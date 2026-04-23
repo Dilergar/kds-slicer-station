@@ -29,7 +29,10 @@ export function isDefrostActive(order: Order, now: number = Date.now()): boolean
 }
 
 /** true если разморозка была запущена (независимо от того, истёк таймер или нет).
- * Используется для лишения ULTRA-статуса: любой след разморозки → NORMAL. */
+ * Используется для (а) разделения агрегации — размороженные и свежие порции
+ * одного блюда идут в РАЗНЫЕ виртуальные карточки (защита от перезапуска
+ * таймера), (б) индикации в OrderCard — статичная серая ❄️ «проходило
+ * разморозку». На ULTRA-статус НЕ влияет — ULTRA сохраняется после разморозки. */
 export function hasDefrostBeenStarted(order: Order): boolean {
   return order.defrost_started_at != null;
 }
@@ -77,7 +80,8 @@ function flattenOrders(
     // Пропускаем активно размораживающиеся — они отображаются мини-карточкой
     // в ряду над доской, не в основной очереди. Когда таймер истёк (или
     // нарезчик нажал «Разморозилась»), isDefrostActive вернёт false и
-    // позиция вернётся в сетку (уже без ULTRA, см. разделение ниже).
+    // позиция вернётся в сетку. ULTRA-статус сохраняется как до, так и
+    // после разморозки — раз блюдо ULTRA, оно остаётся ULTRA.
     if (isDefrostActive(order, now)) continue;
 
     const rawDish = dishes.find(d => d.id === order.dish_id);
@@ -203,24 +207,14 @@ export function buildSmartQueue(
   // 1. Развернуть все заказы в плоский массив
   const allItems = flattenOrders(orders, dishes, categories);
 
-  // Индексируем заказы по id — нужно чтобы в разделении ULTRA/normal
-  // проверить флаг разморозки (он живёт на Order, не на FlatOrderItem).
-  const orderById = new Map<string, Order>();
-  for (const o of orders) orderById.set(o.id, o);
-
-  // 2. Отделить ULTRA-заказы
-  //    Позиция получает ULTRA только если блюдо ULTRA И разморозка ни разу
-  //    не запускалась. Любой след разморозки (даже уже истёкшая) → NORMAL:
-  //    требование бизнеса — после разморозки карточка встаёт в очередь на
-  //    своё "естественное" место по FIFO и категории, без ULTRA-обгона.
+  // 2. Отделить ULTRA-заказы. ULTRA-статус блюда не зависит от разморозки —
+  //    раз блюдо ULTRA, оно остаётся ULTRA и после разморозки тоже.
   const ultraItems: FlatOrderItem[] = [];
   const normalItems: FlatOrderItem[] = [];
 
   for (const item of allItems) {
     const dish = dishes.find(d => d.id === item.dishId);
-    const order = orderById.get(item.orderId);
-    const wasDefrosted = order ? hasDefrostBeenStarted(order) : false;
-    if (dish && dish.priority_flag === PriorityLevel.ULTRA && !wasDefrosted) {
+    if (dish && dish.priority_flag === PriorityLevel.ULTRA) {
       ultraItems.push(item);
     } else {
       normalItems.push(item);

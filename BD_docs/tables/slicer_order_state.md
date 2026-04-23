@@ -71,7 +71,7 @@ elapsed = (pivot - created_at) - accumulated_time_ms
 Пара `defrost_started_at` / `defrost_duration_seconds` описывает состояние:
 - **NULL** → разморозка не запускалась, на карточке кликабельная ❄️ (если у блюда `requires_defrost=true`).
 - **`NOW() < started + duration`** → разморозка идёт, карточка отрисовывается мини-карточкой в DefrostRow над доской (пропускается `smartQueue.flattenOrders`).
-- **`NOW() >= started + duration`** → разморозка завершена, карточка снова в очереди, но без ULTRA (см. `smartQueue.buildSmartQueue`).
+- **`NOW() >= started + duration`** → разморозка завершена, карточка снова в очереди. ULTRA-статус сохраняется (если блюдо было ULTRA — остаётся ULTRA). `defrost_started_at` остаётся NOT NULL только как индикатор «проходило разморозку» (серая ❄️ + защита от повторного запуска таймера).
 
 Ручное подтверждение «Разморозилась» backdate'ит `defrost_started_at = NOW() - (duration+1)s` — отдельная колонка «завершено вручную» не нужна.
 

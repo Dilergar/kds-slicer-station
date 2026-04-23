@@ -3,6 +3,8 @@
 **Дата:** 2026-04-23
 **Файл:** `server/migrations/016_dish_defrost.sql`
 
+> ⚠️ **Обновление (миграция 020, 2026-04-23):** глобальная колонка `slicer_settings.defrost_duration_minutes` удалена. Время разморозки перенесено в `slicer_dish_defrost.defrost_duration_minutes` (per-dish). `enable_defrost_sound` и `defrost_duration_seconds`-snapshot остаются в силе. См. `020_per_dish_defrost_duration.md`.
+
 ## Цель
 
 Добавить поддержку блюд, которые перед нарезкой должны разморозиться (по текущему бизнесу — только рыба). Нарезчик запускает таймер разморозки кликом по ❄️-иконке на карточке, карточка сворачивается в мини-карточку в верхней «зоне разморозки» и возвращается в очередь после истечения таймера (или по ручному подтверждению «Разморозилась»). После разморозки ULTRA-приоритет теряется — блюдо встаёт в очередь по FIFO+категории, как если бы ULTRA не было изначально.
@@ -49,7 +51,7 @@ defrost_started_at IS NOT NULL AND NOW() < started + duration*sec
 
 defrost_started_at IS NOT NULL AND NOW() >= started + duration*sec
   → разморожено, карточка снова в основной очереди
-    ULTRA лишён (smartQueue: hasDefrostBeenStarted → NORMAL)
+    ULTRA-статус сохраняется (если блюдо было ULTRA — остаётся ULTRA)
     на карточке статичная серая ❄️ — индикатор «проходило разморозку»
 ```
 
@@ -61,7 +63,7 @@ defrost_started_at IS NOT NULL AND NOW() >= started + duration*sec
 defrost_started_at = NOW() - (COALESCE(defrost_duration_seconds, 0) + 1) * INTERVAL '1 second'
 ```
 
-После этого `NOW() - started_at >= duration` → таймер истёк, карточка возвращается в очередь. `defrost_started_at` остаётся `NOT NULL`, значит ULTRA по-прежнему лишён.
+После этого `NOW() - started_at >= duration` → таймер истёк, карточка возвращается в очередь. `defrost_started_at` остаётся `NOT NULL` только как индикатор «уже размораживалось» (серая ❄️ + защита от повторного запуска таймера) — на сортировку это не влияет, ULTRA сохраняется.
 
 ## Сброс defrost-state
 
