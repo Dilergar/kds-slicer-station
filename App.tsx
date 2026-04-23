@@ -1,19 +1,15 @@
 /**
  * App.tsx — Корневой компонент приложения KDS Slicer Station
  *
- * Здесь сосредоточен роутинг вьюшек и подключение кастомных хуков.
- * Сама бизнес-логика вынесена в /hooks:
- * - useIngredients: CRUD ингредиентов
+ * Роутинг вьюшек и подключение кастомных хуков.
+ * Данные загружаются из PostgreSQL через API (backend на порту 3001).
+ * Бизнес-логика вынесена в /hooks:
+ * - useIngredients: CRUD ингредиентов (slicer_ingredients)
  * - useStopList: Управление стоп-листами и авто-стоп блюд
- * - useOrders: Заказы, объединение(stack), парковка столов, история
- * 
- * ВАЖНО ДЛЯ БУДУЩЕЙ РЕАЛИЗАЦИИ БД (PostgreSQL):
- * Этот компонент не должен делать запросы сам. Настройте fetch-логику
- * внутри соответствующих хуков, а сюда возвращайте только готовые стейты (orders, dishes и т.д.).
+ * - useOrders: Заказы (polling из docm2_orders), парковка, история
  */
 
-import React, { useState, useMemo } from 'react';
-import { INITIAL_DISHES, INITIAL_CATEGORIES, INITIAL_INGREDIENTS } from './constants';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { ViewMode, Dish, Category, SystemSettings } from './types';
 import { Navigation } from './components/Navigation';
 import { SlicerStation } from './components/SlicerStation';
@@ -21,24 +17,56 @@ import { StopListManager } from './components/StopListManager';
 import { AdminPanel } from './components/AdminPanel';
 import { Dashboard } from './components/Dashboard';
 import { TestOrderModal } from './components/TestOrderModal';
-import { Check } from 'lucide-react';
+import { LoginScreen } from './components/LoginScreen';
+import { Check, LogOut, Ban } from 'lucide-react';
 
 import { useIngredients } from './hooks/useIngredients';
 import { useStopList } from './hooks/useStopList';
 import { useOrders } from './hooks/useOrders';
+import { useAuth } from './hooks/useAuth';
+
+import { fetchCategories } from './services/categoriesApi';
+import { fetchSettings, updateSettings } from './services/settingsApi';
+import { fetchDishes } from './services/dishesApi';
+import { getAllowedViews } from './constants';
 
 function App() {
+  // === Авторизация — PIN из чужой таблицы `users` (см. hooks/useAuth.ts) ===
+  const { user, login, logout } = useAuth();
+
+  // Список разрешённых вкладок для залогиненного юзера.
+  // Считается даже когда user=null (даст []), чтобы не ломать мемо-цепочку,
+  // но фактически не используется до входа — LoginScreen рендерится раньше.
+  const allowedViews = useMemo(
+    () => (user ? getAllowedViews(user.roles) : []),
+    [user]
+  );
+
   // === Текущий режим отображения (KDS | STOPLIST | ADMIN | DASHBOARD) ===
   const [currentView, setCurrentView] = useState<ViewMode>('KDS');
   const [showTestModal, setShowTestModal] = useState(false);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
 
-  // === Основные данные, которые не требуют сложных слоев ===
-  const [dishes, setDishes] = useState<Dish[]>(INITIAL_DISHES);
-  const [categories, setCategories] = useState<Category[]>(INITIAL_CATEGORIES);
+  // Если у юзера нет прав на текущую вкладку (например, Официант залогинился
+  // после Администратора на том же планшете, а в localStorage остался
+  // currentView='ADMIN'), — мягко переключаем на первую доступную.
+  useEffect(() => {
+    if (!user) return;
+    if (allowedViews.length > 0 && !allowedViews.includes(currentView)) {
+      setCurrentView(allowedViews[0]);
+    }
+  }, [user, allowedViews, currentView]);
+
+  // === Данные, загружаемые из API ===
+  const [dishes, setDishes] = useState<Dish[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
   const dishMap = useMemo(() => new Map(dishes.map(d => [d.id, d])), [dishes]);
 
-  // === Системные настройки ===
+  // Флаг: настройки реально подтянулись из БД. Нужен чтобы не флэшить
+  // захардкоженные дефолты в UI, пока идёт fetchSettings().
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+
+  // === Системные настройки (загружаются из slicer_settings) ===
   const [settings, setSettings] = useState<SystemSettings>({
     aggregationWindowMinutes: 5,
     historyRetentionMinutes: 15,
@@ -51,25 +79,66 @@ function App() {
     enableSmartAggregation: true
   });
 
-  // Демо-данные истории стоп-листа
-  const demoStopHistory = useMemo(() => [
-    {
-      id: 'hist_demo_1',
-      ingredientName: 'Potatoes',
-      stoppedAt: Date.now() - 1000 * 60 * 60,
-      resumedAt: Date.now() - 1000 * 60 * 45,
-      reason: 'Delivery Delay',
-      durationMs: 1000 * 60 * 15
-    },
-    {
-      id: 'hist_demo_2',
-      ingredientName: 'Beef Tenderloin',
-      stoppedAt: Date.now() - 1000 * 60 * 120,
-      resumedAt: Date.now() - 1000 * 60 * 115,
-      reason: 'Quality Issue',
-      durationMs: 1000 * 60 * 5
+  // Таймер для дебаунса PUT /api/settings — числовые инпуты (courseWindowSeconds,
+  // aggregationWindowMinutes) дёргают onChange на каждую цифру, без дебаунса
+  // улетит 5-10 запросов на один ввод значения.
+  const settingsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * Обёртка над setSettings: мгновенно обновляет локальный стейт (оптимистично)
+   * и с дебаунсом 500 мс отправляет PUT /api/settings для персиста в БД.
+   * При ошибке сети откатывает стейт на свежее значение из БД через fetchSettings.
+   */
+  const handleSettingsChange = useCallback((next: SystemSettings) => {
+    setSettings(next);
+
+    if (settingsSaveTimer.current) {
+      clearTimeout(settingsSaveTimer.current);
     }
-  ], []);
+    settingsSaveTimer.current = setTimeout(async () => {
+      try {
+        await updateSettings(next);
+      } catch (err) {
+        console.error('[App] Ошибка сохранения настроек:', err);
+        try {
+          const fresh = await fetchSettings();
+          setSettings(fresh);
+        } catch (reloadErr) {
+          console.error('[App] Не удалось откатить настройки из БД:', reloadErr);
+        }
+      }
+    }, 500);
+  }, []);
+
+  // === Загрузка категорий и настроек из API при монтировании ===
+  // Функция перезагрузки блюд из БД — вызывается после изменения алиасов
+  const reloadDishes = useCallback(async () => {
+    try {
+      const dsh = await fetchDishes();
+      setDishes(dsh);
+    } catch (err) {
+      console.error('[App] Ошибка перезагрузки блюд:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const [cats, sets, dsh] = await Promise.all([
+          fetchCategories(),
+          fetchSettings(),
+          fetchDishes()
+        ]);
+        setCategories(cats);
+        setSettings(sets);
+        setSettingsLoaded(true);
+        setDishes(dsh);
+      } catch (err) {
+        console.error('[App] Ошибка загрузки данных:', err);
+      }
+    };
+    loadData();
+  }, []);
 
   // === CUSTOM HOOKS ===
   const {
@@ -78,8 +147,9 @@ function App() {
     ingMap,
     handleAddIngredient,
     handleUpdateIngredient,
-    handleDeleteIngredient
-  } = useIngredients(INITIAL_INGREDIENTS);
+    handleDeleteIngredient,
+    reloadIngredients
+  } = useIngredients();
 
   const {
     stopHistory,
@@ -92,7 +162,9 @@ function App() {
     dishes,
     setDishes,
     dishMap,
-    initialHistory: demoStopHistory
+    reloadIngredients,
+    reloadDishes,
+    user,
   });
 
   const {
@@ -106,7 +178,10 @@ function App() {
     handleRestoreOrder,
     handleParkTable,
     handleUnparkNow,
-    handleUnparkOrders
+    handleUnparkOrders,
+    handleStartDefrost,
+    handleCancelDefrost,
+    handleCompleteDefrost
   } = useOrders({
     settings,
     dishes,
@@ -114,6 +189,47 @@ function App() {
     dishMap,
     ingredients
   });
+
+  // === GATE: не залогинен → экран ввода PIN ===
+  // Хук useAuth восстанавливает юзера из localStorage синхронно на init,
+  // поэтому F5 не покажет LoginScreen если сессия валидна.
+  if (!user) {
+    return <LoginScreen onLogin={login} />;
+  }
+
+  // === GATE: залогинен, но роль не даёт доступа ни к одной вкладке ===
+  // Это Кухня/Хостес/Кассир/без ролей — по требованию заказчика у них
+  // нет доступа. Чтобы юзер не был заперт — показываем экран-заглушку
+  // с одной только кнопкой «Выйти».
+  if (allowedViews.length === 0) {
+    return (
+      <div className="h-screen w-full bg-kds-bg flex items-center justify-center p-6">
+        <div className="max-w-md text-center">
+          <div className="inline-flex items-center justify-center bg-red-600/20 p-4 rounded-2xl mb-4 border border-red-900/50">
+            <Ban className="text-red-400 w-8 h-8" />
+          </div>
+          <h1 className="text-2xl font-bold text-white mb-2">Нет доступа</h1>
+          <p className="text-slate-400 mb-1">
+            {user.login}
+          </p>
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-6">
+            {user.roles.join(', ') || 'Без роли'}
+          </p>
+          <p className="text-slate-400 text-sm mb-8">
+            Ваша роль не имеет доступа к модулю нарезки.<br />
+            Обратитесь к администратору.
+          </p>
+          <button
+            onClick={logout}
+            className="inline-flex items-center gap-2 px-6 py-3 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-bold uppercase tracking-wider transition-all border border-slate-700"
+          >
+            <LogOut size={16} />
+            Выйти
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // === РЕНДЕРИНГ ОСНОВНОГО МАКЕТА ===
   return (
@@ -123,6 +239,9 @@ function App() {
         setView={setCurrentView}
         activeOrderCount={orders.length}
         onAddTestOrder={() => setShowTestModal(true)}
+        allowedViews={allowedViews}
+        user={user}
+        onLogout={logout}
       />
 
       <main className="flex-1 flex flex-col h-full overflow-hidden relative">
@@ -144,6 +263,9 @@ function App() {
             orderHistory={orderHistory}
             onRestoreOrder={handleRestoreOrder}
             settings={settings}
+            onStartDefrost={handleStartDefrost}
+            onCancelDefrost={handleCancelDefrost}
+            onCompleteDefrost={handleCompleteDefrost}
           />
         )}
         {currentView === 'STOPLIST' && (
@@ -156,7 +278,7 @@ function App() {
             onPreviewImage={setPreviewImage}
           />
         )}
-        {currentView === 'ADMIN' && (
+        {currentView === 'ADMIN' && settingsLoaded && (
           <AdminPanel
             categories={categories}
             dishes={dishes}
@@ -164,18 +286,22 @@ function App() {
             setCategories={setCategories}
             setDishes={setDishes}
             settings={settings}
-            setSettings={setSettings}
+            setSettings={handleSettingsChange}
             onToggleDishStop={handleToggleDishStop}
+            onRefreshDishes={reloadDishes}
           />
         )}
-        {currentView === 'DASHBOARD' && (
+        {currentView === 'ADMIN' && !settingsLoaded && (
+          <div className="p-8 text-gray-400">Загрузка настроек…</div>
+        )}
+        {currentView === 'DASHBOARD' && settingsLoaded && (
           <Dashboard
             categories={categories}
             ingredients={ingredients}
             dishes={dishes}
-            stopHistory={stopHistory}
             orderHistory={orderHistory}
             settings={settings}
+            onUpdateIngredient={handleUpdateIngredient}
           />
         )}
       </main>

@@ -1,74 +1,80 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { IngredientBase } from '../types';
+import { fetchIngredients, createIngredient, updateIngredient, deleteIngredient } from '../services/ingredientsApi';
 
 /**
  * Хук для управления справочником Ингредиентов.
- * 
- * ВАЖНО ДЛЯ БУДУЩЕЙ РЕАЛИЗАЦИИ БД (PostgreSQL):
- * - Замените useState и методы ниже на асинхронные запросы (`fetch`, `axios` или подобные).
- * - ingMap полезно держать на клиенте для быстрого доступа, 
- *   хотя джойны (JOIN) в базе в некоторых местах заменят его необходимость.
- * 
- * @param initialIngredients Начальный массив ингредиентов (заменится на пустой массив при переходе на БД).
+ * Загружает данные из PostgreSQL через API.
+ * ingMap — O(1) lookup для быстрого поиска по ID.
  */
-export const useIngredients = (initialIngredients: IngredientBase[]) => {
-  const [ingredients, setIngredients] = useState<IngredientBase[]>(initialIngredients);
+export const useIngredients = () => {
+  const [ingredients, setIngredients] = useState<IngredientBase[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  /**
-   * Оптимизация поиска (O(1) lookup). 
-   * Позволяет мгновенно найти сырьё по ID, избегая O(N) поиска в массивах.
-   */
+  /** Оптимизация поиска (O(1) lookup по ID) */
   const ingMap = useMemo(() => new Map(ingredients.map(i => [i.id, i])), [ingredients]);
 
-  /**
-   * Добавляет новый ингредиент в базу.
-   * [БД Миграция]: INSERT INTO ingredients (...)
-   * 
-   * @param name Название ингредиента
-   * @param parentId ID родительской категории (если есть)
-   * @param unitType Единица измерения (кг или штуки)
-   * @param pieceWeightGrams Средний вес 1 штуки (если unitType === 'piece')
-   */
-  const handleAddIngredient = (name: string, parentId?: string, unitType: 'kg' | 'piece' = 'kg', pieceWeightGrams?: number) => {
-    const newIng: IngredientBase = {
-      id: `ing_${Date.now()}`,
-      name,
-      parentId,
-      unitType,
-      pieceWeightGrams,
-      is_stopped: false
-    };
-    setIngredients(prev => [...prev, newIng]);
-  };
+  /** Загрузка ингредиентов из БД при монтировании */
+  const loadIngredients = useCallback(async () => {
+    try {
+      const data = await fetchIngredients();
+      setIngredients(data);
+    } catch (err) {
+      console.error('[useIngredients] Ошибка загрузки:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadIngredients();
+  }, [loadIngredients]);
 
   /**
-   * Обновляет поля существующего ингредиента.
-   * [БД Миграция]: UPDATE ingredients SET ... WHERE id = :id
-   * 
-   * @param id ID ингредиента для обновления
-   * @param updates Частичный объект обновления (Partial<IngredientBase>)
+   * Добавляет новый ингредиент через API.
+   * После создания — перезагружает список.
    */
-  const handleUpdateIngredient = (id: string, updates: Partial<IngredientBase>) => {
-    setIngredients(prev => prev.map(i => i.id === id ? { ...i, ...updates } : i));
-  };
+  const handleAddIngredient = useCallback(async (name: string, parentId?: string, unitType: 'kg' | 'piece' = 'kg', pieceWeightGrams?: number) => {
+    try {
+      await createIngredient({ name, parentId, unitType, pieceWeightGrams });
+      await loadIngredients();
+    } catch (err) {
+      console.error('[useIngredients] Ошибка создания:', err);
+    }
+  }, [loadIngredients]);
 
   /**
-   * Удаляет ингредиент и каскадно всё, что в него вложено.
-   * [БД Миграция]: DELETE FROM ingredients WHERE id = :id OR parentId = :id
-   * (Либо настроить Foreign Key с ON DELETE CASCADE в PostgreSQL)
-   * 
-   * @param id ID ингредиента для удаления
+   * Обновляет поля существующего ингредиента через API.
    */
-  const handleDeleteIngredient = (id: string) => {
-    setIngredients(prev => prev.filter(i => i.id !== id && i.parentId !== id));
-  };
+  const handleUpdateIngredient = useCallback(async (id: string, updates: Partial<IngredientBase>) => {
+    try {
+      await updateIngredient(id, updates);
+      await loadIngredients();
+    } catch (err) {
+      console.error('[useIngredients] Ошибка обновления:', err);
+    }
+  }, [loadIngredients]);
+
+  /**
+   * Удаляет ингредиент через API (каскадно удаляет children через FK).
+   */
+  const handleDeleteIngredient = useCallback(async (id: string) => {
+    try {
+      await deleteIngredient(id);
+      await loadIngredients();
+    } catch (err) {
+      console.error('[useIngredients] Ошибка удаления:', err);
+    }
+  }, [loadIngredients]);
 
   return {
     ingredients,
     setIngredients,
     ingMap,
+    loading,
     handleAddIngredient,
     handleUpdateIngredient,
-    handleDeleteIngredient
+    handleDeleteIngredient,
+    reloadIngredients: loadIngredients
   };
 };

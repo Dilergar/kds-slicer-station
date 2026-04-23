@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { IngredientBase, Dish, StopHistoryEntry } from '../types';
-import { generateId } from '../utils';
+import React, { useState, useEffect, useCallback } from 'react';
+import { IngredientBase, Dish, StopHistoryEntry, AuthUser } from '../types';
+import { toggleStop, fetchStopHistory } from '../services/stoplistApi';
 
 interface UseStopListProps {
   ingredients: IngredientBase[];
@@ -9,18 +9,29 @@ interface UseStopListProps {
   dishes: Dish[];
   setDishes: React.Dispatch<React.SetStateAction<Dish[]>>;
   dishMap: Map<string, Dish>;
-  initialHistory?: StopHistoryEntry[];
+  reloadIngredients: () => Promise<void>;
+  reloadDishes: () => Promise<void>;
+  // Залогиненный юзер. Прокидывается в toggle, backend пишет его в
+  // slicer_stop_history.stopped_by_* / resumed_by_*. Если null (по идее
+  // невозможно — App рендерит useStopList только после login) — actor
+  // уйдёт как NULL и запись сохранится без имени актора.
+  user: AuthUser | null;
 }
 
 /**
- * Хук для управления Стоп-Листами продуктов и блюд.
- * 
- * ВАЖНО ДЛЯ БУДУЩЕЙ РЕАЛИЗАЦИИ БД (PostgreSQL):
- * - `stopHistory` таблицу (логирование длительности стопов) следует генерировать на бекенде, 
- *   слушая изменения флага `is_stopped` через Postgres Triggers / Webhooks. 
- * - Каскадное отключение БД (ингредиент стоп -> блюдо стоп) должно быть 
- *   вынесено на сторону БД в виде материализованного представления или триггера, 
- *   чтобы фронтенд не гонял лишние данные. В этом случае useEffect отсюда можно удалить.
+ * Хук для управления стоп-листами ингредиентов и блюд.
+ *
+ * Персистентность и каскадная логика — на backend:
+ *  - slicer_ingredients.is_stopped   — состояние ингредиента
+ *  - slicer_dish_stoplist            — актуальный стоп-лист блюд (MANUAL/CASCADE)
+ *  - slicer_stop_history             — лог завершённых стопов для Dashboard
+ *
+ * После любого toggle-вызова хук перезагружает ingredients И dishes из БД,
+ * чтобы подхватить каскадные изменения блюд, которые backend применил в
+ * той же транзакции.
+ *
+ * Фронтенд больше НЕ содержит каскадной логики — она полностью живёт в
+ * recalculateCascadeStops() на backend (server/src/routes/stoplist.ts).
  */
 export const useStopList = ({
   ingredients,
@@ -29,37 +40,45 @@ export const useStopList = ({
   dishes,
   setDishes,
   dishMap,
-  initialHistory = []
+  reloadIngredients,
+  reloadDishes,
+  user,
 }: UseStopListProps) => {
-  const [stopHistory, setStopHistory] = useState<StopHistoryEntry[]>(initialHistory);
+  const [stopHistory, setStopHistory] = useState<StopHistoryEntry[]>([]);
+
+  /** Загрузка истории стопов из БД */
+  const loadStopHistory = useCallback(async () => {
+    try {
+      const data = await fetchStopHistory();
+      setStopHistory(data);
+    } catch (err) {
+      console.error('[useStopList] Ошибка загрузки истории:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadStopHistory();
+  }, [loadStopHistory]);
 
   /**
-   * Ставит ингредиент (сырьё) в стоп-лист или снимает с него.
-   * Вычисляет продолжительность и записывает это в архив истории стопов.
-   * [БД Миграция]: UPDATE ingredients SET is_stopped = true, stop_reason = :reason, stop_timestamp = now() WHERE id = :id
-   * 
-   * @param ingredientId Идентификатор сырья
-   * @param reason Опциональная причина стопа
+   * Переключить стоп-лист ингредиента.
+   *
+   * Поток:
+   *  1. Оптимистичное обновление локального стейта для мгновенного отклика UI
+   *  2. POST /api/stoplist/toggle — backend в одной транзакции обновляет
+   *     slicer_ingredients, пишет историю при снятии и вызывает
+   *     recalculateCascadeStops() — каскадные стопы блюд обновляются в БД.
+   *  3. reloadIngredients + reloadDishes — подтягиваем свежее состояние
+   *     (включая каскадные изменения блюд) из БД.
+   *  4. loadStopHistory — обновляем Dashboard.
    */
-  const handleToggleStop = (ingredientId: string, reason?: string) => {
+  const handleToggleStop = useCallback(async (ingredientId: string, reason?: string) => {
     const targetIng = ingMap.get(ingredientId);
     if (!targetIng) return;
 
     const isStopping = !targetIng.is_stopped;
 
-    if (!isStopping && targetIng.is_stopped && targetIng.stop_timestamp) {
-      const now = Date.now();
-      const newEntry: StopHistoryEntry = {
-        id: generateId('h'),
-        ingredientName: targetIng.name,
-        stoppedAt: targetIng.stop_timestamp,
-        resumedAt: now,
-        reason: targetIng.stop_reason || 'Unknown',
-        durationMs: now - targetIng.stop_timestamp
-      };
-      setStopHistory(prevHist => [newEntry, ...prevHist]);
-    }
-
+    // Оптимистичное обновление — видим эффект мгновенно
     setIngredients(prev => prev.map(ing => {
       if (ing.id === ingredientId) {
         return {
@@ -71,35 +90,41 @@ export const useStopList = ({
       }
       return ing;
     }));
-  };
+
+    try {
+      await toggleStop({
+        targetId: ingredientId,
+        targetType: 'ingredient',
+        reason,
+        actorUuid: user?.uuid,
+        actorName: user?.login,
+      });
+      // Каскадные стопы блюд обновились на backend — подтягиваем оба списка
+      await Promise.all([reloadIngredients(), reloadDishes()]);
+      await loadStopHistory();
+    } catch (err) {
+      console.error('[useStopList] Ошибка toggle ингредиента:', err);
+      // Откатываемся к реальному состоянию БД
+      await Promise.all([reloadIngredients(), reloadDishes()]);
+    }
+  }, [ingMap, setIngredients, reloadIngredients, reloadDishes, loadStopHistory, user]);
 
   /**
-   * Насильно ставит БЛЮДО в стоп-лист, независимо от того, есть ли ингредиенты.
-   * [БД Миграция]: UPDATE dishes SET is_stopped = true WHERE id = :id
-   * 
-   * @param dishId Идентификатор блюда
-   * @param reason Причина остановки (например, "Изменилось меню" или "Ручной стоп")
+   * Переключить стоп-лист блюда (ручной стоп).
+   *
+   * Backend в одной транзакции:
+   *  - UPSERT в slicer_dish_stoplist с stop_type='MANUAL'
+   *  - при снятии пишет историю и вызывает recalculateCascadeStops
+   *    (если ингредиент всё ещё стопнут, блюдо автоматически останется
+   *    на каскадном стопе)
    */
-  const handleToggleDishStop = (dishId: string, reason?: string) => {
+  const handleToggleDishStop = useCallback(async (dishId: string, reason?: string) => {
     const targetDish = dishMap.get(dishId);
     if (!targetDish) return;
 
     const isStopping = !targetDish.is_stopped;
 
-    if (!isStopping && targetDish.is_stopped && targetDish.stop_reason) {
-      const now = Date.now();
-      const stoppedAt = targetDish.stop_timestamp || (now - 1000 * 60);
-      const newEntry: StopHistoryEntry = {
-        id: generateId('h_dish'),
-        ingredientName: `[DISH] ${targetDish.name}`,
-        stoppedAt: stoppedAt,
-        resumedAt: now,
-        reason: targetDish.stop_reason || 'Manual',
-        durationMs: now - stoppedAt
-      };
-      setStopHistory(prevHist => [newEntry, ...prevHist]);
-    }
-
+    // Оптимистичное обновление для мгновенного отклика
     setDishes(prev => prev.map(dish => {
       if (dish.id === dishId) {
         return {
@@ -111,43 +136,25 @@ export const useStopList = ({
       }
       return dish;
     }));
-  };
 
-  /**
-   * Эффект авто-синхронизации (Каскадный стоп-лист).
-   * Если ингредиент уходит в "СТОП" -> все блюда с этим ингредиентом автоматически выключаются "Missing: [название сырья]".
-   * При переходе на БД (PostgreSQL), этот блок стоит заменить триггером или Computed Column,
-   * чтобы при загрузке `dishes` с сервера они УЖЕ прилетали с `is_stopped: true`.
-   */
-  useEffect(() => {
-    setDishes(prevDishes => prevDishes.map(dish => {
-      const stoppedIngredient = dish.ingredients.find(di => {
-        const ing = ingMap.get(di.id);
-        if (!ing) return false;
-
-        if (ing.is_stopped) return true;
-
-        if (ing.parentId) {
-          const parent = ingMap.get(ing.parentId);
-          if (parent?.is_stopped) return true;
-        }
-        return false;
+    try {
+      await toggleStop({
+        targetId: dishId,
+        targetType: 'dish',
+        reason,
+        dishName: targetDish.name,
+        isStopping,
+        actorUuid: user?.uuid,
+        actorName: user?.login,
       });
-
-      const stoppedIng = stoppedIngredient
-        ? ingMap.get(stoppedIngredient.id)
-        : null;
-
-      const wasAutoStopped = dish.stop_reason?.startsWith('Missing:');
-
-      if (stoppedIng && !dish.is_stopped) {
-        return { ...dish, is_stopped: true, stop_reason: `Missing: ${stoppedIng.name}` };
-      } else if (!stoppedIngredient && wasAutoStopped) {
-        return { ...dish, is_stopped: false, stop_reason: '' };
-      }
-      return dish;
-    }));
-  }, [ingredients, setDishes, ingMap]); 
+      // Подтягиваем персистентное состояние — оно теперь в slicer_dish_stoplist
+      await reloadDishes();
+      await loadStopHistory();
+    } catch (err) {
+      console.error('[useStopList] Ошибка toggle блюда:', err);
+      await reloadDishes();
+    }
+  }, [dishMap, setDishes, reloadDishes, loadStopHistory, user]);
 
   return {
     stopHistory,

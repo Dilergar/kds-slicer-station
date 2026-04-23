@@ -12,6 +12,29 @@ dist
 dist-ssr
 *.local
 
+# MCP config (содержит креды БД)
+.mcp.json
+
+# Env файлы
+.env
+.env.local
+server/.env
+
+# Дампы БД — GitHub блокирует файлы > 100 МБ.
+# Хранить их нужно вне git (S3, локальный backup, и т.п.).
+dump-arclient-*
+*.dump
+*.sql.gz
+*.backup
+
+# Загруженные фото блюд (slicer_dish_images) и ингредиентов —
+# пользовательский контент ресторана, не должен попадать в git.
+# Папки пересоздаются автоматически при старте backend.
+server/public/images/dishes/*
+!server/public/images/dishes/.gitkeep
+server/public/images/ingredients/*
+!server/public/images/ingredients/.gitkeep
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

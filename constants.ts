@@ -6,12 +6,40 @@
  * - INITIAL_INGREDIENTS — справочник ингредиентов (родители и разновидности)
  * - INITIAL_DISHES — справочник блюд с рецептурой
  * - INITIAL_ORDERS — начальные заказы для демо
- * - PIN_CODE — PIN-код для режима редактора стоп-листа
  *
  * В продакшене эти данные должны загружаться из базы данных через API.
  */
 
-import { Category, Dish, IngredientBase, Order, PriorityLevel } from "./types";
+import { Category, Dish, IngredientBase, Order, PriorityLevel, ViewMode } from "./types";
+
+// ======================================================================
+// Матрица доступа: роль (из чужой таблицы `roles`) → вкладки модуля.
+// Имена ролей должны совпадать с `roles.name` в БД заказчика.
+// У юзера может быть несколько ролей — на фронте объединяем разрешения.
+// Роли, НЕ перечисленные здесь, получают пустой набор — экран-заглушку
+// «Нет доступа» и только кнопку «Выйти». Так делают `Кухня`, `Хостес`,
+// `Кассир` по требованию заказчика.
+// ======================================================================
+export const ROLE_ACCESS: Record<string, ViewMode[]> = {
+  'admin': ['KDS', 'STOPLIST', 'ADMIN', 'DASHBOARD'],
+  'Администратор': ['KDS', 'STOPLIST', 'ADMIN', 'DASHBOARD'],
+  'Заведующий производством': ['KDS', 'STOPLIST', 'ADMIN', 'DASHBOARD'],
+  'Официант': ['KDS'],
+  'Просмотр отчётов': ['DASHBOARD'],
+};
+
+/**
+ * Объединение прав всех ролей юзера. Если ни одна роль не в ROLE_ACCESS —
+ * пустой массив (юзер залогинен, но увидит заглушку «Нет доступа»).
+ */
+export function getAllowedViews(roles: string[]): ViewMode[] {
+  const merged = new Set<ViewMode>();
+  for (const role of roles) {
+    const views = ROLE_ACCESS[role];
+    if (views) views.forEach(v => merged.add(v));
+  }
+  return Array.from(merged);
+}
 
 // ======================================================================
 // Категории меню — определяют порядок приоритета на KDS-доске
@@ -227,7 +255,3 @@ export const INITIAL_ORDERS: Order[] = [
     status: 'ACTIVE'
   }
 ];
-
-// PIN-код для входа в режим редактора стоп-листа
-// ВНИМАНИЕ: В продакшене должен храниться на сервере!
-export const PIN_CODE = "01151995";

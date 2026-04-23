@@ -22,7 +22,7 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
     onClose,
     onConfirm,
 }) => {
-    const [reason, setReason] = useState('Out of Stock');
+    const [reason, setReason] = useState('Закончилось');
     const [customReason, setCustomReason] = useState('');
     const [validationError, setValidationError] = useState('');
 
@@ -32,7 +32,7 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
         let finalReason = reason;
         if (reason === 'Other') {
             if (!customReason.trim()) {
-                setValidationError('Please enter a reason');
+                setValidationError('Пожалуйста, введите причину');
                 return;
             }
             finalReason = customReason.trim();
@@ -45,13 +45,13 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
             <div className="bg-gray-800 p-6 rounded-lg w-96 border border-red-500/30 shadow-2xl animate-in fade-in zoom-in duration-200">
                 <div className="flex items-center text-red-500 mb-4">
                     <AlertOctagon className="mr-2" />
-                    <h3 className="text-lg font-bold text-white">Stop Item</h3>
+                    <h3 className="text-lg font-bold text-white">Выбор Причины (Стоп)</h3>
                 </div>
 
-                <p className="text-gray-300 mb-4">Why are you stopping <span className="text-white font-bold">{itemName}</span>?</p>
+                <p className="text-gray-300 mb-4">Почему вы останавливаете <span className="text-white font-bold">{itemName}</span>?</p>
 
                 <div className="grid grid-cols-2 gap-3 mb-4">
-                    {['Out of Stock', 'Spoilage', 'Not Delivered', 'Other'].map((r) => (
+                    {['Закончилось', 'Списание', 'Не доставили', 'Другое'].map((r) => (
                         <button
                             key={r}
                             onClick={() => {
@@ -66,12 +66,12 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
                                 }
               `}
                         >
-                            {r === 'Spoilage' ? 'Spoilage / Quality' : r}
+                            {r === 'Списание' ? 'Списание / Качество' : r}
                         </button>
                     ))}
                 </div>
 
-                {reason === 'Other' && (
+                {reason === 'Другое' && (
                     <div className="mb-4">
                         <input
                             type="text"
@@ -80,7 +80,7 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
                                 setCustomReason(e.target.value);
                                 setValidationError('');
                             }}
-                            placeholder="Enter specific reason (Required)"
+                            placeholder="Введите подробную причину (Обязательно)"
                             className={`w-full bg-gray-900 text-white p-3 rounded border outline-none
                    ${validationError ? 'border-red-500 focus:border-red-500' : 'border-gray-700 focus:border-blue-500'}
                 `}
@@ -92,10 +92,10 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
 
                 <div className="flex gap-3">
                     <button onClick={handleConfirm} className="flex-1 bg-red-600 hover:bg-red-500 text-white font-bold py-2 rounded">
-                        Confirm Stop
+                        В СТОП-ЛИСТ
                     </button>
                     <button onClick={onClose} className="flex-1 bg-transparent border border-gray-600 hover:bg-gray-700 text-white font-bold py-2 rounded">
-                        Cancel
+                        Отмена
                     </button>
                 </div>
             </div>

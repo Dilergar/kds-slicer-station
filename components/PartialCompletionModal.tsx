@@ -45,7 +45,7 @@ export const PartialCompletionModal: React.FC<PartialCompletionModalProps> = ({ 
 
                 {/* Header */}
                 <div className="bg-slate-800 p-4 flex justify-between items-center border-b border-slate-700">
-                    <h3 className="text-xl font-bold text-white">Part Done</h3>
+                    <h3 className="text-xl font-bold text-white">Частичная отдача</h3>
                     <button onClick={onClose} className="text-slate-400 hover:text-white">
                         <X size={24} />
                     </button>
@@ -53,7 +53,7 @@ export const PartialCompletionModal: React.FC<PartialCompletionModalProps> = ({ 
 
                 {/* Display */}
                 <div className="p-6 flex flex-col items-center gap-2 bg-slate-800/50">
-                    <div className="text-slate-400 text-sm uppercase font-bold tracking-wider">Quantity to Complete</div>
+                    <div className="text-slate-400 text-sm uppercase font-bold tracking-wider">Количество к отдаче</div>
                     <div className="text-5xl font-mono font-bold text-blue-400 h-16 flex items-center">
                         {value || <span className="text-slate-600">0</span>}
                         <span className="text-slate-500 text-2xl ml-2 font-normal">/ {totalQty}</span>
@@ -77,7 +77,7 @@ export const PartialCompletionModal: React.FC<PartialCompletionModalProps> = ({ 
                         onClick={() => setValue('')} // Clear
                         className="h-16 rounded-lg bg-slate-800 hover:bg-red-900/30 text-red-400 font-bold transition-colors border border-slate-700 flex items-center justify-center"
                     >
-                        CLS
+                        ОЧИСТИТЬ
                     </button>
 
                     <button
@@ -107,7 +107,7 @@ export const PartialCompletionModal: React.FC<PartialCompletionModalProps> = ({ 
                             }`}
                     >
                         <Check size={24} strokeWidth={3} />
-                        Confirm Part Done
+                        Подтвердить отдачу
                     </button>
                 </div>
 

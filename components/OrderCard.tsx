@@ -16,7 +16,8 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Dish, Order, Category, IngredientBase, PriorityLevel } from '../types';
-import { Clock, Check, PauseCircle, Car, MoveLeft, ChevronDown, PieChart, AlertTriangle, X } from 'lucide-react';
+import { Clock, Check, PauseCircle, Car, MoveLeft, ChevronDown, PieChart, AlertTriangle, X, Snowflake } from 'lucide-react';
+import { hasDefrostBeenStarted } from '../smartQueue';
 
 interface OrderCardProps {
     order: Order;
@@ -29,6 +30,27 @@ interface OrderCardProps {
     onStackMerge: (orderId: string) => void;
     onCancelOrder?: (orderId: string) => void;
     onPreviewImage: (url: string) => void;
+    /**
+     * Чисто визуальный флаг «эту карточку уже кто-то начал делать».
+     * Тап по незанятой области карточки → toggle. Живёт только в локальном
+     * стейте SlicerStation, не пишется в БД, не переживает reload.
+     */
+    isInWork?: boolean;
+    onToggleInWork?: (orderId: string) => void;
+    /**
+     * Кнопка запуска разморозки (синяя ❄️) — показывается только если
+     * dish.requires_defrost=true и разморозка ещё не запускалась. После
+     * разморозки (hasDefrostBeenStarted=true) вместо кнопки показывается
+     * статичная серая ❄️ — просто индикатор «это блюдо размораживалось».
+     */
+    onStartDefrost?: (orderId: string) => void;
+    /**
+     * Подпись большой зелёной кнопки (по умолчанию — «ГОТОВО»).
+     * В модалке разморозки (DefrostModal) переопределяется на «РАЗМОРОЗИЛАСЬ»,
+     * чтобы переиспользовать весь компонент целиком — пользователь видит ту
+     * же карточку что и на доске, но подтверждает другое действие.
+     */
+    completeButtonLabel?: string;
 }
 
 const OrderCardBase: React.FC<OrderCardProps> = ({
@@ -41,8 +63,25 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
     onPartialComplete,
     onStackMerge,
     onCancelOrder,
-    onPreviewImage
+    onPreviewImage,
+    isInWork,
+    onToggleInWork,
+    onStartDefrost,
+    completeButtonLabel,
 }) => {
+    /**
+     * Тап по карточке → toggle «В работе». Игнорируем если тап попал в button
+     * (Готово / Частично / Отмена / Merge-бейдж / action-кнопки в футере) —
+     * тогда работают их собственные обработчики. Если картинку ингредиента
+     * тапнут — тоже toggle'нём, это приемлемо: двойной клик для превью
+     * всё равно был ненадёжен на планшете.
+     */
+    const handleCardTap = (e: React.MouseEvent<HTMLDivElement>) => {
+        if (!onToggleInWork) return;
+        const target = e.target as HTMLElement;
+        if (target.closest('button')) return;
+        onToggleInWork(order.id);
+    };
     // --- Derived State ---
     // Check stop status (propagate from dish or order logic if needed, but mostly dish)
     // In SlicerStation we used checkStopped helper, let's replicate or assume dish.is_stopped 
@@ -55,9 +94,21 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
     const totalQty = order.quantity_stack.reduce((sum, q) => sum + q, 0);
     const stackString = order.quantity_stack.join(' + ');
 
-    const timeElapsed = order.accumulated_time_ms
-        ? order.accumulated_time_ms + (order.status === 'ACTIVE' ? (now - (order.created_at || now)) : 0)
-        : now - order.created_at;
+    // Формула времени (миграция 019 — Вариант Б):
+    //   elapsed = (pivot - created_at) - accumulated_time_ms
+    //   где pivot = parked_at если PARKED (таймер «на паузе»), иначе now.
+    //
+    // Семантика accumulated_time_ms — «общее время, проведённое в парковке»,
+    // поэтому вычитаем его из общего «часов от создания». Для новых заказов
+    // accumulated = 0 → elapsed = now - created_at, как и было.
+    // Для заказа вернувшегося из ручной парковки (created_at остался ordertime,
+    // accumulated = сколько был в парковке) — elapsed корректно исключит парковку.
+    // Для десерта после автопарковки (created_at сдвинут на unpark_at, accumulated = 0)
+    // — elapsed = now - unpark_at, таймер с нуля.
+    const pivot = order.status === 'PARKED' && order.parked_at
+      ? order.parked_at
+      : now;
+    const timeElapsed = Math.max(0, (pivot - order.created_at) - (order.accumulated_time_ms || 0));
 
     const formatTime = (ms: number) => {
         const totalSeconds = Math.floor(ms / 1000);
@@ -78,6 +129,12 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
         if (isVipCategory) {
             borderClass = "border-yellow-400 shadow-[0_0_15px_rgba(250,204,21,0.5)]";
         }
+    }
+
+    // «В работе» — светло-неоновый зелёный бордер, overrides ULTRA/VIP.
+    // Делаем ярче чем VIP но светлее чем ULTRA-красный — отличимо с 3 метров.
+    if (isInWork) {
+        borderClass = "border-lime-400 shadow-[0_0_20px_rgba(163,230,53,0.7)]";
     }
 
     // --- Scroll Logic (> 5 Ingredients) ---
@@ -125,10 +182,11 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
 
     return (
         <div
+            onClick={handleCardTap}
             className={`
         bg-kds-card rounded-lg flex flex-col justify-between overflow-hidden
         border-2 ${borderClass} transition-all duration-300 relative
-        h-auto 
+        h-auto cursor-pointer
       `}
         >
             {/* Card Content */}
@@ -201,11 +259,40 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                         )}
                     </div>
 
-                    <div className="flex flex-col items-end shrink-0">
-                        <div className="flex items-center text-slate-400 font-mono text-sm mb-1">
+                    <div className="flex flex-col items-end shrink-0 gap-1">
+                        <div className="flex items-center text-slate-400 font-mono text-sm">
                             <Clock size={14} className="mr-1" />
                             {formatTime(timeElapsed)}
                         </div>
+                        {/* ❄️ Разморозка — три визуальных состояния:
+                            1) Ожидание: dish.requires_defrost && !hasDefrostBeenStarted
+                               → синяя кликабельная кнопка «запустить разморозку»
+                            2) Разморожено: dish.requires_defrost && hasDefrostBeenStarted
+                               → статичная серая ❄️, просто индикатор
+                            3) В процессе: эта карточка сюда не попадает — она
+                               отрисовывается как мини-карточка в DefrostRow */}
+                        {dish.requires_defrost && (
+                            hasDefrostBeenStarted(order) ? (
+                                <div
+                                    className="text-slate-500 flex items-center"
+                                    title="Это блюдо прошло разморозку"
+                                >
+                                    <Snowflake size={18} />
+                                </div>
+                            ) : (
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        onStartDefrost?.(order.id);
+                                    }}
+                                    className="p-1 rounded bg-blue-900/30 hover:bg-blue-800/60 text-blue-300 border border-blue-700/50 transition-colors"
+                                    title="Запустить разморозку"
+                                    aria-label="Запустить разморозку"
+                                >
+                                    <Snowflake size={18} className="animate-pulse" />
+                                </button>
+                            )
+                        )}
                     </div>
                 </div>
 
@@ -215,13 +302,26 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                         onClick={() => !isMerged && onStackMerge(order.id)}
                         disabled={isMerged}
                         className={`
-                 inline-flex items-center px-3 py-1 rounded bg-slate-800 border border-slate-700
-                 font-mono text-lg font-bold
-                 ${isMerged ? 'text-slate-400' : 'text-green-400 animate-pulse cursor-pointer hover:bg-slate-700 hover:border-green-500'}
+                 inline-flex items-center justify-center px-2 py-0 rounded bg-slate-700/80 border-2
+                 font-mono text-3xl font-black leading-none
+                 ${isMerged
+                    ? 'text-cyan-300 border-slate-500'
+                    : 'text-green-400 border-slate-600 animate-pulse cursor-pointer hover:bg-slate-700 hover:border-green-500'}
               `}
                     >
                         {isMerged ? totalQty : stackString}
                     </button>
+
+                    {/* «В работе» — смайлик ножа рядом с количеством порций. */}
+                    {isInWork && (
+                        <span
+                            className="text-2xl select-none drop-shadow-[0_0_6px_rgba(163,230,53,0.8)]"
+                            title="В работе"
+                            aria-label="В работе"
+                        >
+                            🔪
+                        </span>
+                    )}
 
                     {!isMerged && (
                         <MoveLeft
@@ -267,12 +367,12 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                         return ingBase.unitType === 'piece' ? `${val}` : `${val}g`;
                                     });
                                     quantityDisplay = splitValues.join(' + ');
-                                    if (ingBase.unitType === 'piece') quantityDisplay += ' pcs';
+                                    if (ingBase.unitType === 'piece') quantityDisplay += ' шт';
                                 } else {
                                     const val = dishIng.quantity * totalQty;
                                     quantityDisplay = ingBase.unitType === 'piece'
-                                        ? `${val} pcs`
-                                        : `${val}g`;
+                                        ? `${val} шт`
+                                        : `${val}г`;
                                 }
 
                                 return (
@@ -306,7 +406,7 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                     <div className="bg-slate-900/90 p-2 text-center border-t border-slate-700 backdrop-blur-sm mb-2">
                         <span className="text-red-400 text-xs font-bold flex items-center justify-center gap-2 animate-pulse">
                             <AlertTriangle size={14} />
-                            STOP: {stopReason}
+                            СТОП: {stopReason}
                         </span>
                     </div>
                 )}
@@ -354,7 +454,7 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                 </span>
                             ) : (
                                 <>
-                                    <Check size={20} className="mr-2 stroke-[3]" /> Done
+                                    <Check size={20} className="mr-2 stroke-[3]" /> {completeButtonLabel ?? 'ГОТОВО'}
                                 </>
                             )}
                         </button>

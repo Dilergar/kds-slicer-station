@@ -25,17 +25,19 @@ interface AdminPanelProps {
   settings: SystemSettings;
   setSettings: (settings: SystemSettings) => void;
   onToggleDishStop: (dishId: string, reason?: string) => void;
+  onRefreshDishes?: () => Promise<void> | void;
 }
 
-export const AdminPanel: React.FC<AdminPanelProps> = ({ 
-  categories, 
-  dishes, 
-  ingredients, 
-  setCategories, 
-  setDishes, 
-  settings, 
-  setSettings, 
-  onToggleDishStop 
+export const AdminPanel: React.FC<AdminPanelProps> = ({
+  categories,
+  dishes,
+  ingredients,
+  setCategories,
+  setDishes,
+  settings,
+  setSettings,
+  onToggleDishStop,
+  onRefreshDishes
 }) => {
   const [activeTab, setActiveTab] = useState<'CATEGORIES' | 'RECIPES' | 'RANKING' | 'SETTINGS'>('CATEGORIES');
 
@@ -55,47 +57,48 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
   return (
     <div className="flex-1 bg-kds-bg p-8 overflow-y-auto">
-      <h1 className="text-3xl font-bold text-white mb-6">System Configuration</h1>
+      <h1 className="text-3xl font-bold text-white mb-6">Системные Настройки</h1>
 
       <div className="flex space-x-4 mb-8 border-b border-gray-700 overflow-x-auto shrink-0">
         <button
           onClick={() => setActiveTab('CATEGORIES')}
           className={`pb-3 px-4 font-medium transition-colors whitespace-nowrap ${activeTab === 'CATEGORIES' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-400 hover:text-gray-200'}`}
         >
-          Menu Categories
+          Категории Меню
         </button>
         <button
           onClick={() => setActiveTab('RECIPES')}
           className={`pb-3 px-4 font-medium transition-colors whitespace-nowrap ${activeTab === 'RECIPES' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-400 hover:text-gray-200'}`}
         >
-          Recipe Editor
+          Рецепты
         </button>
         <button
           onClick={() => setActiveTab('RANKING')}
           className={`pb-3 px-4 font-medium transition-colors whitespace-nowrap ${activeTab === 'RANKING' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-400 hover:text-gray-200'}`}
         >
-          Category Ranking
+          Приоритет Категорий
         </button>
         <button
           onClick={() => setActiveTab('SETTINGS')}
           className={`pb-3 px-4 font-medium transition-colors whitespace-nowrap ${activeTab === 'SETTINGS' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-400 hover:text-gray-200'}`}
         >
-          System Settings
+          Общие Настройки
         </button>
       </div>
 
       <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
         {activeTab === 'CATEGORIES' && (
-          <CategoriesTab categories={categories} setCategories={setCategories} />
+          <CategoriesTab categories={categories} setCategories={setCategories} settings={settings} setSettings={setSettings} />
         )}
 
         {activeTab === 'RECIPES' && (
-          <RecipeEditor 
-            categories={categories} 
-            dishes={dishes} 
-            setDishes={setDishes} 
-            ingredients={ingredients} 
-            handleStopClick={handleStopClick} 
+          <RecipeEditor
+            categories={categories}
+            dishes={dishes}
+            setDishes={setDishes}
+            ingredients={ingredients}
+            handleStopClick={handleStopClick}
+            onRefreshDishes={onRefreshDishes}
           />
         )}
 

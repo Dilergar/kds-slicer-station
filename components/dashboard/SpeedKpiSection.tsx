@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { OrderHistoryEntry, Dish, Category } from '../../types';
 import { formatDuration, SortField, SortDirection } from './dashboardUtils';
+import { MiniTimelineChart, MiniTimelineEntry } from './MiniTimelineChart';
 import { Zap, Car, Search, X, ArrowUp, ArrowDown, ArrowUpDown, ChevronRight, ChevronDown } from 'lucide-react';
 
 interface SpeedKpiSectionProps {
@@ -144,12 +145,28 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
     const standardOrders = filteredOrders.filter(o => !o.was_parked);
     const parkedOrders = filteredOrders.filter(o => o.was_parked);
 
+    // Entries для MiniTimelineChart: один пункт = одно завершение заказа.
+    // value = prepTime на порцию (итого / количество) — честное «сколько
+    // секунд ушло на одну штуку». Так столбик высокий = медленно, независимо
+    // от того, заказ был на 1 или на 10 порций.
+    const toEntries = (list: typeof orderHistory): MiniTimelineEntry[] =>
+      list.map(o => ({
+        timestamp: o.completedAt,
+        value: o.totalQuantity > 0 ? o.prepTimeMs / o.totalQuantity : o.prepTimeMs,
+      }));
+
     return {
       standard: aggregateByCategory(standardOrders),
-      parked: aggregateByCategory(parkedOrders)
+      parked: aggregateByCategory(parkedOrders),
+      standardTimeline: toEntries(standardOrders),
+      parkedTimeline: toEntries(parkedOrders),
     };
 
   }, [orderHistory, appliedFilter, dishes, categories, searchQuery, sortConfig]);
+
+  // Границы timeline-чартов — тот же period, что и фильтр Dashboard.
+  const rangeStart = new Date(appliedFilter.start).getTime();
+  const rangeEnd = new Date(appliedFilter.end).getTime();
 
   return (
     <>
@@ -157,7 +174,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
       <div className="mb-6 relative">
         <input
           type="text"
-          placeholder="Search dishes..."
+          placeholder="Поиск блюд..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           className="w-full bg-slate-900 border border-slate-700 rounded-lg py-3 px-10 text-white focus:outline-none focus:border-blue-500 transition-colors"
@@ -177,12 +194,21 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
       <div className="grid grid-cols-2 gap-6 mb-8">
         {/* Standard Orders */}
         <div className="bg-kds-card p-6 rounded-lg border border-gray-800 flex flex-col h-[600px]">
-          <h3 className="text-xl font-bold text-green-400 mb-6 flex items-center shrink-0">
-            <Zap className="mr-2" size={20} /> Speed KPI (Standard)
+          <h3 className="text-xl font-bold text-green-400 mb-3 flex items-center shrink-0">
+            <Zap className="mr-2" size={20} /> Скорость отдачи (Обычные)
           </h3>
+          <div className="mb-4 shrink-0">
+            <MiniTimelineChart
+              entries={speedStats.standardTimeline}
+              rangeStart={rangeStart}
+              rangeEnd={rangeEnd}
+              color="green"
+              caption="Где просадка (выше столбик = медленнее)"
+            />
+          </div>
 
           {speedStats.standard.length === 0 ? (
-            <div className="text-center py-8 text-slate-500 italic">No standard orders</div>
+            <div className="text-center py-8 text-slate-500 italic">Нет обычных заказов</div>
           ) : (
             <div className="overflow-auto flex-1 rounded-lg border border-gray-700 custom-scrollbar">
               <table className="w-full text-left border-collapse">
@@ -193,7 +219,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                       onClick={() => handleSort('name')}
                     >
                       <div className="flex items-center gap-1">
-                        Dish Name
+                        Название Блюда
                         {sortConfig.field === 'name' ? (
                           sortConfig.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                         ) : <ArrowUpDown size={14} className="opacity-20" />}
@@ -204,7 +230,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                       onClick={() => handleSort('cycles')}
                     >
                       <div className="flex items-center justify-center gap-1">
-                        Cycles
+                        Кол-во
                         {sortConfig.field === 'cycles' ? (
                           sortConfig.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                         ) : <ArrowUpDown size={14} className="opacity-20" />}
@@ -215,7 +241,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                       onClick={() => handleSort('time')}
                     >
                       <div className="flex items-center justify-end gap-1">
-                        Avg Time
+                        Ср. Время
                         {sortConfig.field === 'time' ? (
                           sortConfig.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                         ) : <ArrowUpDown size={14} className="opacity-20" />}
@@ -264,12 +290,21 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
 
         {/* Parked Orders */}
         <div className="bg-kds-card p-6 rounded-lg border border-gray-800 flex flex-col h-[600px]">
-          <h3 className="text-xl font-bold text-yellow-400 mb-6 flex items-center shrink-0">
-            <Car className="mr-2" size={20} /> Speed KPI (Parked)
+          <h3 className="text-xl font-bold text-yellow-400 mb-3 flex items-center shrink-0">
+            <Car className="mr-2" size={20} /> Скорость отдачи (С парковки)
           </h3>
+          <div className="mb-4 shrink-0">
+            <MiniTimelineChart
+              entries={speedStats.parkedTimeline}
+              rangeStart={rangeStart}
+              rangeEnd={rangeEnd}
+              color="yellow"
+              caption="Где просадка"
+            />
+          </div>
 
           {speedStats.parked.length === 0 ? (
-            <div className="text-center py-8 text-slate-500 italic">No parked orders</div>
+            <div className="text-center py-8 text-slate-500 italic">Нет заказов с парковки</div>
           ) : (
             <div className="overflow-auto flex-1 rounded-lg border border-gray-700 custom-scrollbar">
               <table className="w-full text-left border-collapse">
@@ -280,7 +315,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                       onClick={() => handleSort('name')}
                     >
                       <div className="flex items-center gap-1">
-                        Dish Name
+                        Название Блюда
                         {sortConfig.field === 'name' ? (
                           sortConfig.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                         ) : <ArrowUpDown size={14} className="opacity-20" />}
@@ -291,7 +326,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                       onClick={() => handleSort('cycles')}
                     >
                       <div className="flex items-center justify-center gap-1">
-                        Cycles
+                        Кол-во
                         {sortConfig.field === 'cycles' ? (
                           sortConfig.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                         ) : <ArrowUpDown size={14} className="opacity-20" />}
@@ -302,7 +337,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                       onClick={() => handleSort('time')}
                     >
                       <div className="flex items-center justify-end gap-1">
-                        Avg Time
+                        Ср. Время
                         {sortConfig.field === 'time' ? (
                           sortConfig.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                         ) : <ArrowUpDown size={14} className="opacity-20" />}

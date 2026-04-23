@@ -1,7 +1,21 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Order, OrderHistoryEntry, PriorityLevel, Dish, IngredientBase, SystemSettings } from '../types';
-import { INITIAL_ORDERS } from '../constants';
-import { generateId, calculateConsumedIngredients } from '../utils';
+import { calculateConsumedIngredients } from '../utils';
+import {
+  fetchOrders,
+  completeOrder,
+  partialCompleteOrder,
+  cancelOrder,
+  parkOrder,
+  unparkOrder,
+  mergeOrder,
+  fetchOrderHistory,
+  deleteOrderHistory,
+  restoreOrder,
+  startDefrost,
+  cancelDefrost,
+  completeDefrost
+} from '../services/ordersApi';
 
 interface UseOrdersProps {
   settings: SystemSettings;
@@ -13,14 +27,10 @@ interface UseOrdersProps {
 
 /**
  * Хук для управления Очередью заказов, Парковкой столов и Историей заказов.
- * 
- * ВАЖНО ДЛЯ БУДУЩЕЙ РЕАЛИЗАЦИИ БД (PostgreSQL):
- * Этот хук — самое сердце приложения. При переходе на бекенд:
- * 1. `orders` и `orderHistory` должны быть таблицами БД.
- * 2. `handleAddTestOrder` заменяется на WebSocket/SSE/Polling из базы, откуда падают `INSERT`'s из кассовой системы (R-Keeper, iiko, и т.д.).
- * 3. Логика слияния (`table_stack`, `quantity_stack`) может происходить и на фронте (Smart Wave), но лучше переложить на бекенд.
- * 4. Авто-разпарковка стола (setInterval) заменяется на крон-джобы, либо на Computed Status: 
- *    `SELECT CASE WHEN unpark_at < NOW() THEN 'ACTIVE' ELSE 'PARKED' END as status`.
+ *
+ * Заказы загружаются из PostgreSQL через polling каждые 4 секунды.
+ * Все действия (complete, park, unpark, cancel, merge) отправляются через API.
+ * Авто-разпарковка выполняется на backend при каждом GET /api/orders.
  */
 export const useOrders = ({
   settings,
@@ -29,17 +39,57 @@ export const useOrders = ({
   dishMap,
   ingredients
 }: UseOrdersProps) => {
-  const [orders, setOrders] = useState<Order[]>(INITIAL_ORDERS);
+  const [orders, setOrders] = useState<Order[]>([]);
   const [orderHistory, setOrderHistory] = useState<OrderHistoryEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Ref для предотвращения одновременных polling-запросов
+  const pollingRef = useRef(false);
 
   /**
-   * Добавляет новый заказ (или сливает к существующему, если включено "Aggregation Window").
-   * При Smart Wave этот метод создает отдельный заказ (агрегация рисуется на клиенте `smartQueue.ts`).
-   * 
-   * @param dishId ID Блюда
-   * @param priority Приоритет 'NORMAL' | 'VIP' | 'ULTRA' | etc.
-   * @param tableNumber Номер стола
-   * @param quantity Количество
+   * Загрузка активных заказов из БД.
+   * Вызывается при монтировании и каждые 4 секунды (polling).
+   */
+  const loadOrders = useCallback(async () => {
+    // Пропускаем если предыдущий запрос ещё выполняется
+    if (pollingRef.current) return;
+    pollingRef.current = true;
+
+    try {
+      const data = await fetchOrders();
+      setOrders(data);
+    } catch (err) {
+      console.error('[useOrders] Ошибка загрузки заказов:', err);
+    } finally {
+      pollingRef.current = false;
+      setLoading(false);
+    }
+  }, []);
+
+  /** Загрузка истории заказов из БД */
+  const loadHistory = useCallback(async () => {
+    try {
+      const data = await fetchOrderHistory();
+      setOrderHistory(data);
+    } catch (err) {
+      console.error('[useOrders] Ошибка загрузки истории:', err);
+    }
+  }, []);
+
+  // Polling заказов каждые 4 секунды
+  useEffect(() => {
+    loadOrders();
+    loadHistory();
+    const interval = setInterval(() => {
+      loadOrders();
+      loadHistory();
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [loadOrders, loadHistory]);
+
+  /**
+   * Добавляет тестовый заказ (для dev-режима).
+   * В продакшене заказы создаются кассовой системой в docm2_orders.
    */
   const handleAddTestOrder = useCallback((dishId: string, priority: PriorityLevel, tableNumber?: number, quantity: number = 1) => {
     // Временно изменяем приоритет блюда глобально (test feature)
@@ -51,371 +101,461 @@ export const useOrders = ({
       return updated;
     });
 
-    setOrders(prevOrders => {
-      const now = Date.now();
-      const targetTableNumber = tableNumber !== undefined ? tableNumber : (Math.floor(Math.random() * 100) + 1);
-      const newTableEntries = Array(quantity).fill(targetTableNumber);
-
-      const aggregationEnabled = settings.enableAggregation !== false;
-      const windowMs = settings.aggregationWindowMinutes * 60 * 1000;
-
-      let existingOrderIndex = -1;
-
-      // Если Aggregation Window ВКЛ и Smart Wave ВЫКЛ -> схлопываем заказы физически
-      if (existingOrderIndex === -1 && aggregationEnabled && !settings.enableSmartAggregation) {
-        existingOrderIndex = prevOrders.findIndex(o =>
-          o.dish_id === dishId && (now - o.created_at) < windowMs
-        );
-      }
-
-      if (existingOrderIndex > -1) {
-        const newOrders = [...prevOrders];
-        const existingOrder = newOrders[existingOrderIndex];
-
-        const currentParkedTables = existingOrder.parked_tables || (existingOrder.was_parked ? existingOrder.table_stack.flat() : []);
-
-        newOrders[existingOrderIndex] = {
-          ...existingOrder,
-          quantity_stack: [...existingOrder.quantity_stack, quantity],
-          table_stack: [...existingOrder.table_stack, newTableEntries],
-          parked_tables: currentParkedTables,
-          updated_at: Date.now(),
-          status: 'ACTIVE'
-        };
-        return newOrders;
-      } else {
-        const newOrder: Order = {
-          id: generateId('o'),
-          dish_id: dishId,
-          quantity_stack: [quantity],
-          table_stack: [newTableEntries],
-          parked_tables: [],
-          created_at: Date.now(),
-          updated_at: Date.now(),
-          status: 'ACTIVE'
-        };
-        return [...prevOrders, newOrder];
-      }
-    });
-  }, [setDishes, settings]);
+    // В dev-режиме добавляем заказ локально (без API, т.к. нет endpoint для создания)
+    const now = Date.now();
+    const targetTableNumber = tableNumber !== undefined ? tableNumber : (Math.floor(Math.random() * 100) + 1);
+    const newOrder: Order = {
+      id: `test_${now}_${Math.random().toString(36).substring(2, 9)}`,
+      dish_id: dishId,
+      quantity_stack: [quantity],
+      table_stack: [Array(quantity).fill(targetTableNumber)],
+      parked_tables: [],
+      created_at: now,
+      updated_at: now,
+      status: 'ACTIVE'
+    };
+    setOrders(prev => [...prev, newOrder]);
+  }, [setDishes]);
 
   /**
-   * Слияние вложенных массивов количеств и столов в сплошной поток
-   * Вызывается вручную пользователем со станции.
+   * Объединение стеков (Merge). Отправляет на backend.
    */
-  const handleStackMerge = (orderId: string) => {
+  const handleStackMerge = useCallback(async (orderId: string) => {
+    const order = orders.find(o => o.id === orderId);
+    if (!order) return;
+
+    const sum = order.quantity_stack.reduce((a, b) => a + b, 0);
+    const allTables = order.table_stack.flat();
+
+    // Оптимистичное обновление UI
     setOrders(prev => prev.map(o => {
       if (o.id !== orderId) return o;
-      const sum = o.quantity_stack.reduce((a, b) => a + b, 0);
-      const allTables = o.table_stack.flat();
-
-      return {
-        ...o,
-        quantity_stack: [sum],
-        table_stack: [allTables]
-      };
+      return { ...o, quantity_stack: [sum], table_stack: [allTables] };
     }));
-  };
+
+    try {
+      await mergeOrder(orderId, { quantityStack: [sum], tableStack: [allTables] });
+    } catch (err) {
+      console.error('[useOrders] Ошибка merge:', err);
+      await loadOrders(); // Откатываем к реальным данным
+    }
+  }, [orders, loadOrders]);
 
   /**
-   * Полное завершение приготовления блюда. (Кнопка "Готово")
-   * Рассчитывает граммовку потребляемого сырья (calculateConsumedIngredients) и генерирует History Entry.
-   * [БД Миграция]: UPDATE orders SET status = 'COMPLETED'
+   * Полное завершение заказа.
+   * Отправляет на backend: обновляет docm2tabl1_cooked, создаёт историю и расход.
    */
-  const handleCompleteOrder = (orderId: string) => {
+  const handleCompleteOrder = useCallback(async (orderId: string) => {
     const order = orders.find(o => o.id === orderId);
     if (!order) return;
 
     const dish = dishMap.get(order.dish_id);
-    if (dish) {
-      const totalOrderQty = order.quantity_stack.reduce((a, b) => a + b, 0);
-      const consumedIngredients = calculateConsumedIngredients(dish, ingredients, totalOrderQty);
-      const now = Date.now();
-      const prepTimeMs = (now - order.created_at) + (order.accumulated_time_ms || 0);
+    if (!dish) return;
 
-      const historyEntry: OrderHistoryEntry = {
-        id: generateId('oh'),
+    const totalOrderQty = order.quantity_stack.reduce((a, b) => a + b, 0);
+    const consumedIngredients = calculateConsumedIngredients(dish, ingredients, totalOrderQty);
+    const now = Date.now();
+    // Вариант Б: accumulated_time_ms теперь «время парковок», вычитаем из общего.
+    const prepTimeMs = Math.max(0, (now - order.created_at) - (order.accumulated_time_ms || 0));
+
+    // Оптимистичное удаление из UI
+    setOrders(prev => prev.filter(o => o.id !== orderId));
+
+    try {
+      await completeOrder(orderId, {
         dishId: dish.id,
         dishName: dish.name,
-        completedAt: now,
         totalQuantity: totalOrderQty,
         prepTimeMs,
-        consumedIngredients,
-        was_parked: order.was_parked,
-        snapshot: order
-      };
-      setOrderHistory(prevHistory => [historyEntry, ...prevHistory]);
+        wasParked: order.was_parked,
+        snapshot: order,
+        consumedIngredients
+      });
+      await loadHistory(); // Обновить историю
+    } catch (err) {
+      console.error('[useOrders] Ошибка complete:', err);
+      await loadOrders(); // Откатываем
     }
-
-    setOrders(prev => prev.filter(o => o.id !== orderId));
-  };
+  }, [orders, dishMap, ingredients, loadOrders, loadHistory]);
 
   /**
-   * Частичная отдача заказа. (Например, из 5 порций готовы только 3).
-   * Выдает 3 штуки порции (отправляет их в order_history), а 2 оставляет в ACTIVE очереди.
+   * Частичная отдача заказа.
    */
-  const handlePartialComplete = (orderId: string, quantityToComplete: number) => {
+  const handlePartialComplete = useCallback(async (orderId: string, quantityToComplete: number) => {
     const order = orders.find(o => o.id === orderId);
     if (!order) return;
 
     const dish = dishMap.get(order.dish_id);
-    if (dish) {
-      const consumedIngredients = calculateConsumedIngredients(dish, ingredients, quantityToComplete);
-      const now = Date.now();
-      const prepTimeMs = (now - order.created_at) + (order.accumulated_time_ms || 0);
-      const allOriginalTables = order.table_stack.flat();
-      const completedTables = allOriginalTables.slice(0, quantityToComplete);
+    if (!dish) return;
 
-      const historyEntry: OrderHistoryEntry = {
-        id: generateId('oh_part'),
-        dishId: dish.id,
-        dishName: dish.name + " (Partial)",
-        completedAt: now,
-        totalQuantity: quantityToComplete,
-        prepTimeMs,
-        consumedIngredients,
-        was_parked: order.was_parked,
-        snapshot: {
-          ...order,
-          quantity_stack: [quantityToComplete],
-          table_stack: [completedTables]
-        }
-      };
-      setOrderHistory(prevHistory => [historyEntry, ...prevHistory]);
+    const consumedIngredients = calculateConsumedIngredients(dish, ingredients, quantityToComplete);
+    const now = Date.now();
+    // Вариант Б: accumulated_time_ms теперь «время парковок», вычитаем из общего.
+    const prepTimeMs = Math.max(0, (now - order.created_at) - (order.accumulated_time_ms || 0));
+
+    // Вычисляем оставшийся стек
+    const newStack = [...order.quantity_stack];
+    let remainingToRemove = quantityToComplete;
+    for (let i = 0; i < newStack.length; i++) {
+      if (remainingToRemove <= 0) break;
+      if (newStack[i] > remainingToRemove) {
+        newStack[i] -= remainingToRemove;
+        remainingToRemove = 0;
+      } else {
+        remainingToRemove -= newStack[i];
+        newStack[i] = 0;
+      }
     }
+    const cleanedStack = newStack.filter(q => q > 0);
+    let currentTables = order.table_stack.flat();
+    currentTables = currentTables.length > quantityToComplete
+      ? currentTables.slice(quantityToComplete)
+      : [];
 
+    const allOriginalTables = order.table_stack.flat();
+    const completedTables = allOriginalTables.slice(0, quantityToComplete);
+
+    // Оптимистичное обновление UI
     setOrders(prev => prev.map(o => {
       if (o.id !== orderId) return o;
-
-      const newStack = [...o.quantity_stack];
-      let remainingToRemove = quantityToComplete;
-
-      for (let i = 0; i < newStack.length; i++) {
-        if (remainingToRemove <= 0) break;
-        if (newStack[i] > remainingToRemove) {
-          newStack[i] -= remainingToRemove;
-          remainingToRemove = 0;
-        } else {
-          remainingToRemove -= newStack[i];
-          newStack[i] = 0;
-        }
-      }
-
-      const cleanedStack = newStack.filter(q => q > 0);
-
-      let currentTables = o.table_stack.flat();
-      if (currentTables.length > quantityToComplete) {
-        currentTables = currentTables.slice(quantityToComplete);
-      } else {
-        currentTables = [];
-      }
-
-      return {
-        ...o,
-        quantity_stack: cleanedStack,
-        table_stack: [currentTables]
-      };
+      return { ...o, quantity_stack: cleanedStack, table_stack: [currentTables] };
     }));
-  };
+
+    try {
+      await partialCompleteOrder(orderId, {
+        dishId: dish.id,
+        dishName: dish.name,
+        quantityToComplete,
+        prepTimeMs,
+        wasParked: order.was_parked,
+        snapshot: { ...order, quantity_stack: [quantityToComplete], table_stack: [completedTables] },
+        consumedIngredients,
+        remainingQuantityStack: cleanedStack,
+        remainingTableStack: [currentTables]
+      });
+      await loadHistory();
+    } catch (err) {
+      console.error('[useOrders] Ошибка partial-complete:', err);
+      await loadOrders();
+    }
+  }, [orders, dishMap, ingredients, loadOrders, loadHistory]);
 
   /**
-   * Отмена заказа без ухода в историю.
-   * [БД Миграция]: UPDATE orders SET status = 'CANCELLED'
+   * Отмена заказа через API.
    */
-  const handleCancelOrder = (orderId: string) => {
+  const handleCancelOrder = useCallback(async (orderId: string) => {
     setOrders(prev => prev.filter(o => o.id !== orderId));
-  };
+    try {
+      await cancelOrder(orderId);
+    } catch (err) {
+      console.error('[useOrders] Ошибка cancel:', err);
+      await loadOrders();
+    }
+  }, [loadOrders]);
 
   /**
-   * UNDO ф-я. Извлекает заказ из order_history и возвращает его в active orders.
-   * Полезно если повар случайно нажал "Готово".
+   * Восстановление заказа из истории (UNDO).
+   *
+   * Логика:
+   * 1. Считаем финальные quantity_stack/table_stack: если позиция уже
+   *    висит на доске (остаток после partial) — конкатенируем со снапшотом;
+   *    иначе снапшот сам по себе.
+   * 2. Оптимистично кладём в локальный state + выкидываем из истории.
+   * 3. Отправляем на backend: POST /api/orders/:id/restore — UPSERT
+   *    slicer_order_state (status=ACTIVE, новые stacks, finished_at=NULL).
+   *    Это критично: без этого шага следующий polling через 4с перезапишет
+   *    локальный state значением из БД и восстановление исчезнет — тот
+   *    самый баг «вернул → суп слегка мелькнул → пропал навсегда».
+   * 4. Удаляем запись из истории на backend (DELETE /api/history/orders/:id).
+   *    Порядок важен: сначала restore, потом delete — если первый упал,
+   *    история ещё на месте и пользователь может попробовать снова.
+   *
+   * Для тестовых заказов (id начинается с "test_") — только локальный
+   * state и удаление истории. Они не живут в БД, backend restore им не
+   * нужен.
    */
-  const handleRestoreOrder = (historyId: string) => {
+  const handleRestoreOrder = useCallback(async (historyId: string) => {
     const entry = orderHistory.find(h => h.id === historyId);
     if (!entry || !entry.snapshot) return;
 
     const restoredOrder = entry.snapshot;
+    const isTestOrder = restoredOrder.id.startsWith('test_');
 
-    setOrders(currentOrders => {
-      const existingOrderIndex = currentOrders.findIndex(o => o.id === restoredOrder.id);
+    // Вычисляем финальный стек ДО оптимистичного обновления, чтобы отправить то же самое на backend.
+    const existing = orders.find(o => o.id === restoredOrder.id);
+    const newQuantityStack = existing
+      ? [...existing.quantity_stack, ...restoredOrder.quantity_stack]
+      : restoredOrder.quantity_stack;
+    const newTableStack = existing
+      ? [...existing.table_stack, ...restoredOrder.table_stack]
+      : restoredOrder.table_stack;
 
-      if (existingOrderIndex > -1) {
-        const updatedOrders = [...currentOrders];
-        const existing = updatedOrders[existingOrderIndex];
-
-        updatedOrders[existingOrderIndex] = {
-          ...existing,
-          quantity_stack: [...existing.quantity_stack, ...restoredOrder.quantity_stack],
-          table_stack: [...existing.table_stack, ...restoredOrder.table_stack],
+    // Оптимистичное обновление UI
+    setOrders(prev => {
+      const existingIndex = prev.findIndex(o => o.id === restoredOrder.id);
+      if (existingIndex > -1) {
+        const updated = [...prev];
+        updated[existingIndex] = {
+          ...updated[existingIndex],
+          status: 'ACTIVE' as const,
+          quantity_stack: newQuantityStack,
+          table_stack: newTableStack,
         };
-        return updatedOrders;
-      } else {
-        return [...currentOrders, { ...restoredOrder, status: 'ACTIVE' }];
+        return updated;
       }
+      return [...prev, { ...restoredOrder, status: 'ACTIVE' as const, quantity_stack: newQuantityStack, table_stack: newTableStack }];
+    });
+    setOrderHistory(prev => prev.filter(h => h.id !== historyId));
+
+    try {
+      if (!isTestOrder) {
+        // Вернуть в slicer_order_state: без этого polling через 4с перезатрёт локальное состояние.
+        await restoreOrder(restoredOrder.id, {
+          quantityStack: newQuantityStack,
+          tableStack: newTableStack,
+        });
+      }
+      await deleteOrderHistory(historyId);
+    } catch (err) {
+      console.error('[useOrders] Ошибка restore:', err);
+      await loadOrders();
+      await loadHistory();
+    }
+  }, [orderHistory, orders, loadOrders, loadHistory]);
+
+  /**
+   * Парковка стола. Отправляет на backend.
+   */
+  const handleParkTable = useCallback(async (tableNumber: number, returnTimestamp: number) => {
+    const now = Date.now();
+
+    // Собираем заказы, которые нужно паркануть
+    const affectedOrders = orders.filter(o => {
+      const tablesInStack = o.table_stack ? o.table_stack.flat() : [];
+      return tablesInStack.includes(tableNumber) && o.status !== 'PARKED';
     });
 
-    setOrderHistory(prev => prev.filter(h => h.id !== historyId));
-  };
+    if (affectedOrders.length === 0) return;
 
-  /**
-   * Ставит стол "на паузу" (Парковка). 
-   * Если в заказе совмещены порции паркуемого стола и другого (активного) стола, производит Split (разделение чеков).
-   * 
-   * @param tableNumber Номер стола для парковки
-   * @param returnTimestamp Unix time когда стол должен вернуться в выдачу
-   */
-  const handleParkTable = (tableNumber: number, returnTimestamp: number) => {
-    const now = Date.now();
+    // Оптимистичное обновление UI.
+    // Вариант Б (миграция 019): accumulated_time_ms НЕ трогаем при парковке
+    // (накопление при /unpark), created_at тоже не трогаем. Просто переводим
+    // в PARKED и ставим parked_at=now. Формула таймера на карточке ставит
+    // pivot=parked_at когда PARKED → таймер замирает на момент парковки.
     setOrders(prev => prev.flatMap(o => {
-      const tablesInStack = o.table_stack ? o.table_stack.flat() : (o.table_numbers || []);
+      const tablesInStack = o.table_stack ? o.table_stack.flat() : [];
       const hasTargetTable = tablesInStack.includes(tableNumber);
+      if (!hasTargetTable || o.status === 'PARKED') return [o];
 
-      if (!hasTargetTable || o.status === 'PARKED') {
-        return [o];
-      }
+      const currentParkedTables = o.parked_tables || [];
+      const allTargetTables = o.table_stack.flat();
+      const updatedParkedTables = Array.from(new Set([...currentParkedTables, ...allTargetTables]));
 
-      const newActiveTableStack: number[][] = [];
-      const newActiveQuantityStack: number[] = [];
-
-      const newParkedTableStack: number[][] = [];
-      const newParkedQuantityStack: number[] = [];
-
-      const currentParkedTables = o.parked_tables || (o.was_parked ? o.table_stack.flat() : []);
-
-      o.table_stack.forEach((blockTables) => {
-        const staying = blockTables.filter((t) => t !== tableNumber);
-        const leaving = blockTables.filter((t) => t === tableNumber);
-
-        if (staying.length > 0) {
-          newActiveTableStack.push(staying);
-          newActiveQuantityStack.push(staying.length);
-        }
-
-        if (leaving.length > 0) {
-          newParkedTableStack.push(leaving);
-          newParkedQuantityStack.push(leaving.length);
-        }
-      });
-
-      const timeElapsedSoFar = now - (o.created_at || now);
-
-      if (newActiveTableStack.length === 0) {
-        const allTargetTables = o.table_stack.flat();
-        const updatedParkedTables = Array.from(new Set([...currentParkedTables, ...allTargetTables]));
-
-        return [
-          {
-            ...o,
-            status: 'PARKED',
-            parked_at: now,
-            unpark_at: returnTimestamp,
-            accumulated_time_ms: (o.accumulated_time_ms || 0) + timeElapsedSoFar,
-            was_parked: true,
-            parked_tables: updatedParkedTables,
-          },
-        ];
-      }
-
-      const activeOrderPart: Order = {
+      return [{
         ...o,
-        quantity_stack: newActiveQuantityStack,
-        table_stack: newActiveTableStack,
-        parked_tables: currentParkedTables.filter((t) => t !== tableNumber),
-      };
-
-      const parkedOrderPart: Order = {
-        ...o,
-        id: generateId('o_parked'),
-        status: 'PARKED',
-        quantity_stack: newParkedQuantityStack,
-        table_stack: newParkedTableStack,
-        parked_tables: Array.from(new Set([...tablesInStack.filter((t) => t === tableNumber)])),
+        status: 'PARKED' as const,
         parked_at: now,
         unpark_at: returnTimestamp,
-        accumulated_time_ms: (o.accumulated_time_ms || 0) + timeElapsedSoFar,
         was_parked: true,
-      };
-
-      return [activeOrderPart, parkedOrderPart];
+        parked_tables: updatedParkedTables,
+      }];
     }));
+
+    // Отправляем каждый затронутый заказ на backend.
+    // `parkedTables` = ВСЕ столы стека (дедуплицированные): парковка переводит
+    // весь заказ в PARKED (split не реализован). `accumulatedTimeMs` передаём
+    // как есть — backend его использует только при INSERT новой строки,
+    // на UPDATE игнорирует (накопление при /unpark).
+    for (const order of affectedOrders) {
+      const allTablesUnique: number[] = Array.from(new Set<number>(order.table_stack.flat()));
+      try {
+        await parkOrder(order.id, {
+          quantityStack: order.quantity_stack,
+          tableStack: order.table_stack,
+          parkedTables: allTablesUnique,
+          unparkAt: returnTimestamp,
+          accumulatedTimeMs: order.accumulated_time_ms || 0
+        });
+      } catch (err) {
+        console.error('[useOrders] Ошибка park:', err);
+      }
+    }
+  }, [orders]);
+
+  /**
+   * Оптимистичный апдейт Order при разпарковке (Вариант Б, миграция 019):
+   *   - Ручная парковка: accumulated_time_ms += (now - parked_at) — заказ
+   *     остаётся на историческом месте в очереди по ordertime.
+   *   - Автопарковка (parked_by_auto=TRUE): сбрасываем accumulated=0 и
+   *     created_at=now — десерт встаёт «как новый» в конец очереди.
+   * Без знания parked_by_auto на фронте (до полной синхронизации) этот оптимистичный
+   * рендер можно отличить по нашему флагу в Order. Поле присутствует после
+   * polling из backend (миграция 019). Если флага нет — считаем ручной.
+   */
+  const applyUnparkOptimistic = (o: Order, now: number): Order => {
+    const wasAuto = (o as Order & { parked_by_auto?: boolean }).parked_by_auto === true;
+    const elapsedInPark = o.parked_at ? (now - o.parked_at) : 0;
+    if (wasAuto) {
+      return {
+        ...o,
+        status: 'ACTIVE',
+        parked_at: undefined,
+        unpark_at: undefined,
+        accumulated_time_ms: 0,
+        created_at: now,
+      };
+    }
+    return {
+      ...o,
+      status: 'ACTIVE',
+      parked_at: undefined,
+      unpark_at: undefined,
+      accumulated_time_ms: (o.accumulated_time_ms || 0) + elapsedInPark,
+      // created_at НЕ меняем — сортировка по историческому ordertime.
+    };
   };
 
   /**
-   * Мгновенный возврат всех заказов стола с парковки в 'ACTIVE'.
+   * Мгновенный возврат стола с парковки через API.
    */
-  const handleUnparkNow = (tableNumber: number) => {
+  const handleUnparkNow = useCallback(async (tableNumber: number) => {
+    const parkedOrders = orders.filter(o =>
+      o.status === 'PARKED' && o.table_stack?.flat().includes(tableNumber)
+    );
+
     const now = Date.now();
     setOrders(prev => prev.map(o => {
-      const belongsToTable = o.table_stack
-        ? o.table_stack.flat().includes(tableNumber)
-        : false;
-
+      const belongsToTable = o.table_stack?.flat().includes(tableNumber);
       if (belongsToTable && o.status === 'PARKED') {
-        return {
-          ...o,
-          status: 'ACTIVE',
-          parked_at: undefined,
-          unpark_at: undefined,
-          created_at: now
-        };
+        return applyUnparkOptimistic(o, now);
       }
       return o;
     }));
-  };
+
+    for (const order of parkedOrders) {
+      try {
+        await unparkOrder(order.id);
+      } catch (err) {
+        console.error('[useOrders] Ошибка unpark:', err);
+      }
+    }
+  }, [orders]);
 
   /**
    * Гранулярная выгрузка из парковки (только выбранные заказы).
    */
-  const handleUnparkOrders = (orderIds: string[]) => {
+  const handleUnparkOrders = useCallback(async (orderIds: string[]) => {
     const now = Date.now();
     setOrders(prev => prev.map(o => {
       if (orderIds.includes(o.id) && o.status === 'PARKED') {
-        return {
-          ...o,
-          status: 'ACTIVE',
-          parked_at: undefined,
-          unpark_at: undefined,
-          created_at: now
-        };
+        return applyUnparkOptimistic(o, now);
       }
       return o;
     }));
-  };
+
+    for (const id of orderIds) {
+      try {
+        await unparkOrder(id);
+      } catch (err) {
+        console.error('[useOrders] Ошибка unpark:', err);
+      }
+    }
+  }, []);
+
+  // ======================================================================
+  // Разморозка (миграция 016)
+  // Все три действия идут на один набор реальных order_item_id. Для Smart
+  // Wave их несколько (стек 1+1+1), для стандартного режима — один. Вызывающий
+  // код передаёт sourceOrderItemIds (или undefined если id уже реальный).
+  // ======================================================================
 
   /**
-   * Системный CRON: каждые 10 секунд проверяет запаркованные столы.
-   * Если время ожидания (`unpark_at`) вышло, то меняет их статус обратно на `ACTIVE`.
+   * Запустить таймер разморозки. Оптимистично проставляем defrost_started_at
+   * = now + snapshot duration из settings, чтобы мини-карточка появилась
+   * мгновенно, не дожидаясь ближайшего polling через 4 сек.
    */
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const now = Date.now();
-      setOrders(prevOrders => {
-        let hasChanges = false;
-        const nextOrders = prevOrders.map(o => {
-          if (o.status === 'PARKED' && o.unpark_at && now >= o.unpark_at) {
-            hasChanges = true;
-            return {
-              ...o,
-              status: 'ACTIVE',
-              parked_at: undefined,
-              unpark_at: undefined,
-              created_at: now
-            } as Order;
-          }
-          return o;
-        });
-        return hasChanges ? nextOrders : prevOrders;
-      });
-    }, 10000);
+  const handleStartDefrost = useCallback(async (
+    orderId: string,
+    sourceOrderItemIds?: string[]
+  ) => {
+    const durationSec = (settings?.defrostDurationMinutes ?? 15) * 60;
+    const now = Date.now();
+    const ids = sourceOrderItemIds && sourceOrderItemIds.length > 0
+      ? sourceOrderItemIds
+      : [orderId];
 
-    return () => clearInterval(interval);
-  }, []);
+    setOrders(prev => prev.map(o => {
+      if (!ids.includes(o.id)) return o;
+      return { ...o, defrost_started_at: now, defrost_duration_seconds: durationSec };
+    }));
+
+    try {
+      await startDefrost(orderId, sourceOrderItemIds);
+    } catch (err) {
+      console.error('[useOrders] Ошибка defrost-start:', err);
+      await loadOrders();
+    }
+  }, [settings?.defrostDurationMinutes, loadOrders]);
+
+  /** Отменить разморозку — возвращает карточку в очередь с исходным ULTRA. */
+  const handleCancelDefrost = useCallback(async (
+    orderId: string,
+    sourceOrderItemIds?: string[]
+  ) => {
+    const ids = sourceOrderItemIds && sourceOrderItemIds.length > 0
+      ? sourceOrderItemIds
+      : [orderId];
+
+    setOrders(prev => prev.map(o => {
+      if (!ids.includes(o.id)) return o;
+      return { ...o, defrost_started_at: null, defrost_duration_seconds: null };
+    }));
+
+    try {
+      await cancelDefrost(orderId, sourceOrderItemIds);
+    } catch (err) {
+      console.error('[useOrders] Ошибка defrost-cancel:', err);
+      await loadOrders();
+    }
+  }, [loadOrders]);
+
+  /**
+   * «Разморозилась» — ручное подтверждение раньше таймера. Оптимистично
+   * бэкдейтим started_at на (duration+1) сек назад, чтобы мини-карточка
+   * исчезла мгновенно и позиция сразу вернулась в очередь (без ULTRA).
+   */
+  const handleCompleteDefrost = useCallback(async (
+    orderId: string,
+    sourceOrderItemIds?: string[]
+  ) => {
+    const ids = sourceOrderItemIds && sourceOrderItemIds.length > 0
+      ? sourceOrderItemIds
+      : [orderId];
+    const now = Date.now();
+
+    setOrders(prev => prev.map(o => {
+      if (!ids.includes(o.id) || !o.defrost_started_at) return o;
+      const durationSec = o.defrost_duration_seconds ?? 0;
+      return {
+        ...o,
+        defrost_started_at: now - (durationSec + 1) * 1000
+      };
+    }));
+
+    try {
+      await completeDefrost(orderId, sourceOrderItemIds);
+    } catch (err) {
+      console.error('[useOrders] Ошибка defrost-complete:', err);
+      await loadOrders();
+    }
+  }, [loadOrders]);
 
   return {
     orders,
     setOrders,
     orderHistory,
     setOrderHistory,
+    loading,
     handleAddTestOrder,
     handleStackMerge,
     handleCompleteOrder,
@@ -424,6 +564,9 @@ export const useOrders = ({
     handleRestoreOrder,
     handleParkTable,
     handleUnparkNow,
-    handleUnparkOrders
+    handleUnparkOrders,
+    handleStartDefrost,
+    handleCancelDefrost,
+    handleCompleteDefrost
   };
 };

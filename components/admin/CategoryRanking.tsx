@@ -9,11 +9,11 @@ interface CategoryRankingProps {
 export const CategoryRanking: React.FC<CategoryRankingProps> = ({ settings, setSettings }) => {
   return (
     <div className="bg-kds-card rounded-lg p-6 max-w-2xl">
-      <h2 className="text-xl font-bold text-white mb-6">Category & Priority Ranking</h2>
+      <h2 className="text-xl font-bold text-white mb-6">Ранжирование и Приоритеты</h2>
 
       <div className="space-y-6">
         <div className="border-b border-gray-700 pb-6">
-          <label className="block text-gray-400 font-bold mb-4">Sorting Priority Rules</label>
+          <label className="block text-gray-400 font-bold mb-4">Правила Сортировки</label>
           <div className="space-y-2 bg-gray-900/50 p-4 rounded-lg border border-gray-700">
             {(settings.activePriorityRules || ['ULTRA', 'FIFO']).map((rule, idx, arr) => {
               const moveUp = () => {
@@ -34,7 +34,7 @@ export const CategoryRanking: React.FC<CategoryRankingProps> = ({ settings, setS
                   case 'ULTRA': return '🚨 ULTRA (KDS Flag)';
                   case 'FIFO': return '⏱️ FIFO (По очереди)';
                   case 'COURSE_FIFO': return '🍽️ COURSE_FIFO (Курсы + FIFO)';
-                  case 'CATEGORY': return '📂 Category Priority';
+                  case 'CATEGORY': return '📂 Приоритет по категории';
                   default: return r;
                 }
               };

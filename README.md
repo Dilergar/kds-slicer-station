@@ -1,97 +1,211 @@
 # KDS Slicer Station
 
-**KDS Slicer Station** — это профессиональная система управления заказами на кухне (Kitchen Display System), разработанная специально для станции нарезки (слайсинга) или сборки бургеров/пиццы, где критически важна логика агрегации потока одинаковых блюд.
+**KDS Slicer Station** — это профессиональная система управления заказами на кухне (Kitchen Display System), разработанная специально для станции нарезки (слайсинга). Модуль подключается к существующей KDS-системе через PostgreSQL.
 
-Приложение позволяет объединять заказы: умные волны привязывают заказы к конкретным "волнам выноса", а логика парковки позволяет гибко управлять приоритетами готовых / не готовых блюд в чеке.
-
-## 🛠 Технологический Стек
-* **Frontend Framework**: React 19 + TypeScript
-* **Build Tool**: Vite
-* **Styling**: TailwindCSS v4 + Lucide React (иконки)
-* **Государство (State)**: In-Memory (React `useState` in Custom Hooks) – *Готово к миграции на PostgreSQL*
-* **Charting**: Recharts (Dashboard)
+## Технологический Стек
+* **Frontend:** React 19 + TypeScript 5.8 + Vite 6
+* **Backend:** Express 4 + pg (node-postgres)
+* **БД:** PostgreSQL 18 (база `arclient`)
+* **Стили:** TailwindCSS v4 (CDN) + Lucide React (иконки)
+* **Графики:** Recharts (Dashboard)
 
 ---
 
-## 📂 Структура проекта (Архитектура)
+## Структура проекта
 ```text
 kds-slicer-station/
-├── src/
-│   ├── components/                # UI Компоненты
-│   │   ├── admin/                 # Подкомпоненты панели администратора
-│   │   ├── dashboard/             # Подкомпоненты аналитики и дашборда
-│   │   ├── Navigation.tsx         # Левое меню навигации
-│   │   ├── SlicerStation.tsx      # Главный экран (Заказы и Smart Queue)
-│   │   ├── StopListManager.tsx    # Экран ручного стоп-листа
-│   │   ├── OrderCard.tsx          # Карточка заказа
-│   ├── hooks/                     # 🧠 БИЗНЕС-ЛОГИКА И STATE (Готово к API миграции)
-│   │   ├── useIngredients.ts      # CRUD сырья
-│   │   ├── useOrders.ts           # Заказы, парковки, слияния, истории
-│   │   └── useStopList.ts         # Управление стоп-листами и каскадами
-│   ├── types.ts                   # Глобальные TS типы и интерфейсы
-│   ├── constants.ts               # Начальные In-Memory данные (Mock DB)
-│   ├── App.tsx                    # Главный роутер, точка подключения хуков
+├── App.tsx                    # Корневой компонент, роутинг
+├── types.ts                   # TypeScript типы
+├── services/                  # Frontend API-клиент (fetch обёртки)
+│   ├── client.ts              # Базовый fetch wrapper
+│   ├── ordersApi.ts           # Заказы (complete, park, unpark, merge)
+│   ├── ingredientsApi.ts      # CRUD ингредиентов
+│   ├── categoriesApi.ts       # CRUD категорий
+│   ├── settingsApi.ts         # Настройки
+│   ├── stoplistApi.ts         # Стоп-лист
+│   ├── dishesApi.ts           # Загрузка блюд
+│   └── recipesApi.ts          # Рецепты
+├── hooks/                     # Бизнес-логика (API + state)
+│   ├── useOrders.ts           # Polling заказов, все actions через API
+│   ├── useIngredients.ts      # CRUD ингредиентов через API
+│   └── useStopList.ts         # Стоп-лист через API, каскад
+├── components/                # UI компоненты
+│   ├── admin/                 # Панель администратора
+│   └── dashboard/             # Аналитика и KPI
+├── server/                    # Backend (Express + PostgreSQL)
+│   ├── src/index.ts           # Express, порт 3001
+│   ├── src/routes/            # API маршруты (9 файлов)
+│   │   └── stoplist.ts        # включает recalculateCascadeStops helper
+│   ├── src/config/db.ts       # pg.Pool подключение к arclient
+│   ├── .env.example           # Шаблон конфига backend
+│   ├── src/services/          # Адаптеры (kdsStoplistSync — двусторонний стоп-лист)
+│   └── migrations/            # SQL миграции (6 файлов: 001–006)
+├── BD_docs/                   # Документация БД для программистов
+│   ├── README.md              # Обзор архитектуры, ER-схема
+│   ├── tables/                # Описание каждой slicer_ таблицы (12 файлов)
+│   ├── migrations/            # Описание миграций (6 файлов)
+│   ├── mappings.md            # TypeScript ↔ DB маппинг
+│   └── existing_tables.md     # Таблицы основной KDS
+└── Инструкция.md              # Гайд по развёртыванию для IT-команды заказчика
 ```
 
 ---
 
-## 🧠 Управление состоянием (Custom Hooks)
+## База данных
 
-На данный момент всё состояние приложения хранится в памяти браузера (in-memory). Бизнес-логика намеренно абстрагирована в **Custom Hooks**, чтобы максимально облегчить подключение полноценной базы данных (PostgreSQL). 
+### Подключение
+- **Host:** localhost
+- **Port:** 5432
+- **Database:** arclient
+- **User:** postgres
+- **Password:** 1234
 
-Для программистов, принимающих проект: **Вся интеграция с БД должна происходить именно внутри этих 3-х файлов (`hooks/*`)**, больше нигде UI трогать не нужно!
+### Существующие таблицы KDS (чтение):
+- `docm2_orders` — заказы
+- `docm2tabl1_items` — позиции заказов
+- `ctlg15_dishes` — блюда
+- `ctlg13_halltables` — столы
 
-### 1. `useOrders.ts` (Работа с заказами)
-Отвечает за текущую очередь приготовления заказов и за историю выполненных.
-- **В памяти**: `orders`, `orderHistory`
-- **PostgreSQL Миграция**: 
-  - `handleAddTestOrder`: Вместо модификации `setOrders` сделать `INSERT INTO orders ...` и `fetchOrders()`.
-  - `handleCompleteOrder` / `handlePartialComplete`: `UPDATE orders SET status='COMPLETED'` с транзакционным переносом в `order_history`.
-  - `setInterval` (Авто-азпарковка): На стороне БД можно использовать периодические триггеры, Cron (pg_cron), или вычисляемые поля `is_parked = unpark_at > now()`.
+### Таблицы модуля нарезчика (prefix `slicer_`, всего 12):
+| Таблица | Назначение |
+|---|---|
+| `slicer_categories` | Категории с порядком сортировки |
+| `slicer_dish_categories` | Ручное назначение slicer-категорий блюдам |
+| `slicer_ingredients` | Справочник ингредиентов (иерархия, стоп-лист) |
+| `slicer_recipes` | Рецепты: блюдо → ингредиент + граммовка |
+| `slicer_dish_aliases` | Алиасы блюд: общий рецепт для вариантов (163/Д163) |
+| `slicer_dish_stoplist` | Актуальный стоп-лист блюд (MANUAL + CASCADE) |
+| `slicer_kds_sync_config` | Конфиг двусторонней синхронизации с rgst3_dishstoplist (OFF по умолчанию) |
+| `slicer_order_state` | Состояние заказов нарезчика (парковка, статус) |
+| `slicer_order_history` | Завершённые заказы (KPI) |
+| `slicer_ingredient_consumption` | Расход ингредиентов |
+| `slicer_stop_history` | История стоп-листа |
+| `slicer_settings` | Настройки модуля (singleton) |
 
-### 2. `useStopList.ts` (Стоп-листы)
-Управляет состоянием доступности Блюд и Ингредиентов. Обладает эффектом **"Каскадного стопа"**: если ингредиент закончился, все зависящие от него блюда автоматически встают в Стоп.
-- **В памяти**: `stopHistory`, модификация стейтов `dishes` и `ingredients`.
-- **PostgreSQL Миграция**: 
-  - `handleToggleStop`: `UPDATE ingredients SET is_stopped = ...`
-  - *Каскадный стоп*: Идеально реализовать через Триггеры (PostgreSQL Triggers) на уровне БД или Database View, чтобы фронтенд лишь вычитывал флаг `is_stopped` у блюда. Окно записи в лог стоп-листа (StopHistory) также лучше спрятать в базу (например, триггер на `UPDATE`).
-
-### 3. `useIngredients.ts` (Справочник сырья)
-Простое CRUD хранилище для справочника.
-- **PostgreSQL Миграция**: Стандартные `SELECT`, `INSERT`, `UPDATE`, `DELETE` из таблицы `ingredients`.
-
----
-
-## ⚡ Ключевые алгоритмы (Core Features)
-
-### 1. Smart Wave Aggregation
-Решает проблему дублирования одинаковых блюд для одного стола (или компании).
-- Управляется функцией: `buildSmartQueue` в файле `smartQueue.ts`.
-- **Алгоритм**: Группирует заказы по "Волнам выноса" (Course). На экране SlicerStation повар видит одну сводную карточку (например, "+5 порций для стола 1" и "+2 порции для стола 3"), если у них одинаковые блюда. Это колоссально снижает нагрузку на терминал.
-
-### 2. Парковка столов (Table Parking)
-В KDS можно "парковать" выдачу чека. Если часть заказа готова, а вторая часть требует ожидания, можно отправить активные заказы "на парковку" с указанием таймера.
-- Заказы исчезают из `ACTIVE` очереди и переходят в `PARKED`.
-- По истечении таймера заказ автоматически возвращается в активную очередь (или может быть возвращен кнопкой вручную).
-
-### 3. Dashboard KPI (Аналитика)
-Расположен в `components/dashboard/`.
-- Высчитывает среднюю скорость выдачи для стандарнтных и "запаркованных" заказов.
-- Строит **MicroTimeline** (диаграмма Ганта) того, сколько времени продукт провел в стоп-листе, **сжимая нерабочие часы ресторана** (исключая ночь и выходные), чтобы показать чистую потерю рабочего времени.
+Подробная документация: `BD_docs/tables/`
 
 ---
 
-## 🚀 Запуск проекта
+## Ключевые фичи
 
-1. Установите зависимости:
+### Smart Wave Aggregation
+Группирует одинаковые блюда по "волнам выноса" для минимизации нагрузки на нарезчика.
+
+### Парковка столов (Table Parking)
+Откладывание заказов с таймером автовозврата. Поддерживает split: часть заказа ACTIVE, часть PARKED.
+
+### Dashboard KPI
+- Средняя скорость приготовления (обычные vs паркованные)
+- Расход ингредиентов с буфером
+- % времени на стопе (с учётом рабочих часов и выходных)
+
+---
+
+## Запуск проекта
+
+### 1. Установить зависимости
 ```bash
 npm install
+cd server && npm install
 ```
-2. Поднимите Development Server:
+
+### 2. Настроить `.env`
+```bash
+cp server/.env.example server/.env
+# Отредактировать server/.env — укажите пароль PostgreSQL и (если нужно) другое имя БД
+```
+
+### 3. Развернуть таблицы модуля в существующую БД `arclient`
+```bash
+# Создать все 10 slicer-таблиц + начальные данные (категории, настройки):
+cd server && npm run migrate
+```
+Либо вручную по порядку:
+```bash
+psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/001_create_slicer_tables.sql
+psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/002_seed_defaults.sql
+psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/003_dish_aliases.sql
+psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/004_dish_categories.sql
+psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/005_dish_stoplist.sql
+psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/006_kds_stoplist_sync.sql
+```
+
+> **Внимание:** перед первым запуском на новом ресторане обновите константу
+> `KITCHEN_STORAGE_UUIDS` в `server/src/routes/orders.ts` и `dishes.ts` под
+> UUID цеха «Кухня» вашей `ctlg17_storages`. Подробнее — в [`Инструкция.md`](Инструкция.md).
+
+### 4. Запустить backend (порт 3001)
+```bash
+cd server && npm run dev
+```
+
+### 5. Запустить frontend (порт 3000)
 ```bash
 npm run dev
 ```
-3. Соберите для Production:
-```bash
-npm run build
+
+### 6. Открыть в браузере
 ```
+http://localhost:3000
+```
+
+> **Для передачи модуля IT-команде заказчика:** см. подробный гайд
+> [`Инструкция.md`](Инструкция.md) в корне проекта.
+
+---
+
+## Команды
+```bash
+# Frontend
+npm install       # Установка зависимостей
+npm run dev       # Dev-сервер (порт 3000)
+npm run build     # Production сборка
+npm run typecheck # Проверка типов (tsc --noEmit)
+npm run lint      # Линтинг (ESLint)
+
+# Backend
+cd server
+npm install       # Установка зависимостей сервера
+npm run dev       # Dev-сервер (порт 3001, hot-reload)
+npm run build     # Компиляция TypeScript
+npm start         # Production запуск
+```
+
+---
+
+## API Endpoints
+
+| Метод | Путь | Описание |
+|---|---|---|
+| GET | `/api/orders` | Активные заказы (polling каждые 4 сек) |
+| POST | `/api/orders/:id/complete` | Завершить заказ |
+| POST | `/api/orders/:id/partial-complete` | Частичное завершение |
+| POST | `/api/orders/:id/restore` | Вернуть из истории (UPSERT slicer_order_state = ACTIVE) |
+| POST | `/api/orders/:id/park` | Парковка стола |
+| POST | `/api/orders/:id/unpark` | Снять с парковки |
+| POST | `/api/orders/:id/merge` | Объединить стеки |
+| POST | `/api/orders/:id/cancel` | Отменить заказ |
+| GET | `/api/dishes` | Справочник блюд кухни (с whitelist по `KITCHEN_STORAGE_UUIDS`) |
+| POST | `/api/dishes/:id/image` | Загрузить фото блюда (multipart/form-data, поле `image`, ≤5МБ) |
+| DELETE | `/api/dishes/:id/image` | Удалить фото блюда (файл + запись в БД) |
+| POST | `/api/ingredients/:id/image` | Загрузить фото ингредиента (multipart, ≤5МБ) |
+| DELETE | `/api/ingredients/:id/image` | Удалить фото ингредиента (файл + image_url) |
+| PUT | `/api/dishes/:dishId/categories` | Назначить блюду slicer-категории (полная замена) |
+| GET | `/api/dish-aliases` | Список алиасов блюд |
+| POST | `/api/dish-aliases` | Создать алиас (автокопия категорий primary → alias) |
+| DELETE | `/api/dish-aliases/:alias_dish_id` | Отвязать алиас |
+| GET | `/api/ingredients` | Список ингредиентов (+ POST/PUT/DELETE) |
+| GET | `/api/categories` | Список категорий (+ POST/PUT/DELETE) |
+| PUT | `/api/categories/reorder` | Пакетная смена порядка |
+| GET | `/api/settings` | Настройки модуля |
+| PUT | `/api/settings` | Обновить настройки |
+| POST | `/api/stoplist/toggle` | Переключить стоп-лист |
+| GET | `/api/stoplist/history` | История стопов |
+| GET | `/api/history/orders` | История заказов |
+| GET | `/api/history/dashboard/speed-kpi` | KPI скорости приготовления (нарезчик) |
+| GET | `/api/history/dashboard/chef-cooking-speed` | Скорость готовки повара (cooktime − finished_at) |
+| GET | `/api/history/dashboard/ingredient-usage` | Расход ингредиентов |
+| GET | `/api/recipes/:dishId` | Рецепт блюда (+ PUT для обновления) |
+| GET | `/api/health` | Проверка здоровья сервера |
+
+Полный список: см. `server/src/routes/`

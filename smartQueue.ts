@@ -18,11 +18,35 @@
 import { Order, Dish, Category, FlatOrderItem, SmartQueueGroup, PriorityLevel } from './types';
 
 // ======================================================================
+// Хелперы состояния разморозки (миграция 016)
+// ======================================================================
+
+/** true если разморозка идёт прямо сейчас (таймер ещё не истёк). */
+export function isDefrostActive(order: Order, now: number = Date.now()): boolean {
+  if (!order.defrost_started_at) return false;
+  const durationMs = (order.defrost_duration_seconds ?? 0) * 1000;
+  return now < order.defrost_started_at + durationMs;
+}
+
+/** true если разморозка была запущена (независимо от того, истёк таймер или нет).
+ * Используется для лишения ULTRA-статуса: любой след разморозки → NORMAL. */
+export function hasDefrostBeenStarted(order: Order): boolean {
+  return order.defrost_started_at != null;
+}
+
+// ======================================================================
 // Вспомогательная функция: определить основную категорию блюда
-// Основная = категория с наименьшим sort_index
+// Основная = категория с наименьшим sort_index.
+// Блюда без slicer-категорий в очередь не попадают (фильтруются на бэке
+// в GET /api/orders через EXISTS по slicer_dish_categories) — это означает,
+// что блюдо готовое (рис, пампушки) и не проходит через нарезчика.
+// Для тест-заказов, где dish может не иметь категорий, getPrimaryCategory
+// вернёт null, и flattenOrders пропустит такую позицию.
 // ======================================================================
 function getPrimaryCategory(dish: Dish, categories: Category[]): Category | null {
-  if (!dish.category_ids || dish.category_ids.length === 0) return null;
+  if (!dish.category_ids || dish.category_ids.length === 0) {
+    return null;
+  }
 
   const dishCategories = dish.category_ids
     .map(id => categories.find(c => c.id === id))
@@ -42,26 +66,70 @@ function getPrimaryCategory(dish: Dish, categories: Category[]): Category | null
 function flattenOrders(
   orders: Order[],
   dishes: Dish[],
-  categories: Category[]
+  categories: Category[],
+  now: number = Date.now()
 ): FlatOrderItem[] {
   const items: FlatOrderItem[] = [];
 
   for (const order of orders) {
     // Пропускаем паркованные заказы — они не участвуют в расчёте волн
     if (order.status === 'PARKED') continue;
+    // Пропускаем активно размораживающиеся — они отображаются мини-карточкой
+    // в ряду над доской, не в основной очереди. Когда таймер истёк (или
+    // нарезчик нажал «Разморозилась»), isDefrostActive вернёт false и
+    // позиция вернётся в сетку (уже без ULTRA, см. разделение ниже).
+    if (isDefrostActive(order, now)) continue;
 
-    const dish = dishes.find(d => d.id === order.dish_id);
-    if (!dish) continue;
+    const rawDish = dishes.find(d => d.id === order.dish_id);
+    if (!rawDish) continue;
+
+    // Канонический id/имя/категория — у primary-блюда (если это alias).
+    // /api/orders уже резолвит dish_id через COALESCE на бэке, но тест-заказы
+    // добавляются локально с оригинальным alias_dish_id — их тоже нужно
+    // свести в одну группу, чтобы агрегация не видела разницы между Д90 и 90.
+    const canonicalDishId = rawDish.recipe_source_id || rawDish.id;
+    const dish = dishes.find(d => d.id === canonicalDishId) || rawDish;
 
     const primaryCat = getPrimaryCategory(dish, categories);
+    // Блюдо без slicer-категории = не идёт через нарезчика (готовое блюдо:
+    // рис, пампушки и т.п.). Пропускаем, чтобы не отрисовывалось на доске.
     if (!primaryCat) continue;
 
-    // Проходим по каждому блоку стека
-    for (let blockIdx = 0; blockIdx < order.table_stack.length; blockIdx++) {
-      const tablesInBlock = order.table_stack[blockIdx] || [];
+    // Проходим по каждому блоку стека. Если table_stack пуст или блок
+    // пустой — падаем на quantity_stack и генерируем порции с tableNumber=0.
+    // Это защита от заказов без привязки к столу (доставка, тесты, битая
+    // связка с ctlg13_halltables на бэке).
+    const stackLength = Math.max(
+      order.table_stack?.length || 0,
+      order.quantity_stack?.length || 0,
+      1
+    );
 
-      // Каждый номер стола в блоке = 1 порция
-      for (const tableNumber of tablesInBlock) {
+    for (let blockIdx = 0; blockIdx < stackLength; blockIdx++) {
+      const tablesInBlock = order.table_stack?.[blockIdx] || [];
+      const blockQuantity = order.quantity_stack?.[blockIdx] ?? tablesInBlock.length ?? 1;
+
+      // Флаг разморозки — единый для всего Order, копируем в каждый FlatItem.
+      // Используется как часть ключа группировки (`groupItemsByDish`) —
+      // размороженные и свежие порции одного блюда не склеиваются в одну
+      // виртуальную карточку (см. коммент к полю в types.ts).
+      const wasDefrosted = hasDefrostBeenStarted(order);
+
+      // Сколько порций разворачиваем: берём МАКСИМУМ из blockQuantity и
+      // числа столов, чтобы не потерять порции, если столов меньше чем qty.
+      // Типичный случай: 3 порции десерта на стол 50 → quantity_stack=[3],
+      // table_stack=[[50]]. Старый код бегал `for (t of tablesInBlock)` и
+      // создавал 1 элемент вместо 3.
+      //
+      // Стол берём по индексу с фолбэком на последний — для 3 порц на 1
+      // столе получим [50, 50, 50], для неоднородных блоков [[50,51]] qty=2
+      // получим [50, 51]. Если столов вообще нет — 0 как tableNumber.
+      const portions = Math.max(blockQuantity, tablesInBlock.length, 1);
+
+      for (let i = 0; i < portions; i++) {
+        const tableNumber = tablesInBlock.length > 0
+          ? (tablesInBlock[i] ?? tablesInBlock[tablesInBlock.length - 1])
+          : 0;
         items.push({
           orderId: order.id,
           dishId: dish.id,
@@ -71,6 +139,7 @@ function flattenOrders(
           tableNumber,
           orderedAt: order.created_at,
           quantity: 1,
+          wasDefrosted,
         });
       }
     }
@@ -134,13 +203,24 @@ export function buildSmartQueue(
   // 1. Развернуть все заказы в плоский массив
   const allItems = flattenOrders(orders, dishes, categories);
 
+  // Индексируем заказы по id — нужно чтобы в разделении ULTRA/normal
+  // проверить флаг разморозки (он живёт на Order, не на FlatOrderItem).
+  const orderById = new Map<string, Order>();
+  for (const o of orders) orderById.set(o.id, o);
+
   // 2. Отделить ULTRA-заказы
+  //    Позиция получает ULTRA только если блюдо ULTRA И разморозка ни разу
+  //    не запускалась. Любой след разморозки (даже уже истёкшая) → NORMAL:
+  //    требование бизнеса — после разморозки карточка встаёт в очередь на
+  //    своё "естественное" место по FIFO и категории, без ULTRA-обгона.
   const ultraItems: FlatOrderItem[] = [];
   const normalItems: FlatOrderItem[] = [];
 
   for (const item of allItems) {
     const dish = dishes.find(d => d.id === item.dishId);
-    if (dish && dish.priority_flag === PriorityLevel.ULTRA) {
+    const order = orderById.get(item.orderId);
+    const wasDefrosted = order ? hasDefrostBeenStarted(order) : false;
+    if (dish && dish.priority_flag === PriorityLevel.ULTRA && !wasDefrosted) {
       ultraItems.push(item);
     } else {
       normalItems.push(item);
@@ -269,23 +349,27 @@ export function buildSmartQueue(
 // Одинаковые блюда → одна SmartQueueGroup
 // ======================================================================
 function groupItemsByDish(items: FlatOrderItem[]): SmartQueueGroup[] {
+  // Ключ — пара (dishId, wasDefrosted). Уже размороженные и свежие порции
+  // одного блюда идут в РАЗНЫЕ группы: иначе клик ❄️ на объединённой
+  // виртуальной карточке перезапускал бы разморозку и на уже готовой рыбе.
   const dishMap = new Map<string, FlatOrderItem[]>();
 
   for (const item of items) {
-    if (!dishMap.has(item.dishId)) {
-      dishMap.set(item.dishId, []);
+    const key = `${item.dishId}_${item.wasDefrosted ? '1' : '0'}`;
+    if (!dishMap.has(key)) {
+      dishMap.set(key, []);
     }
-    dishMap.get(item.dishId)!.push(item);
+    dishMap.get(key)!.push(item);
   }
 
   const groups: SmartQueueGroup[] = [];
 
-  for (const [dishId, dishItems] of dishMap) {
+  for (const dishItems of dishMap.values()) {
     const tables = [...new Set(dishItems.map(i => i.tableNumber))];
     const sourceOrderIds = [...new Set(dishItems.map(i => i.orderId))];
 
     groups.push({
-      dishId,
+      dishId: dishItems[0].dishId,
       dishName: dishItems[0].dishName,
       category: dishItems[0].category,
       categoryId: dishItems[0].categoryId,
@@ -295,6 +379,7 @@ function groupItemsByDish(items: FlatOrderItem[]): SmartQueueGroup[] {
       earliestOrderTime: Math.min(...dishItems.map(i => i.orderedAt)),
       tables,
       position: 0, // Будет присвоена в buildSmartQueue
+      wasDefrosted: dishItems[0].wasDefrosted,
     });
   }
 

@@ -1,7 +1,11 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Category, Dish, IngredientBase, PriorityLevel } from '../../types';
-import { Plus, X, ArrowDown, AlertOctagon, Ban, Check, Edit2, Trash2, Camera, Save } from 'lucide-react';
+import { Plus, X, ArrowDown, AlertOctagon, Ban, Check, Edit2, Trash2, Camera, Save, Link2, Link2Off, Snowflake } from 'lucide-react';
 import { ConfirmModal } from '../ui/ConfirmModal';
+import { fetchDishAliases, linkDishToAlias, unlinkDishAlias, DishAlias } from '../../services/dishAliasesApi';
+import { updateRecipe } from '../../services/recipesApi';
+import { updateDishCategories, updateDishPriority, clearDishSlicerData, updateDishDefrost } from '../../services/dishesApi';
+import { uploadDishImage, deleteDishImage } from '../../services/dishImagesApi';
 
 interface RecipeEditorProps {
   categories: Category[];
@@ -9,22 +13,96 @@ interface RecipeEditorProps {
   setDishes: (dishes: Dish[]) => void;
   ingredients: IngredientBase[];
   handleStopClick: (e: React.MouseEvent, dish: Dish) => void;
+  onRefreshDishes?: () => Promise<void> | void; // для перезагрузки после изменения алиасов
 }
 
-export const RecipeEditor: React.FC<RecipeEditorProps> = ({ 
-  categories, 
-  dishes, 
-  setDishes, 
-  ingredients, 
-  handleStopClick 
+export const RecipeEditor: React.FC<RecipeEditorProps> = ({
+  categories,
+  dishes,
+  setDishes,
+  ingredients,
+  handleStopClick,
+  onRefreshDishes
 }) => {
   const [recipeSearchTerm, setRecipeSearchTerm] = useState('');
   const [isEditingDish, setIsEditingDish] = useState(false);
   const [currentDish, setCurrentDish] = useState<Partial<Dish>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Pending-состояние фото блюда:
+  // pendingImageFile — File выбранный пользователем, ещё не загруженный на сервер.
+  //                    Загружается в saveDishForm multipart-запросом.
+  // imageMarkedForRemoval — пользователь нажал крестик на превью; на сохранении
+  //                    отправится DELETE /api/dishes/:id/image. currentDish.image_url
+  //                    при этом уже очищен, чтобы превью не мелькало.
+  // Превью в диалоге рисуется из currentDish.image_url, куда FileReader кладёт
+  // data-URL для мгновенного показа (не летит на сервер — это только для UI).
+  const [pendingImageFile, setPendingImageFile] = useState<File | null>(null);
+  const [imageMarkedForRemoval, setImageMarkedForRemoval] = useState(false);
   const [expandedCategoryIds, setExpandedCategoryIds] = useState<string[]>([]);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // === Состояние для алиасов ===
+  const [showAliases, setShowAliases] = useState(false); // Показывать alias-блюда в основном списке
+  const [aliases, setAliases] = useState<DishAlias[]>([]); // Все алиасы с бэка
+  const [linkModalForDish, setLinkModalForDish] = useState<Dish | null>(null); // Модалка "Связать блюдо"
+  const [linkModalSearch, setLinkModalSearch] = useState('');
+
+  // Загружаем алиасы при монтировании и после изменений
+  const reloadAliases = async () => {
+    try {
+      const data = await fetchDishAliases();
+      setAliases(data);
+    } catch (err) {
+      console.error('[RecipeEditor] Ошибка загрузки алиасов:', err);
+    }
+  };
+  useEffect(() => {
+    reloadAliases();
+  }, []);
+
+  // Map alias_dish_id → primary_dish_id (для быстрого lookup)
+  const aliasMap = useMemo(() => {
+    const m = new Map<string, string>();
+    aliases.forEach(a => m.set(a.alias_dish_id, a.primary_dish_id));
+    return m;
+  }, [aliases]);
+
+  // Map primary_dish_id → [alias_dish_id, ...] (для отображения связанных)
+  const aliasesByPrimary = useMemo(() => {
+    const m = new Map<string, string[]>();
+    aliases.forEach(a => {
+      if (!m.has(a.primary_dish_id)) m.set(a.primary_dish_id, []);
+      m.get(a.primary_dish_id)!.push(a.alias_dish_id);
+    });
+    return m;
+  }, [aliases]);
+
+  // Проверка: является ли блюдо алиасом (имеет primary)
+  const isAlias = (dishId: string) => aliasMap.has(dishId);
+
+  /** Связать блюдо с primary (сделать его алиасом) */
+  const handleLinkDish = async (aliasDishId: string, primaryDishId: string) => {
+    try {
+      await linkDishToAlias(aliasDishId, primaryDishId);
+      await reloadAliases();
+      if (onRefreshDishes) await onRefreshDishes();
+    } catch (err) {
+      console.error('[RecipeEditor] Ошибка связывания:', err);
+    }
+  };
+
+  /** Отвязать блюдо (удалить алиас) */
+  const handleUnlinkDish = async (aliasDishId: string) => {
+    try {
+      await unlinkDishAlias(aliasDishId);
+      await reloadAliases();
+      if (onRefreshDishes) await onRefreshDishes();
+    } catch (err) {
+      console.error('[RecipeEditor] Ошибка отвязки:', err);
+    }
+  };
 
   const toggleCategory = (catId: string) => {
     setExpandedCategoryIds(prev =>
@@ -35,6 +113,8 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
   const handleEditDish = (dish: Dish) => {
     setCurrentDish({ ...dish });
     setFormError(null);
+    setPendingImageFile(null);
+    setImageMarkedForRemoval(false);
     setIsEditingDish(true);
   };
 
@@ -51,6 +131,8 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
       stop_reason: ''
     });
     setFormError(null);
+    setPendingImageFile(null);
+    setImageMarkedForRemoval(false);
     setIsEditingDish(true);
   };
 
@@ -58,7 +140,13 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
     setConfirmDeleteId(id);
   };
 
-  const saveDishForm = () => {
+  /**
+   * Сохраняет рецепт (ингредиенты) и ручное назначение категорий на бэкенд.
+   * Рецепт пишется в slicer_recipes на primary-блюдо (если текущее —
+   * alias, резолвим через aliasMap). Категории — всегда на оригинальный dishId.
+   * После успеха перезагружает блюда из БД (источник правды).
+   */
+  const saveDishForm = async () => {
     if (!currentDish.name || !currentDish.category_ids?.length) {
       setFormError("Name and at least one Category are required!");
       return;
@@ -70,14 +158,55 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
       return;
     }
 
-    if (dishes.find(d => d.id === currentDish.id)) {
-      setDishes(dishes.map(d => d.id === currentDish.id ? currentDish as Dish : d));
-    } else {
-      setDishes([...dishes, currentDish as Dish]);
+    const dishId = currentDish.id!;
+    // Для алиаса рецепт пишется в primary (общий рецепт для всех вариантов).
+    // Категории — всегда на оригинальный dishId.
+    const recipeDishId = aliasMap.get(dishId) ?? dishId;
+
+    // Маппинг поля ingredients: фронт хранит `id`, бэк ждёт `ingredientId`.
+    const ingredientsPayload = (currentDish.ingredients || []).map(i => ({
+      ingredientId: i.id,
+      quantity: i.quantity,
+    }));
+
+    try {
+      // Сохраняем назначение категорий, приоритет и рецепт последовательно.
+      // Если рецепт упадёт — категории/приоритет уже записаны, это ок (они независимы).
+      // Приоритет сохраняется на оригинальный dishId (не на primary), т.к. у alias
+      // и primary в UI отдельные карточки и могут иметь разный priority_flag.
+      await updateDishCategories(dishId, currentDish.category_ids);
+      await updateDishPriority(dishId, currentDish.priority_flag ?? 1);
+      // Флаг разморозки (миграция 016) пишем на primary — общий для всех
+      // вариантов блюда, как и рецепт. Alias наследует через recipe_source_id.
+      await updateDishDefrost(recipeDishId, currentDish.requires_defrost ?? false);
+      await updateRecipe(recipeDishId, ingredientsPayload);
+
+      // Фото: upload или delete в самом конце, чтобы не блокировать
+      // сохранение рецепта если upload вдруг упадёт (например, слишком
+      // большой файл). Ошибка показывается в форме, но категории/рецепт
+      // уже в БД — пользователь может попробовать снова загрузить фото.
+      if (pendingImageFile) {
+        // Картинку кладём на конкретный dishId (не на primary алиаса) —
+        // алиасы могут быть разными блюдами (зал/доставка) с одинаковым
+        // рецептом но разным видом. Если нужно — пользователь загрузит
+        // фото и для primary отдельно.
+        await uploadDishImage(dishId, pendingImageFile);
+      } else if (imageMarkedForRemoval) {
+        await deleteDishImage(dishId);
+      }
+
+      // Перезагружаем блюда из БД — это источник правды после persist.
+      if (onRefreshDishes) await onRefreshDishes();
+
+      setIsEditingDish(false);
+      setCurrentDish({});
+      setPendingImageFile(null);
+      setImageMarkedForRemoval(false);
+      setFormError(null);
+    } catch (err) {
+      console.error('[RecipeEditor] Ошибка сохранения рецепта:', err);
+      setFormError(err instanceof Error ? err.message : 'Ошибка сохранения рецепта');
     }
-    setIsEditingDish(false);
-    setCurrentDish({});
-    setFormError(null);
   };
 
   const toggleIngredientSelection = (ingId: string) => {
@@ -105,22 +234,32 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
     }
   };
 
+  /**
+   * Пользователь выбрал файл в диалоге.
+   * Файл сохраняется в pendingImageFile (реально уйдёт на сервер при Save),
+   * а превью рисуется через FileReader → data-URL в currentDish.image_url
+   * (это только для глаз, в БД не попадает).
+   * Лимит: 5 МБ — синхронизировано с multer на backend.
+   */
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      if (file.size > 2 * 1024 * 1024) {
-        setFormError('Image size must be less than 2MB.');
-        if (fileInputRef.current) fileInputRef.current.value = '';
-        return;
-      }
-      setFormError(null);
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setCurrentDish(prev => ({ ...prev, image_url: reader.result as string }));
-        if (fileInputRef.current) fileInputRef.current.value = '';
-      };
-      reader.readAsDataURL(file);
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setFormError('Размер фото не должен превышать 5 МБ');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
     }
+    setFormError(null);
+    setPendingImageFile(file);
+    setImageMarkedForRemoval(false);
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      // data-URL только для превью в диалоге
+      setCurrentDish(prev => ({ ...prev, image_url: reader.result as string }));
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    };
+    reader.readAsDataURL(file);
   };
 
   useEffect(() => {
@@ -153,7 +292,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
         <div className="relative flex-1 max-w-md">
           <input
             type="text"
-            placeholder="Search recipes..."
+            placeholder="Поиск рецептов..."
             value={recipeSearchTerm}
             onChange={(e) => setRecipeSearchTerm(e.target.value)}
             className="w-full bg-gray-900 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:border-blue-500 outline-none"
@@ -171,19 +310,31 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
           )}
         </div>
 
+        <label className="flex items-center gap-2 ml-4 text-sm text-gray-300 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={showAliases}
+            onChange={(e) => setShowAliases(e.target.checked)}
+            className="w-4 h-4 accent-blue-500"
+          />
+          Показать связанные варианты
+        </label>
+
         <button
           onClick={handleAddDish}
           className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-500 flex items-center gap-2 font-bold ml-4"
         >
-          <Plus size={20} /> Add New Recipe
+          <Plus size={20} /> Создать Рецепт
         </button>
       </div>
 
       <div className="space-y-4">
-        {categories.filter(c => c.name.toLowerCase() !== 'vip').map(category => {
+        {categories.map(category => {
           const categoryDishes = dishes.filter(d =>
             d.category_ids?.includes(category.id) &&
-            d.name.toLowerCase().includes(recipeSearchTerm.toLowerCase())
+            d.name.toLowerCase().includes(recipeSearchTerm.toLowerCase()) &&
+            // По умолчанию скрываем alias-блюда (те у кого есть primary)
+            (showAliases || !isAlias(d.id))
           );
           if (categoryDishes.length === 0) return null;
 
@@ -248,7 +399,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                             </button>
                             <img src={dish.image_url || "https://via.placeholder.com/150"} className="w-16 h-16 rounded object-cover bg-gray-800" alt="" />
                             <div>
-                              <h3 className="font-bold text-white text-lg leading-tight flex items-center gap-2">
+                              <h3 className="font-bold text-white text-lg leading-tight flex items-center gap-2 flex-wrap">
                                 {dish.name}
                                 {isVip && (
                                   <span className="text-yellow-400 border-2 border-yellow-400 text-[10px] px-1 rounded-sm -rotate-6 font-black tracking-widest shadow-[0_0_10px_rgba(250,204,21,0.5)] bg-yellow-400/10 select-none">
@@ -260,18 +411,37 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                                     ULTRA
                                   </span>
                                 )}
+                                {/* Индикатор «требует разморозки» (миграция 016).
+                                    Голубая ❄️ рядом с названием блюда — чтобы в
+                                    админке сразу видеть какие блюда проходят
+                                    через таймер разморозки. */}
+                                {dish.requires_defrost && (
+                                  <span
+                                    title="Требует разморозки"
+                                    className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-500/15 text-blue-300 border border-blue-500/50 shadow-[0_0_8px_rgba(96,165,250,0.4)]"
+                                  >
+                                    <Snowflake size={12} strokeWidth={2.5} />
+                                  </span>
+                                )}
                               </h3>
-                              <p className="text-xs text-gray-500 font-mono mt-0.5">{dish.ingredients.length} ingredients</p>
+                              <p className="text-xs text-gray-500 font-mono mt-0.5">{dish.ingredients.length} ингредиентов</p>
                               {dish.is_stopped && (
                                 <div className="mt-1">
                                   <span className="text-[10px] text-red-500 font-bold bg-red-900/20 px-1.5 py-0.5 rounded border border-red-900">
-                                    STOPPED: {dish.stop_reason || 'Manual'}
+                                    СТОП: {dish.stop_reason || 'Ручной'}
                                   </span>
                                 </div>
                               )}
                             </div>
                           </div>
                           <div className="flex gap-1">
+                            <button
+                              onClick={() => setLinkModalForDish(dish)}
+                              title="Связать другое блюдо (алиас)"
+                              className="p-2 hover:bg-gray-700 rounded text-gray-400 hover:text-blue-400"
+                            >
+                              <Link2 size={18} />
+                            </button>
                             <button
                               onClick={() => handleEditDish(dish)}
                               className="p-2 hover:bg-gray-700 rounded text-gray-400 hover:text-white"
@@ -289,11 +459,11 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
 
                         <div className="bg-gray-800/50 p-3 rounded space-y-2 text-sm">
                           <div className="flex justify-between">
-                            <span className="text-gray-500">Weight:</span>
+                            <span className="text-gray-500">Порция:</span>
                             <span className="text-gray-300 font-mono">{dish.grams_per_portion}g</span>
                           </div>
                           <div>
-                            <span className="text-gray-500 block mb-1">Ingredients:</span>
+                            <span className="text-gray-500 block mb-1">Ингредиенты:</span>
                             <div className="flex flex-wrap gap-1">
                               {dish.ingredients.map(dishIng => {
                                 const ing = ingredients.find(i => i.id === dishIng.id);
@@ -308,6 +478,48 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                               })}
                             </div>
                           </div>
+
+                          {/* Секция связанных вариантов (алиасов) — только для primary-блюд */}
+                          {(aliasesByPrimary.get(dish.id)?.length ?? 0) > 0 && (
+                            <div className="border-t border-gray-700 pt-2 mt-2">
+                              <span className="text-gray-500 block mb-1 text-xs uppercase tracking-wide">
+                                Связанные варианты ({aliasesByPrimary.get(dish.id)?.length}):
+                              </span>
+                              <div className="flex flex-wrap gap-1">
+                                {aliasesByPrimary.get(dish.id)!.map(aliasId => {
+                                  const aliasDish = dishes.find(d => d.id === aliasId);
+                                  if (!aliasDish) return null;
+                                  return (
+                                    <span key={aliasId} className="text-xs bg-blue-900/40 border border-blue-700/50 px-1.5 py-0.5 rounded text-blue-200 flex items-center gap-1">
+                                      {aliasDish.name}
+                                      <button
+                                        onClick={() => handleUnlinkDish(aliasId)}
+                                        title="Отвязать вариант"
+                                        className="hover:text-red-300"
+                                      >
+                                        <Link2Off size={12} />
+                                      </button>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Если это сам алиас — показать к какому primary привязан */}
+                          {isAlias(dish.id) && (
+                            <div className="border-t border-gray-700 pt-2 mt-2">
+                              <span className="text-xs text-blue-300">
+                                Алиас → использует рецепт primary-блюда
+                              </span>
+                              <button
+                                onClick={() => handleUnlinkDish(dish.id)}
+                                className="ml-2 text-xs text-red-400 hover:text-red-300 underline"
+                              >
+                                Отвязать
+                              </button>
+                            </div>
+                          )}
                         </div>
                       </div>
                     );
@@ -319,7 +531,11 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
         })}
 
         {(() => {
-          const unknownDishes = dishes.filter(d => !d.category_ids || d.category_ids.length === 0);
+          const unknownDishes = dishes.filter(d =>
+            (!d.category_ids || d.category_ids.length === 0) &&
+            d.name.toLowerCase().includes(recipeSearchTerm.toLowerCase()) &&
+            (showAliases || !isAlias(d.id))
+          );
           if (unknownDishes.length === 0) return null;
 
           const isExpanded = expandedCategoryIds.includes('unknown');
@@ -339,7 +555,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                     <ArrowDown size={20} className="text-gray-400" />
                   </span>
                   <h2 className="text-lg font-bold text-gray-400 uppercase tracking-wide">
-                    Uncategorized
+                    Без категории
                   </h2>
                   <span className="bg-gray-700 text-gray-300 text-xs px-2 py-0.5 rounded-full font-mono">
                     {sortedUnknown.length}
@@ -356,7 +572,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                           <div className="w-12 h-12 bg-gray-800 rounded flex items-center justify-center text-gray-600 font-bold">?</div>
                           <div>
                             <h3 className="font-bold text-white text-lg">{dish.name}</h3>
-                            <p className="text-xs text-red-400 font-mono">No Category</p>
+                            <p className="text-xs text-red-400 font-mono">Нет категории</p>
                           </div>
                         </div>
                         <div className="flex gap-1">
@@ -378,9 +594,16 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
           <div className="bg-gray-800 rounded-xl w-full max-w-4xl max-h-[90vh] overflow-y-auto border border-gray-700 shadow-2xl flex flex-col">
             <div className="p-6 border-b border-gray-700 flex justify-between items-center bg-gray-900/50 sticky top-0 z-10 backdrop-blur-md">
               <h2 className="text-2xl font-bold text-white">
-                {dishes.find(d => d.id === currentDish.id) ? 'Edit Recipe' : 'New Recipe'}
+                {dishes.find(d => d.id === currentDish.id) ? 'Редактировать Рецепт' : 'Новый Рецепт'}
               </h2>
-              <button onClick={() => setIsEditingDish(false)} className="text-gray-400 hover:text-white">
+              <button
+                onClick={() => {
+                  setIsEditingDish(false);
+                  setPendingImageFile(null);
+                  setImageMarkedForRemoval(false);
+                }}
+                className="text-gray-400 hover:text-white"
+              >
                 <X size={24} />
               </button>
             </div>
@@ -388,7 +611,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
             <div className="p-8 grid grid-cols-1 lg:grid-cols-2 gap-8">
               <div className="space-y-6">
                 <div>
-                  <label className="block text-gray-400 text-sm font-bold mb-2">Recipe Name</label>
+                  <label className="block text-gray-400 text-sm font-bold mb-2">Название Блюда</label>
                   <input
                     type="text"
                     value={currentDish.name || ''}
@@ -400,7 +623,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
 
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-gray-400 text-sm font-bold mb-2">Categories (Max 3)</label>
+                    <label className="block text-gray-400 text-sm font-bold mb-2">Категории (Макс 3)</label>
                     <div className="flex flex-wrap gap-2 mb-2">
                       {currentDish.category_ids?.map(catId => {
                         const cat = categories.find(c => c.id === catId);
@@ -434,7 +657,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                         }}
                         className="w-full bg-gray-900 border border-gray-700 rounded p-3 text-white focus:border-blue-500 outline-none appearance-none"
                       >
-                        <option value="">+ Add Category</option>
+                        <option value="">+ Добавить Категорию</option>
                         {categories
                           .filter(c => !currentDish.category_ids?.includes(c.id))
                           .map(c => (
@@ -448,20 +671,55 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                     onChange={(e) => setCurrentDish({ ...currentDish, priority_flag: parseInt(e.target.value) })}
                     className="w-full bg-gray-900 border border-gray-700 rounded p-3 text-white focus:border-blue-500 outline-none appearance-none"
                   >
-                    <option value={PriorityLevel.NORMAL}>Normal</option>
+                    <option value={PriorityLevel.NORMAL}>Обычный</option>
                     <option value={PriorityLevel.ULTRA}>ULTRA</option>
                   </select>
                 </div>
 
+                {/* Требует разморозки? (миграция 016)
+                    Значение сохраняется на primary-блюдо (recipe_source_id),
+                    алиасы наследуют. По умолчанию — Нет. На карточке в KDS
+                    Board появится кликабельная ❄️ для запуска разморозки. */}
                 <div>
-                  <label className="block text-gray-400 text-sm font-bold mb-2">Total Weight (Calculated)</label>
+                  <label className="block text-gray-400 text-sm font-bold mb-2">Требует разморозки?</label>
+                  <div className="flex bg-gray-900 rounded border border-gray-700 overflow-hidden w-fit">
+                    <button
+                      type="button"
+                      onClick={() => setCurrentDish({ ...currentDish, requires_defrost: false })}
+                      className={`px-5 py-2 text-sm font-bold transition-all ${
+                        !(currentDish.requires_defrost ?? false)
+                          ? 'bg-slate-700 text-white shadow-inner'
+                          : 'text-gray-500 hover:text-gray-300'
+                      }`}
+                    >
+                      Нет
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCurrentDish({ ...currentDish, requires_defrost: true })}
+                      className={`px-5 py-2 text-sm font-bold transition-all ${
+                        currentDish.requires_defrost
+                          ? 'bg-blue-600 text-white shadow-[0_0_10px_rgba(59,130,246,0.4)]'
+                          : 'text-gray-500 hover:text-gray-300'
+                      }`}
+                    >
+                      Да
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    На карточке появится ❄️ для запуска таймера разморозки (время — в Настройках).
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-gray-400 text-sm font-bold mb-2">Общий Выход Порции (Расчетный)</label>
                   <div className="w-full bg-gray-800 border border-gray-700 rounded p-3 text-blue-400 font-bold font-mono">
                     {currentDish.grams_per_portion || 0} g
                   </div>
                 </div>
 
                 <div>
-                  <label className="block text-gray-400 text-sm font-bold mb-2">Image</label>
+                  <label className="block text-gray-400 text-sm font-bold mb-2">Фотография</label>
                   <div className="flex gap-2 items-center">
                     <button
                       onClick={triggerImageUpload}
@@ -472,7 +730,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                           `}
                     >
                       <Camera size={20} />
-                      {currentDish.image_url ? 'Change Image' : 'Upload Image'}
+                      {currentDish.image_url ? 'Сменить Фото' : 'Загрузить Фото'}
                     </button>
                   </div>
                   {currentDish.image_url && (
@@ -480,10 +738,17 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                       <img src={currentDish.image_url} alt="Preview" className="h-32 w-full object-cover rounded border border-gray-700" />
                       <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center rounded">
                         <button
-                          onClick={() => setCurrentDish({ ...currentDish, image_url: '' })}
+                          onClick={() => {
+                            // Помечаем фото как удалённое: на сохранении уйдёт
+                            // DELETE /api/dishes/:id/image (если было сохранено ранее).
+                            // Если была только pending-загрузка — просто отменяем её.
+                            setPendingImageFile(null);
+                            setImageMarkedForRemoval(true);
+                            setCurrentDish({ ...currentDish, image_url: '' });
+                          }}
                           className="text-red-400 hover:text-red-300 flex items-center gap-1 font-bold bg-black/60 px-3 py-1 rounded"
                         >
-                          <Trash2 size={16} /> Remove
+                          <Trash2 size={16} /> Удалить
                         </button>
                       </div>
                     </div>
@@ -494,9 +759,9 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
               <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-700 flex flex-col h-full">
                 <div className="mb-4 flex-1 overflow-y-auto max-h-[250px] border-b border-gray-700 pb-4">
                   <label className="block text-blue-400 text-sm font-bold mb-3 uppercase tracking-wider">
-                    Selected Ingredients ({currentDish.ingredients?.length || 0})
+                    Выбранные Ингредиенты ({currentDish.ingredients?.length || 0})
                   </label>
-                  {currentDish.ingredients?.length === 0 && <p className="text-gray-500 italic text-sm">No ingredients selected.</p>}
+                  {currentDish.ingredients?.length === 0 && <p className="text-gray-500 italic text-sm">Ингредиенты не выбраны.</p>}
 
                   <div className="space-y-2">
                     {currentDish.ingredients?.map(dishIng => {
@@ -532,7 +797,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                 </div>
 
                 <div className="flex-1 overflow-y-auto pt-2">
-                  <label className="block text-gray-400 text-sm font-bold mb-3 uppercase tracking-wider">Add Ingredients</label>
+                  <label className="block text-gray-400 text-sm font-bold mb-3 uppercase tracking-wider">Все Ингредиенты</label>
                   <div className="space-y-1">
                     {ingredients.filter(i => !i.parentId).map(parent => {
                       const variations = ingredients.filter(i => i.parentId === parent.id);
@@ -552,7 +817,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                               <img src={parent.imageUrl} className="w-8 h-8 rounded object-cover" alt="" />
                               <span className="font-medium">{parent.name}</span>
                             </div>
-                            {isSelected ? <span className="text-xs text-green-500">Added</span> : <Plus size={16} />}
+                            {isSelected ? <span className="text-xs text-green-500">Добавлен</span> : <Plus size={16} />}
                           </div>
 
                           {variations.length > 0 && (
@@ -596,33 +861,126 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                 onClick={() => {
                   setIsEditingDish(false);
                   setFormError(null);
+                  setPendingImageFile(null);
+                  setImageMarkedForRemoval(false);
                 }}
                 className="px-6 py-2 text-gray-400 font-bold hover:text-white transition-colors"
               >
-                Cancel
+                Отмена
               </button>
               <button
                 onClick={saveDishForm}
                 className="px-8 py-3 rounded bg-green-600 hover:bg-green-500 text-white font-bold shadow-lg transform active:scale-95 transition-all flex items-center gap-2"
               >
                 <Save size={20} />
-                Save Recipe
+                Сохранить Рецепт
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* -------------------- CONFIRM DELETE MODAL -------------------- */}
+      {/* -------------------- МОДАЛКА: СВЯЗАТЬ БЛЮДО С ТЕКУЩИМ (АЛИАС) -------------------- */}
+      {linkModalForDish && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl w-full max-w-2xl max-h-[80vh] flex flex-col border border-gray-700 shadow-2xl">
+            <div className="p-6 border-b border-gray-700 flex justify-between items-center">
+              <div>
+                <h2 className="text-xl font-bold text-white">Связать блюда с этим рецептом</h2>
+                <p className="text-sm text-gray-400 mt-1">
+                  Primary: <span className="text-blue-300 font-bold">{linkModalForDish.name}</span>
+                </p>
+                <p className="text-xs text-gray-500 mt-1">
+                  Выбранные блюда будут использовать рецепт этого блюда. На KDS-доске заказы будут агрегироваться в одну карточку.
+                </p>
+              </div>
+              <button
+                onClick={() => { setLinkModalForDish(null); setLinkModalSearch(''); }}
+                className="text-gray-400 hover:text-white"
+              >
+                <X size={24} />
+              </button>
+            </div>
+
+            <div className="p-4 border-b border-gray-700">
+              <input
+                type="text"
+                placeholder="Поиск блюда..."
+                value={linkModalSearch}
+                onChange={(e) => setLinkModalSearch(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 text-white rounded-lg px-4 py-2 focus:border-blue-500 outline-none"
+              />
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-1">
+              {dishes
+                .filter(d =>
+                  d.id !== linkModalForDish.id &&                     // не сам себя
+                  !isAlias(d.id) &&                                    // не уже чей-то алиас
+                  (aliasesByPrimary.get(d.id)?.length ?? 0) === 0 &&   // не является primary (иначе запутаемся)
+                  d.name.toLowerCase().includes(linkModalSearch.toLowerCase())
+                )
+                .sort((a, b) => a.name.localeCompare(b.name))
+                .map(candidate => (
+                  <button
+                    key={candidate.id}
+                    onClick={async () => {
+                      await handleLinkDish(candidate.id, linkModalForDish.id);
+                    }}
+                    className="w-full text-left p-3 rounded bg-gray-900 border border-gray-700 hover:border-blue-500 hover:bg-gray-700 transition-colors flex items-center justify-between"
+                  >
+                    <div className="flex items-center gap-3">
+                      <img src={candidate.image_url || "https://via.placeholder.com/150"} className="w-10 h-10 rounded object-cover bg-gray-800" alt="" />
+                      <div>
+                        <div className="text-white font-medium">{candidate.name}</div>
+                        {candidate.code && <div className="text-xs text-gray-500 font-mono">code: {candidate.code}</div>}
+                      </div>
+                    </div>
+                    <Link2 size={18} className="text-blue-400" />
+                  </button>
+                ))}
+              {dishes.filter(d =>
+                d.id !== linkModalForDish.id &&
+                !isAlias(d.id) &&
+                (aliasesByPrimary.get(d.id)?.length ?? 0) === 0 &&
+                d.name.toLowerCase().includes(linkModalSearch.toLowerCase())
+              ).length === 0 && (
+                <p className="text-center text-gray-500 py-8">Нет доступных блюд для связывания.</p>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-gray-700 flex justify-end">
+              <button
+                onClick={() => { setLinkModalForDish(null); setLinkModalSearch(''); }}
+                className="px-6 py-2 text-gray-400 hover:text-white font-bold"
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* -------------------- CONFIRM RESET MODAL -------------------- */}
+      {/*
+        Сброс slicer-данных блюда: чистим рецепт, назначения категорий и алиасы
+        через DELETE /api/dishes/:dishId/slicer-data. Само блюдо остаётся в
+        ctlg15_dishes и после reload снова появится в секции «Без категории».
+      */}
       <ConfirmModal
         isOpen={!!confirmDeleteId}
         onClose={() => setConfirmDeleteId(null)}
-        title="Delete Recipe?"
-        description="Are you sure you want to delete this recipe? It will be removed from all categories."
-        onConfirm={() => {
-          if (confirmDeleteId) {
-            setDishes(dishes.filter(d => d.id !== confirmDeleteId));
-            setConfirmDeleteId(null);
+        title="Сбросить рецепт?"
+        description="Блюдо вернётся в секцию «Без категории». Ингредиенты рецепта, назначения категорий и связи алиасов будут удалены. Само блюдо останется в системе."
+        onConfirm={async () => {
+          if (!confirmDeleteId) return;
+          const targetId = confirmDeleteId;
+          setConfirmDeleteId(null);
+          try {
+            await clearDishSlicerData(targetId);
+            if (onRefreshDishes) await onRefreshDishes();
+          } catch (err) {
+            console.error('[RecipeEditor] Ошибка сброса slicer-данных:', err);
           }
         }}
       />

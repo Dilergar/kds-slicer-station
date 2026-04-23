@@ -3,6 +3,7 @@
  *
  * Находит DOM-элемент #root в index.html и монтирует в него App-компонент.
  * React.StrictMode включён для обнаружения потенциальных проблем в разработке.
+ * ErrorBoundary оборачивает App для отлова runtime-ошибок.
  */
 
 import React from 'react';

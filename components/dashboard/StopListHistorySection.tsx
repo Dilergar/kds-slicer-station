@@ -1,14 +1,57 @@
 import React, { useState, useMemo } from 'react';
 import { StopHistoryEntry, IngredientBase, Dish, SystemSettings } from '../../types';
-import { 
-  calculateBusinessOverlap, 
-  formatDate, 
-  formatDuration, 
-  DashboardHistoryEntry, 
-  DateGroup, 
-  HistoryGroup 
+import {
+  calculateBusinessOverlap,
+  formatDate,
+  formatDuration,
+  mergeIntervals,
+  sumMergedMs,
+  DashboardHistoryEntry,
+  DateGroup,
+  HistoryGroup
 } from './dashboardUtils';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, Package, Calendar, Search, X, User } from 'lucide-react';
+
+/**
+ * Подпись актора для одной entry: «Поставил: Иванов · Снял: Петров».
+ * Если оба NULL — возвращаем null (UI не рендерит блок).
+ * Если только один известен — показываем только его.
+ * Для kds-источника дополнительно помечаем, что снятие анонимное (rgst3
+ * не пишет кто именно сделал DELETE).
+ */
+const ActorLine: React.FC<{ entry: DashboardHistoryEntry }> = ({ entry }) => {
+  const stopped = entry.stoppedByName;
+  const resumed = entry.resumedByName;
+  if (!stopped && !resumed) return null;
+
+  return (
+    <div className="flex items-center flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-400 mt-1">
+      {stopped && (
+        <span className="inline-flex items-center gap-1">
+          <User size={10} className="text-red-400/70" />
+          <span className="text-slate-500">Поставил:</span>
+          <span className="text-slate-300 font-medium">{stopped}</span>
+          {entry.actorSource === 'kds' && (
+            <span className="text-[9px] uppercase tracking-wider text-blue-400/70 ml-1">KDS</span>
+          )}
+          {entry.actorSource === 'cascade' && (
+            <span className="text-[9px] uppercase tracking-wider text-orange-400/70 ml-1">каскад</span>
+          )}
+        </span>
+      )}
+      {resumed && (
+        <span className="inline-flex items-center gap-1">
+          <User size={10} className="text-green-400/70" />
+          <span className="text-slate-500">Снял:</span>
+          <span className="text-slate-300 font-medium">{resumed}</span>
+        </span>
+      )}
+    </div>
+  );
+};
+
+/** Режим группировки в «Истории Стоп-листов». */
+type GroupMode = 'by-item' | 'by-date';
 
 const MicroTimeline: React.FC<{
   entries: DashboardHistoryEntry[];
@@ -16,16 +59,22 @@ const MicroTimeline: React.FC<{
   rangeEnd: number;
   settings: SystemSettings;
 }> = ({ entries, rangeStart, rangeEnd, settings }) => {
-  if (rangeEnd <= rangeStart) return <div className="h-1.5 w-full bg-slate-800 rounded opacity-50"></div>;
+  // Открыто/закрыто вытащим один раз — раньше одни и те же defaults
+  // подставлялись 2N раз внутри цикла. Для годового отчёта с сотнями
+  // стопов это заметная экономия.
+  const openTime  = settings.restaurantOpenTime  || '12:00';
+  const closeTime = settings.restaurantCloseTime || '23:59';
+  const excluded  = settings.excludedDates;
 
-  const totalBusinessDuration = calculateBusinessOverlap(
-    rangeStart,
-    rangeEnd,
-    settings.restaurantOpenTime || "12:00",
-    settings.restaurantCloseTime || "23:59",
-    settings.excludedDates
+  // totalBusinessDuration — один на всю шкалу. Мемоизируем через useMemo,
+  // чтобы при ре-рендере таблицы (смена expandedCategories и т.п.)
+  // не пересчитывать заново O(N_days).
+  const totalBusinessDuration = React.useMemo(
+    () => calculateBusinessOverlap(rangeStart, rangeEnd, openTime, closeTime, excluded),
+    [rangeStart, rangeEnd, openTime, closeTime, excluded]
   );
 
+  if (rangeEnd <= rangeStart) return <div className="h-1.5 w-full bg-slate-800 rounded opacity-50"></div>;
   if (totalBusinessDuration <= 0) return <div className="h-1.5 w-full bg-slate-800 rounded opacity-30" title="Outside Business Hours"></div>;
 
   return (
@@ -34,26 +83,16 @@ const MicroTimeline: React.FC<{
 
       {entries.map((entry, idx) => {
         const start = Math.max(rangeStart, entry.stoppedAt);
-        const effectiveEnd = entry.isActive ? Math.min(rangeEnd, Date.now()) : entry.resumedAt;
+        // Для активных entry.resumedAt уже содержит reportTime (выставляется
+        // в filteredHistory). Раньше был Date.now() — рассинхрон с
+        // HistoryGroupRow.percentStopped на секунды. Теперь источник один.
+        const effectiveEnd = entry.isActive ? Math.min(rangeEnd, entry.resumedAt) : entry.resumedAt;
         const end = Math.min(rangeEnd, effectiveEnd);
 
         if (end <= start) return null;
 
-        const businessOffsetStart = calculateBusinessOverlap(
-          rangeStart,
-          start,
-          settings.restaurantOpenTime || "12:00",
-          settings.restaurantCloseTime || "23:59",
-          settings.excludedDates
-        );
-
-        const businessDuration = calculateBusinessOverlap(
-          start,
-          end,
-          settings.restaurantOpenTime || "12:00",
-          settings.restaurantCloseTime || "23:59",
-          settings.excludedDates
-        );
+        const businessOffsetStart = calculateBusinessOverlap(rangeStart, start, openTime, closeTime, excluded);
+        const businessDuration    = calculateBusinessOverlap(start, end, openTime, closeTime, excluded);
 
         if (businessDuration <= 0) return null;
 
@@ -62,7 +101,7 @@ const MicroTimeline: React.FC<{
 
         return (
           <div
-            key={idx}
+            key={entry.id || idx}
             className="absolute h-full bg-red-400 group-hover:bg-red-500 transition-colors"
             style={{
               left: `${leftPercent}%`,
@@ -97,7 +136,7 @@ const DateGroupRow: React.FC<{
           </div>
         </td>
         <td className="px-6 py-3 text-gray-400 font-mono text-base">
-          {dateGroup.stopCount} stops
+          {dateGroup.stopCount} раз
         </td>
         <td className="px-6 py-3">
         </td>
@@ -123,8 +162,92 @@ const DateGroupRow: React.FC<{
                 <span className="text-green-300">{formatDate(entry.resumedAt)}</span>
               )}
             </div>
+            <ActorLine entry={entry} />
           </td>
           <td className="px-6 py-3 text-right font-mono text-gray-300 text-base">
+            {formatDuration(entry.durationMs)}
+          </td>
+        </tr>
+      ))}
+    </React.Fragment>
+  );
+};
+
+/**
+ * Строка режима группировки «по датам» (GroupMode = 'by-date').
+ *
+ * Формат:
+ *   ▸ <дата> • <N стопов> • <totalDuration>
+ *       └ имя блюда/ингредиента — reason — time range — duration
+ *       └ ...
+ *
+ * Используем ту же структуру DateGroup что и в by-item режиме, только
+ * здесь DateGroup верхнеуровневый, а не вложенный в HistoryGroup.
+ * Внутри — плоский список entries этого дня с их именами.
+ */
+const ByDateGroupRow: React.FC<{
+  dateGroup: DateGroup;
+}> = ({ dateGroup }) => {
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  // Сортируем entries внутри дня: активные наверху, потом по времени начала убыв.
+  const sortedEntries = [...dateGroup.entries].sort((a, b) => {
+    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    return b.stoppedAt - a.stoppedAt;
+  });
+
+  return (
+    <React.Fragment>
+      <tr
+        className={`cursor-pointer transition-colors border-b border-gray-800 group
+                    bg-slate-800/10 hover:bg-slate-800/20
+                    ${isExpanded ? 'bg-slate-800/30' : ''}`}
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <td className="px-6 py-5 font-bold text-white flex items-center gap-3 text-xl">
+          <div className={`transition-transform duration-200 ${isExpanded ? 'rotate-90' : ''}`}>
+            <ChevronRight size={24} className="text-slate-400" />
+          </div>
+          <span className="text-blue-400">{dateGroup.dateStr}</span>
+        </td>
+        <td className="px-6 py-5 text-gray-400 font-mono text-base">
+          {dateGroup.stopCount} раз
+        </td>
+        <td className="px-6 py-5 text-gray-500 italic text-sm">
+          {/* В by-date режиме таймлайн нерелевантен — один день — одна метка */}
+          {new Set(sortedEntries.map(e => e.ingredientName)).size} продукт(ов)
+        </td>
+        <td className="px-6 py-5 text-right font-mono text-yellow-500 text-xl font-bold">
+          {formatDuration(dateGroup.totalDuration)}
+        </td>
+      </tr>
+
+      {isExpanded && sortedEntries.map((entry, idx) => (
+        <tr
+          key={`${dateGroup.dateStr}-${entry.id || idx}`}
+          className="bg-slate-900/30 border-b border-gray-800/30 text-base hover:bg-slate-800/40"
+        >
+          <td className="px-6 py-3 pl-16 text-base">
+            <div className="flex items-center gap-2">
+              <span className="text-white font-medium">{entry.ingredientName}</span>
+              {entry.isActive && <span className="inline-block w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>}
+            </div>
+            <div className="text-xs text-gray-500 mt-0.5">{entry.reason || 'N/A'}</div>
+          </td>
+          <td className="px-6 py-3"></td>
+          <td className="px-6 py-3 font-mono text-sm">
+            <div className="flex items-center gap-3">
+              <span className="text-blue-300">{formatDate(entry.stoppedAt)}</span>
+              <span className="text-gray-600">→</span>
+              {entry.isActive ? (
+                <span className="text-orange-500 font-bold animate-pulse text-sm uppercase tracking-wider">Active</span>
+              ) : (
+                <span className="text-green-300">{formatDate(entry.resumedAt)}</span>
+              )}
+            </div>
+            <ActorLine entry={entry} />
+          </td>
+          <td className="px-6 py-3 text-right font-mono text-gray-300">
             {formatDuration(entry.durationMs)}
           </td>
         </tr>
@@ -151,14 +274,21 @@ const HistoryGroupRow: React.FC<{
     settings.excludedDates
   ));
 
-  const actualStoppedMs = group.entries.reduce((sum, entry) => {
-    const start = Math.max(rangeStart, entry.stoppedAt);
-    const end = Math.min(effectiveRangeEnd, entry.isActive ? effectiveRangeEnd : entry.resumedAt);
-
-    if (end > start) {
+  // Сливаем перекрывающиеся интервалы entries в union, потом для каждого
+  // непересекающегося отрезка считаем бизнес-overlap. Без merge два
+  // совпадающих стопа давали бы 200%, а % > 100 это бред.
+  const actualStoppedMs = mergeIntervals(
+    group.entries.map(e => ({
+      stoppedAt: e.stoppedAt,
+      resumedAt: e.isActive ? effectiveRangeEnd : e.resumedAt,
+    }))
+  ).reduce((sum, [start, end]) => {
+    const clippedStart = Math.max(rangeStart, start);
+    const clippedEnd = Math.min(effectiveRangeEnd, end);
+    if (clippedEnd > clippedStart) {
       return sum + calculateBusinessOverlap(
-        start,
-        end,
+        clippedStart,
+        clippedEnd,
         settings.restaurantOpenTime || "12:00",
         settings.restaurantCloseTime || "23:59",
         settings.excludedDates
@@ -192,7 +322,7 @@ const HistoryGroupRow: React.FC<{
           {group.isActive && <span className="inline-block w-3 h-3 bg-red-500 rounded-full animate-pulse ml-3"></span>}
         </td>
         <td className="px-6 py-5 text-gray-400 font-mono text-base">
-          {group.stopCount} stops
+          {group.stopCount} раз
         </td>
         <td className="px-6 py-5">
           <div className="flex items-center gap-4 w-full">
@@ -245,6 +375,15 @@ interface StopListHistorySectionProps {
 }
 
 export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ stopHistory, ingredients, dishes, appliedFilter, settings }) => {
+  // Режим группировки: 'by-item' — как раньше (имя блюда/ингредиента → даты),
+  // 'by-date' — обратная иерархия (дата → имена). Переключается тублером.
+  const [groupMode, setGroupMode] = useState<GroupMode>('by-item');
+
+  // Поиск по имени блюда/ингредиента. Фильтр применяется к entries до
+  // группировки — в режиме «по датам» день останется в выдаче только если
+  // в нём есть entries подходящие под запрос.
+  const [searchQuery, setSearchQuery] = useState('');
+
   const filteredHistory = useMemo(() => {
     if (!appliedFilter) return [];
 
@@ -252,13 +391,29 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
     const endTime = appliedFilter.end ? new Date(appliedFilter.end).getTime() : Infinity;
     const reportTime = appliedFilter.timestamp;
 
+    // Завершённые стопы: фильтр по пересечению интервала [stoppedAt; resumedAt]
+    // с [startTime; endTime]. Backend уже отдал правильный набор через
+    // серверный фильтр (Dashboard → fetchStopHistory(from, to)), но на случай
+    // локально загруженной истории / гонки данных повторяем фильтр на фронте.
     const completed: DashboardHistoryEntry[] = stopHistory
-      .filter(entry => entry.stoppedAt >= startTime && entry.stoppedAt <= endTime)
+      .filter(entry => entry.stoppedAt <= endTime && entry.resumedAt >= startTime)
       .map(entry => ({ ...entry, isActive: false }));
 
+    // Активные стопы в отчёте: всё что ещё на стопе прямо сейчас и пересекается
+    // с выбранным периодом. Стоп, начавшийся раньше startTime, но ещё не
+    // снятый, тоже виден — иначе на «отчёт за сегодня» с активным вчерашним
+    // стопом будет ложно казаться что простоя нет.
+    //
+    // Правила фильтра:
+    //   - stop_timestamp <= endTime   — стоп начался до конца периода
+    //   - stop_timestamp <= reportTime — и до момента формирования отчёта
+    //   Стоп, начавшийся до startTime, тоже проходит — он покрывает часть
+    //   периода. Таймлайн MicroTimeline и % downtime уже clip'аются по
+    //   rangeStart через calculateBusinessOverlap, поэтому durationMs здесь
+    //   оставляем полный (симметрично с row.duration_ms для завершённых).
     const activeIngredients: DashboardHistoryEntry[] = ingredients
       .filter(i => i.is_stopped && i.stop_timestamp)
-      .filter(i => i.stop_timestamp! >= startTime && i.stop_timestamp! <= endTime)
+      .filter(i => i.stop_timestamp! <= endTime)
       .filter(i => i.stop_timestamp! <= reportTime)
       .map(i => ({
         id: `active_ing_${i.id}`,
@@ -267,12 +422,12 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
         resumedAt: reportTime,
         reason: i.stop_reason || 'Unknown',
         durationMs: reportTime - i.stop_timestamp!,
-        isActive: true
+        isActive: true,
       }));
 
     const activeDishes: DashboardHistoryEntry[] = dishes
       .filter(d => d.is_stopped && d.stop_timestamp)
-      .filter(d => d.stop_timestamp! >= startTime && d.stop_timestamp! <= endTime)
+      .filter(d => d.stop_timestamp! <= endTime)
       .filter(d => d.stop_timestamp! <= reportTime)
       .map(d => ({
         id: `active_dish_${d.id}`,
@@ -281,19 +436,79 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
         resumedAt: reportTime,
         reason: d.stop_reason || 'Manual',
         durationMs: reportTime - d.stop_timestamp!,
-        isActive: true
+        isActive: true,
       }));
 
     return [...completed, ...activeIngredients, ...activeDishes].sort((a, b) => b.stoppedAt - a.stoppedAt);
   }, [stopHistory, ingredients, dishes, appliedFilter]);
 
+  // Поисковый фильтр поверх filteredHistory. Сделано отдельным useMemo
+  // чтобы агрегация по группам (которая выполняется в render) всегда шла
+  // по уже отфильтрованному набору — тогда и счётчики «N раз», и таймлайн
+  // отражают именно то что видит пользователь.
+  const searchedHistory = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return filteredHistory;
+    return filteredHistory.filter(e => e.ingredientName.toLowerCase().includes(query));
+  }, [filteredHistory, searchQuery]);
+
   return (
     <div className="w-full">
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="text-xl font-bold text-red-400">Stop List History</h3>
-        <div className="flex gap-4 text-xs font-mono">
-          <span className="text-gray-500">Report Generated: <span className="text-white">{formatDate(appliedFilter.timestamp)}</span></span>
-          <span className="text-gray-500">Records: <span className="text-white">{filteredHistory.length}</span></span>
+      <div className="flex items-center justify-between mb-4 gap-4 flex-wrap">
+        <h3 className="text-xl font-bold text-red-400">История Стоп-листов</h3>
+        <div className="flex items-center gap-4 text-xs font-mono">
+          {/* Поиск по имени блюда/ингредиента — работает в обоих режимах
+              группировки (по продуктам / по датам). */}
+          <div className="relative">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Поиск..."
+              className="bg-slate-900 border border-slate-700 text-white text-xs pl-8 pr-7 py-1.5 rounded-lg w-56 focus:border-red-500 focus:outline-none transition-colors"
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-slate-500 hover:text-white"
+                title="Очистить"
+              >
+                <X size={12} />
+              </button>
+            )}
+          </div>
+          {/* Тублер режима группировки. Две кнопки: по продуктам / по датам.
+              Активная подсвечивается синим, неактивная — серая. Иконки
+              (Package / Calendar) подсказывают модель. */}
+          <div className="flex rounded-lg overflow-hidden border border-slate-700 bg-slate-900">
+            <button
+              type="button"
+              onClick={() => setGroupMode('by-item')}
+              title="Группировать по блюду / ингредиенту"
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                groupMode === 'by-item'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-slate-900 text-gray-400 hover:text-white'
+              }`}
+            >
+              <Package size={14} /> По продуктам
+            </button>
+            <button
+              type="button"
+              onClick={() => setGroupMode('by-date')}
+              title="Группировать по дате"
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                groupMode === 'by-date'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-slate-900 text-gray-400 hover:text-white'
+              }`}
+            >
+              <Calendar size={14} /> По датам
+            </button>
+          </div>
+          <span className="text-gray-500">Отчет сформирован: <span className="text-white">{formatDate(appliedFilter.timestamp)}</span></span>
+          <span className="text-gray-500">Записи: <span className="text-white">{searchedHistory.length}</span></span>
         </div>
       </div>
 
@@ -302,75 +517,135 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
           <table className="w-full text-sm text-left">
             <thead className="bg-slate-800 text-gray-400 font-bold uppercase text-base">
               <tr>
-                <th className="px-6 py-4 whitespace-nowrap w-[35%]">Product</th>
-                <th className="px-6 py-4 whitespace-nowrap w-[10%]">Count</th>
-                <th className="px-6 py-4 whitespace-nowrap w-[35%]">Timeline</th>
-                <th className="px-6 py-4 whitespace-nowrap w-[20%] text-right">Duration</th>
+                <th className="px-6 py-4 whitespace-nowrap w-[35%]">
+                  {groupMode === 'by-item' ? 'Продукт' : 'Дата'}
+                </th>
+                <th className="px-6 py-4 whitespace-nowrap w-[10%]">Кол-во</th>
+                <th className="px-6 py-4 whitespace-nowrap w-[35%]">
+                  {groupMode === 'by-item' ? 'Таймлайн' : 'Продукты / время'}
+                </th>
+                <th className="px-6 py-4 whitespace-nowrap w-[20%] text-right">Длительность</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800">
               {(() => {
-                const groupedHistory = filteredHistory.reduce<Record<string, HistoryGroup>>((acc, entry) => {
-                  const key = entry.ingredientName;
-                  if (!acc[key]) {
-                    acc[key] = {
-                      name: entry.ingredientName,
-                      isActive: false,
-                      entries: [],
-                      totalDuration: 0,
-                      stopCount: 0,
-                      dates: {}
-                    };
-                  }
-                  acc[key].entries.push(entry);
-                  acc[key].totalDuration += entry.durationMs;
-                  acc[key].stopCount += 1;
-                  if (entry.isActive) acc[key].isActive = true;
-
-                  const dateObj = new Date(entry.stoppedAt);
-                  const dateStr = dateObj.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
-
-                  if (!acc[key].dates[dateStr]) {
-                    acc[key].dates[dateStr] = {
-                      dateStr,
-                      totalDuration: 0,
-                      stopCount: 0,
-                      entries: []
-                    };
-                  }
-                  acc[key].dates[dateStr].entries.push(entry);
-                  acc[key].dates[dateStr].totalDuration += entry.durationMs;
-                  acc[key].dates[dateStr].stopCount += 1;
-
-                  return acc;
-                }, {});
-
-                const sortedGroups = (Object.values(groupedHistory) as HistoryGroup[]).sort((a, b) => {
-                  if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
-                  return b.totalDuration - a.totalDuration;
-                });
-
-                if (sortedGroups.length === 0) {
+                if (searchedHistory.length === 0) {
                   return (
                     <tr>
                       <td colSpan={5} className="px-6 py-12 text-center text-gray-500 italic">
-                        No records found for the selected period.
+                        {searchQuery.trim()
+                          ? `Ничего не найдено по запросу «${searchQuery}»`
+                          : 'Нет записей за выбранный период.'}
                       </td>
                     </tr>
                   );
                 }
 
-                const timelineStart = appliedFilter.start ? new Date(appliedFilter.start).getTime() : (filteredHistory.length > 0 ? filteredHistory[filteredHistory.length - 1].stoppedAt : Date.now() - 86400000);
-                const timelineEnd = appliedFilter.end ? new Date(appliedFilter.end).getTime() : Date.now();
+                // === Режим «по продуктам»: имя → даты → entries ===
+                if (groupMode === 'by-item') {
+                  const groupedHistory = searchedHistory.reduce<Record<string, HistoryGroup>>((acc, entry) => {
+                    const key = entry.ingredientName;
+                    if (!acc[key]) {
+                      acc[key] = {
+                        name: entry.ingredientName,
+                        isActive: false,
+                        entries: [],
+                        totalDuration: 0,  // пересчитаем ниже через mergeIntervals
+                        stopCount: 0,
+                        dates: {}
+                      };
+                    }
+                    acc[key].entries.push(entry);
+                    acc[key].stopCount += 1;
+                    if (entry.isActive) acc[key].isActive = true;
 
-                return sortedGroups.map((group) => (
-                  <HistoryGroupRow
-                    key={group.name}
-                    group={group}
-                    rangeStart={timelineStart}
-                    rangeEnd={timelineEnd}
-                    settings={settings}
-                  />
+                    const dateObj = new Date(entry.stoppedAt);
+                    const dateStr = dateObj.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+
+                    if (!acc[key].dates[dateStr]) {
+                      acc[key].dates[dateStr] = {
+                        dateStr,
+                        totalDuration: 0,  // пересчитаем ниже
+                        stopCount: 0,
+                        entries: []
+                      };
+                    }
+                    acc[key].dates[dateStr].entries.push(entry);
+                    acc[key].dates[dateStr].stopCount += 1;
+
+                    return acc;
+                  }, {});
+
+                  // Пересчёт totalDuration через union интервалов — чтобы
+                  // перекрывающиеся стопы (типичный кейс когда в ctlg15_dishes
+                  // два блюда с одинаковым именем и оба на стопе) не давали
+                  // двойной подсчёт времени. stopCount остаётся как число
+                  // событий (показывает активность кассира), totalDuration —
+                  // фактический простой блюда.
+                  for (const group of Object.values(groupedHistory) as HistoryGroup[]) {
+                    group.totalDuration = sumMergedMs(group.entries);
+                    for (const dateKey of Object.keys(group.dates)) {
+                      group.dates[dateKey].totalDuration = sumMergedMs(group.dates[dateKey].entries);
+                    }
+                  }
+
+                  const sortedGroups = (Object.values(groupedHistory) as HistoryGroup[]).sort((a, b) => {
+                    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+                    return b.totalDuration - a.totalDuration;
+                  });
+
+                  const timelineStart = appliedFilter.start ? new Date(appliedFilter.start).getTime() : (searchedHistory.length > 0 ? searchedHistory[searchedHistory.length - 1].stoppedAt : Date.now() - 86400000);
+                  const timelineEnd = appliedFilter.end ? new Date(appliedFilter.end).getTime() : Date.now();
+
+                  return sortedGroups.map((group) => (
+                    <HistoryGroupRow
+                      key={group.name}
+                      group={group}
+                      rangeStart={timelineStart}
+                      rangeEnd={timelineEnd}
+                      settings={settings}
+                    />
+                  ));
+                }
+
+                // === Режим «по датам»: дата → entries с именами ===
+                // Одна запись попадает в день НАЧАЛА стопа (если стоп
+                // через полночь — относим к первому дню, чтобы избежать
+                // двойного учёта между датами).
+                const byDate = searchedHistory.reduce<Record<string, DateGroup>>((acc, entry) => {
+                  const dateObj = new Date(entry.stoppedAt);
+                  const dateStr = dateObj.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+                  if (!acc[dateStr]) {
+                    acc[dateStr] = { dateStr, totalDuration: 0, stopCount: 0, entries: [] };
+                  }
+                  acc[dateStr].entries.push(entry);
+                  acc[dateStr].stopCount += 1;
+                  return acc;
+                }, {});
+
+                // TotalDuration дня = sum(union-по-имени для каждого блюда).
+                // Разные блюда складываются (они не взаимозаменяемы), одно
+                // и то же блюдо с дубль-стопами — union (избегаем двойного счёта).
+                for (const dateGroup of Object.values(byDate) as DateGroup[]) {
+                  const perName = new Map<string, DashboardHistoryEntry[]>();
+                  for (const entry of dateGroup.entries) {
+                    const list = perName.get(entry.ingredientName) || [];
+                    list.push(entry);
+                    perName.set(entry.ingredientName, list);
+                  }
+                  let sum = 0;
+                  for (const list of perName.values()) sum += sumMergedMs(list);
+                  dateGroup.totalDuration = sum;
+                }
+
+                const sortedDays = (Object.values(byDate) as DateGroup[]).sort((a, b) => {
+                  const [d1, m1, y1] = a.dateStr.split('.').map(Number);
+                  const [d2, m2, y2] = b.dateStr.split('.').map(Number);
+                  return new Date(y2, m2 - 1, d2).getTime() - new Date(y1, m1 - 1, d1).getTime();
+                });
+
+                return sortedDays.map((dateGroup) => (
+                  <ByDateGroupRow key={dateGroup.dateStr} dateGroup={dateGroup} />
                 ));
               })()}
             </tbody>

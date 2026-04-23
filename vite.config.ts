@@ -20,6 +20,21 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,       // Порт для localhost
         host: '0.0.0.0',  // Открыть для локальной сети (доступ с других устройств)
+        // Проксирование API-запросов и статики на backend (Express, порт 3001)
+        // /api/*    — REST-эндпоинты
+        // /images/* — загруженные фото блюд (slicer_dish_images), раздаются
+        //             Express static из server/public/images/. В проде это
+        //             проксирование делает nginx напрямую с диска, минуя Node.
+        proxy: {
+          '/api': {
+            target: 'http://localhost:3001',
+            changeOrigin: true,
+          },
+          '/images': {
+            target: 'http://localhost:3001',
+            changeOrigin: true,
+          }
+        }
       },
       // Плагины (React для JSX/TSX и HMR)
       plugins: [react()],

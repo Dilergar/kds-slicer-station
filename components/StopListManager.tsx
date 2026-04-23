@@ -3,15 +3,19 @@
  *
  * Иерархическое отображение: Родитель → Разновидности (Children).
  * Включение/выключение стопа с причиной. Каскад: стоп ингредиента → стоп блюда.
- * Режим редактора (PIN: 01151995): CRUD разновидностей, загрузка изображений (Base64).
+ * CRUD разновидностей и загрузка изображений доступны всегда (без PIN).
+ *
+ * Фото ингредиента с миграции 009: multipart-upload через
+ * services/ingredientImagesApi.ts, файл на диске + путь в БД. Раньше был
+ * Base64 в TEXT — симметрично изменению для блюд (миграция 008).
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { IngredientBase } from '../types';
-import { Ban, Check, AlertOctagon, Edit2, Plus, Trash2, X, Save, AlertTriangle, Camera, Image as ImageIcon, Lock } from 'lucide-react';
-import { PIN_CODE } from '../constants';
+import { Ban, Check, AlertOctagon, Edit2, Plus, Trash2, X, Save, AlertTriangle, Camera, Image as ImageIcon, Search } from 'lucide-react';
 import { StopReasonModal } from './StopReasonModal';
 import { ConfirmModal } from './ui/ConfirmModal';
+import { uploadIngredientImage } from '../services/ingredientImagesApi';
 
 interface StopListManagerProps {
   ingredients: IngredientBase[];
@@ -57,12 +61,6 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
   const [editingUnit, setEditingUnit] = useState<'kg' | 'piece'>('kg');
   const [editingWeight, setEditingWeight] = useState<number>(0);
 
-  // Editor Mode State
-  const [isEditorMode, setIsEditorMode] = useState(false);
-  const [showAuthModal, setShowAuthModal] = useState(false);
-  const [pinInput, setPinInput] = useState('');
-  const [pinError, setPinError] = useState(false);
-
   // Parent Editing State (Inside Modal)
   const [isEditingParent, setIsEditingParent] = useState(false);
   const [tempParentName, setTempParentName] = useState('');
@@ -76,10 +74,25 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
   // Confirm Delete Modal State
   const [confirmModalData, setConfirmModalData] = useState<{ id: string, type: 'main' | 'variety' } | null>(null);
 
+  // Строка поиска — фильтрует карточки родительских ингредиентов по названию
+  // самого родителя и по названиям его разновидностей (чтобы найти «Запеченный
+  // Картофель» по слову «запеч» и увидеть его parent «Картофель»).
+  const [searchQuery, setSearchQuery] = useState('');
+
   // Get only MAIN ingredients (parents) and sort them
   const parentIngredients = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
     return ingredients
       .filter(i => !i.parentId)
+      .filter(parent => {
+        if (!query) return true;
+        if (parent.name.toLowerCase().includes(query)) return true;
+        // Если имя parent не совпало — проверяем children: совпадение по
+        // любой разновидности вытягивает весь parent в выдачу.
+        return ingredients.some(child =>
+          child.parentId === parent.id && child.name.toLowerCase().includes(query)
+        );
+      })
       .sort((a, b) => {
         const getPriority = (ing: IngredientBase) => {
           if (ing.is_stopped) return 0; // Top priority
@@ -101,7 +114,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
         return a.name.localeCompare(b.name);
       });
-  }, [ingredients]);
+  }, [ingredients, searchQuery]);
 
   // When modal opens, reset editing state
   useEffect(() => {
@@ -125,7 +138,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
       onToggleStop(ing.id);
     } else {
       setStopModalId(ing.id);
-      setReason('Out of Stock');
+      setReason('Закончилось');
       setCustomReason('');
       setValidationError('');
     }
@@ -135,7 +148,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
     let finalReason = reason;
     if (reason === 'Other') {
       if (!customReason.trim()) {
-        setValidationError('Please enter a reason.');
+        setValidationError('Пожалуйста, укажите причину.');
         return;
       }
       finalReason = customReason.trim();
@@ -210,30 +223,6 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
     }
   };
 
-  // Auth Handlers for Editor Mode
-  const handleToggleEditorMode = () => {
-    if (isEditorMode) {
-      // Turn OFF immediately
-      setIsEditorMode(false);
-    } else {
-      // Turn ON requires PIN
-      setShowAuthModal(true);
-      setPinInput('');
-      setPinError(false);
-    }
-  };
-
-  const verifyPin = () => {
-    if (pinInput === PIN_CODE) {
-      setIsEditorMode(true);
-      setShowAuthModal(false);
-    } else {
-      setPinError(true);
-    }
-  };
-
-
-
   // Image Upload Logic
   const triggerImageUpload = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
@@ -243,18 +232,35 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  /**
+   * Файл выбран в диалоге — загружаем на backend multipart'ом.
+   * Сервер сохранит в server/public/images/ingredients/<id>.<ext> и
+   * запишет путь в slicer_ingredients.image_url. Мы обновляем локальный
+   * state через onUpdateIngredient — это подхватит новый image_url из
+   * ответа сервера, UI покажет картинку по HTTP URL (/images/ingredients/...).
+   * Лимит 5 МБ — синхронизирован с multer на backend.
+   */
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file && uploadingIngredientId) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const base64String = reader.result as string;
-        onUpdateIngredient(uploadingIngredientId, { imageUrl: base64String });
-        setUploadingIngredientId(null);
-        // Reset file input
-        if (fileInputRef.current) fileInputRef.current.value = '';
-      };
-      reader.readAsDataURL(file);
+    if (!file || !uploadingIngredientId) return;
+
+    if (file.size > 5 * 1024 * 1024) {
+      alert('Размер фото не должен превышать 5 МБ');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setUploadingIngredientId(null);
+      return;
+    }
+
+    const targetId = uploadingIngredientId;
+    try {
+      const imageUrl = await uploadIngredientImage(targetId, file);
+      onUpdateIngredient(targetId, { imageUrl });
+    } catch (err) {
+      console.error('[StopListManager] Ошибка загрузки фото:', err);
+      alert(err instanceof Error ? err.message : 'Ошибка загрузки фото');
+    } finally {
+      setUploadingIngredientId(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
@@ -271,23 +277,39 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
       <div className="flex justify-between items-center mb-8">
         <div>
-          <h1 className="text-3xl font-bold text-white mb-2">Stop List Manager</h1>
-          <p className="text-gray-400">Manage Main Ingredients and their specific varieties.</p>
+          <h1 className="text-3xl font-bold text-white mb-2">Менеджер Стоп-Листа</h1>
+          <p className="text-gray-400">Управление основными ингредиентами и их разновидностями.</p>
         </div>
-        <div className="flex items-center gap-3 bg-slate-800 p-2 rounded-lg border border-slate-700">
-          <span className={`text-sm font-bold ${isEditorMode ? 'text-white' : 'text-slate-400'}`}>Editor Mode</span>
-          <button
-            onClick={handleToggleEditorMode}
-            className={`w-12 h-6 rounded-full relative transition-colors duration-300 focus:outline-none
-                 ${isEditorMode ? 'bg-blue-600' : 'bg-slate-600'}
-               `}
-          >
-            <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform duration-300
-                 ${isEditorMode ? 'translate-x-6' : 'translate-x-0'}
-               `}></div>
-          </button>
+        <div className="flex items-center gap-3">
+          {/* Поиск по названию ингредиента (родителя или разновидности).
+              Совпадение по children вытягивает весь parent. */}
+          <div className="relative">
+            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Поиск..."
+              className="bg-slate-800 border border-slate-700 text-white text-sm pl-9 pr-8 py-2 rounded-lg w-64 focus:border-blue-500 focus:outline-none transition-colors"
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-slate-500 hover:text-white"
+                title="Очистить"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
         </div>
       </div>
+
+      {parentIngredients.length === 0 && searchQuery.trim() && (
+        <div className="text-center py-12 text-slate-500 italic">
+          Ничего не найдено по запросу «{searchQuery}»
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
         {parentIngredients.map(ing => {
@@ -337,17 +359,17 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                     </h3>
                     <div className="flex items-center gap-2 mt-1 flex-wrap">
                       <span className="text-xs text-slate-500 font-mono block">
-                        {children.length} Varieties
+                        {children.length} Видов
                       </span>
                       {ing.unitType === 'piece' && (
                         <span className="text-xs text-blue-400 font-mono block mt-1">
-                          1 pc ≈ {ing.pieceWeightGrams}g
+                          1 шт ≈ {ing.pieceWeightGrams}г
                         </span>
                       )}
                       {/* Indicator text if children are stopped but parent is active */}
                       {!ing.is_stopped && hasStoppedChildren && (
                         <span className="text-[10px] font-bold text-orange-400 bg-orange-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
-                          <AlertTriangle size={10} /> PARTIAL STOP
+                          <AlertTriangle size={10} /> ЧАСТИЧНЫЙ СТОП
                         </span>
                       )}
                     </div>
@@ -369,38 +391,36 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                     </div>
                   </button>
 
-                  {/* Main Item Actions: Image, Edit, Delete - ONLY IN EDITOR MODE */}
-                  {isEditorMode && (
-                    <div className="flex items-center gap-1 mt-1 bg-slate-800/50 p-1 rounded-md border border-slate-700/50">
-                      <button
-                        onClick={(e) => triggerImageUpload(e, ing.id)}
-                        className="p-1.5 text-slate-400 hover:text-blue-400 hover:bg-slate-700 rounded transition-colors"
-                        title="Upload Photo"
-                      >
-                        <ImageIcon size={14} />
-                      </button>
-                      <button
-                        onClick={(e) => handleEditMainItemClick(e, ing)}
-                        className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors"
-                        title="Edit"
-                      >
-                        <Edit2 size={14} />
-                      </button>
-                      <button
-                        onClick={(e) => handleDeleteMainItemClick(e, ing.id)}
-                        className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-slate-700 rounded transition-colors"
-                        title="Delete"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  )}
+                  {/* Main Item Actions: Image, Edit, Delete */}
+                  <div className="flex items-center gap-1 mt-1 bg-slate-800/50 p-1 rounded-md border border-slate-700/50">
+                    <button
+                      onClick={(e) => triggerImageUpload(e, ing.id)}
+                      className="p-1.5 text-slate-400 hover:text-blue-400 hover:bg-slate-700 rounded transition-colors"
+                      title="Загрузить Фото"
+                    >
+                      <ImageIcon size={14} />
+                    </button>
+                    <button
+                      onClick={(e) => handleEditMainItemClick(e, ing)}
+                      className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors"
+                      title="Изменить"
+                    >
+                      <Edit2 size={14} />
+                    </button>
+                    <button
+                      onClick={(e) => handleDeleteMainItemClick(e, ing.id)}
+                      className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-slate-700 rounded transition-colors"
+                      title="Удалить"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
                 </div>
               </div>
 
               {ing.is_stopped && (
                 <div className="bg-red-900/20 p-2 rounded border border-red-900/50 text-red-500 text-xs font-bold uppercase text-center mt-2">
-                  Stopped: {ing.stop_reason}
+                  Стоп-лист: {ing.stop_reason}
                 </div>
               )}
 
@@ -409,16 +429,14 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
           );
         })}
 
-        {/* Add New Parent (Simulated) - ONLY IN EDITOR MODE */}
-        {isEditorMode && (
-          <div
-            onClick={() => setIsAddingMainItem(true)}
-            className="h-full border-2 border-dashed border-slate-700 rounded-lg flex flex-col items-center justify-center p-6 cursor-pointer hover:border-slate-500 hover:bg-slate-800/30 transition-colors text-slate-500 hover:text-slate-300 min-h-[120px]"
-          >
-            <Plus size={32} />
-            <span className="font-bold text-sm mt-2">Add Main Item</span>
-          </div>
-        )}
+        {/* Add New Parent */}
+        <div
+          onClick={() => setIsAddingMainItem(true)}
+          className="h-full border-2 border-dashed border-slate-700 rounded-lg flex flex-col items-center justify-center p-6 cursor-pointer hover:border-slate-500 hover:bg-slate-800/30 transition-colors text-slate-500 hover:text-slate-300 min-h-[120px]"
+        >
+          <Plus size={32} />
+          <span className="font-bold text-sm mt-2">Добавить Ингредиент</span>
+        </div>
       </div>
 
       {/* -------------------- ADD MAIN ITEM MODAL -------------------- */}
@@ -427,12 +445,12 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
           <div className="bg-gray-800 p-6 rounded-lg w-96 border border-blue-500/30 shadow-2xl animate-in fade-in zoom-in duration-200">
             <div className="flex items-center text-blue-500 mb-4">
               <Plus className="mr-2" />
-              <h3 className="text-lg font-bold text-white">Add Main Ingredient</h3>
+              <h3 className="text-lg font-bold text-white">Новый Ингредиент</h3>
             </div>
 
             <div className="space-y-4">
               <div>
-                <label className="text-xs text-slate-400 font-bold uppercase block mb-1">Name</label>
+                <label className="text-xs text-slate-400 font-bold uppercase block mb-1">Название</label>
                 <input
                   autoFocus
                   value={newMainName}
@@ -444,26 +462,26 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
               </div>
 
               <div>
-                <label className="text-xs text-slate-400 font-bold uppercase block mb-1">Unit Type</label>
+                <label className="text-xs text-slate-400 font-bold uppercase block mb-1">Единица измерения</label>
                 <div className="flex bg-gray-900 rounded border border-gray-700 p-1">
                   <button
                     onClick={() => setNewMainUnit('kg')}
                     className={`flex-1 py-2 rounded text-sm font-bold transition-colors ${newMainUnit === 'kg' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}
                   >
-                    KG
+                    КГ
                   </button>
                   <button
                     onClick={() => setNewMainUnit('piece')}
                     className={`flex-1 py-2 rounded text-sm font-bold transition-colors ${newMainUnit === 'piece' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}
                   >
-                    PIECE
+                    ШТ
                   </button>
                 </div>
               </div>
 
               {newMainUnit === 'piece' && (
                 <div className="animate-in fade-in slide-in-from-top-2">
-                  <label className="text-xs text-slate-400 font-bold uppercase block mb-1">Weight per Piece (grams)</label>
+                  <label className="text-xs text-slate-400 font-bold uppercase block mb-1">Вес одной шт (граммы)</label>
                   <input
                     type="number"
                     value={newMainWeight || ''}
@@ -476,10 +494,10 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
               <div className="flex gap-3 pt-2">
                 <button onClick={handleSaveNewMainItem} className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold py-2 rounded">
-                  Create
+                  Создать
                 </button>
                 <button onClick={() => setIsAddingMainItem(false)} className="flex-1 bg-transparent border border-gray-600 hover:bg-gray-700 text-white font-bold py-2 rounded">
-                  Cancel
+                  Отмена
                 </button>
               </div>
             </div>
@@ -513,18 +531,16 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                         <h2 className="text-2xl font-bold text-white">
                           {ingredients.find(i => i.id === parentModalId)?.name}
                         </h2>
-                        <p className="text-slate-400 text-sm">Manage specific kinds and varieties</p>
+                        <p className="text-slate-400 text-sm">Управление конкретными видами и сортами</p>
                       </div>
                       <div className="flex items-center gap-1 ml-4 bg-slate-800 p-1 rounded-lg border border-slate-700">
-                        {isEditorMode && (
-                          <button
-                            onClick={() => { setIsAddingVariety(true); setNewVarietyName(''); }}
-                            className="p-2 text-blue-400 hover:bg-slate-700 rounded transition-colors"
-                            title="Add New Variety"
-                          >
-                            <Plus size={18} />
-                          </button>
-                        )}
+                        <button
+                          onClick={() => { setIsAddingVariety(true); setNewVarietyName(''); }}
+                          className="p-2 text-blue-400 hover:bg-slate-700 rounded transition-colors"
+                          title="Добавить Разновидность"
+                        >
+                          <Plus size={18} />
+                        </button>
                       </div>
                     </div>
                   )}
@@ -601,7 +617,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                             {editingUnit === 'piece' && (
                               <input
                                 type="number"
-                                placeholder="Weight (g)"
+                                placeholder="Вес (гр)"
                                 value={editingWeight || ''}
                                 onChange={(e) => setEditingWeight(parseInt(e.target.value))}
                                 className="bg-slate-900 text-white p-1 rounded border border-blue-400 text-xs w-20"
@@ -632,9 +648,9 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
                         <span className={`font-medium text-lg ${child.is_stopped ? 'text-gray-500 line-through' : 'text-white'}`}>
                           {child.name}
-                          {child.unitType === 'piece' && <span className="text-xs text-blue-400 ml-2 font-normal">(1pc ≈ {child.pieceWeightGrams}g)</span>}
+                          {child.unitType === 'piece' && <span className="text-xs text-blue-400 ml-2 font-normal">(1шт ≈ {child.pieceWeightGrams}г)</span>}
                         </span>
-                        {child.is_stopped && <span className="text-xs text-red-500 font-bold bg-red-900/20 px-2 py-0.5 rounded">STOPPED</span>}
+                        {child.is_stopped && <span className="text-xs text-red-500 font-bold bg-red-900/20 px-2 py-0.5 rounded">СТОП-ЛИСТ</span>}
                       </div>
                     )}
 
@@ -655,40 +671,36 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
                       <div className="w-px h-6 bg-slate-700 mx-2"></div>
 
-                      {isEditorMode && (
-                        <>
-                          <button
-                            onClick={(e) => triggerImageUpload(e, child.id)}
-                            className="p-2 hover:bg-slate-700 rounded text-slate-400 hover:text-blue-400"
-                            title="Upload Photo"
-                          >
-                            <ImageIcon size={16} />
-                          </button>
-                          <button
-                            onClick={() => {
-                              setEditingVarietyId(child.id);
-                              setEditingName(child.name);
-                              setEditingUnit(child.unitType || 'kg');
-                              setEditingWeight(child.pieceWeightGrams || 0);
-                            }}
-                            className="p-2 hover:bg-slate-700 rounded text-slate-400 hover:text-white"
-                          >
-                            <Edit2 size={16} />
-                          </button>
-                          <button
-                            onClick={() => setConfirmModalData({ id: child.id, type: 'variety' })}
-                            className="p-2 hover:bg-slate-700 rounded text-slate-400 hover:text-red-400"
-                          >
-                            <Trash2 size={16} />
-                          </button>
-                        </>
-                      )}
+                      <button
+                        onClick={(e) => triggerImageUpload(e, child.id)}
+                        className="p-2 hover:bg-slate-700 rounded text-slate-400 hover:text-blue-400"
+                        title="Загрузить Фото"
+                      >
+                        <ImageIcon size={16} />
+                      </button>
+                      <button
+                        onClick={() => {
+                          setEditingVarietyId(child.id);
+                          setEditingName(child.name);
+                          setEditingUnit(child.unitType || 'kg');
+                          setEditingWeight(child.pieceWeightGrams || 0);
+                        }}
+                        className="p-2 hover:bg-slate-700 rounded text-slate-400 hover:text-white"
+                      >
+                        <Edit2 size={16} />
+                      </button>
+                      <button
+                        onClick={() => setConfirmModalData({ id: child.id, type: 'variety' })}
+                        className="p-2 hover:bg-slate-700 rounded text-slate-400 hover:text-red-400"
+                      >
+                        <Trash2 size={16} />
+                      </button>
                     </div>
                   </div>
                 ))}
 
                 {ingredients.filter(i => i.parentId === parentModalId).length === 0 && !isAddingVariety && (
-                  <div className="text-center py-8 text-slate-500 italic">No varieties added yet.</div>
+                  <div className="text-center py-8 text-slate-500 italic">Пока нет разновидностей.</div>
                 )}
               </div>
 
@@ -724,52 +736,15 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
       />
 
 
-      {/* -------------------- PIN AUTH MODAL -------------------- */}
-      {
-        showAuthModal && (
-          <div className="fixed inset-0 bg-black/90 flex items-center justify-center z-[70]">
-            <div className="bg-gray-800 p-6 rounded-lg w-72 text-center border border-gray-600 shadow-2xl animate-in fade-in zoom-in duration-200">
-              <Lock size={32} className="mx-auto text-blue-500 mb-4" />
-              <h3 className="text-white font-bold mb-2">Security Check</h3>
-              <p className="text-xs text-gray-400 mb-4">
-                Enter Supervisor PIN to enable Editor Mode.
-              </p>
-
-              <input
-                type="password"
-                value={pinInput}
-                onChange={(e) => setPinInput(e.target.value)}
-                className={`w-full bg-gray-900 text-white text-center text-xl tracking-widest p-2 rounded border mb-4 outline-none
-                ${pinError ? 'border-red-500' : 'border-gray-700 focus:border-blue-500'}
-              `}
-                placeholder="••••••••"
-                autoFocus
-                onKeyDown={(e) => e.key === 'Enter' && verifyPin()}
-              />
-              {pinError && <p className="text-red-500 text-xs mb-3">Incorrect PIN</p>}
-
-              <div className="grid grid-cols-2 gap-2">
-                <button onClick={verifyPin} className="bg-blue-600 text-white py-2 rounded font-bold hover:bg-blue-500">
-                  Unlock
-                </button>
-                <button onClick={() => setShowAuthModal(false)} className="bg-gray-700 text-white py-2 rounded hover:bg-gray-600">
-                  Cancel
-                </button>
-              </div>
-            </div>
-          </div>
-        )
-      }
-
       {/* -------------------- CONFIRM DELETE MODAL -------------------- */}
       <ConfirmModal
         isOpen={!!confirmModalData}
         onClose={() => setConfirmModalData(null)}
-        title={confirmModalData?.type === 'main' ? "Delete Main Item?" : "Delete Variety?"}
+        title={confirmModalData?.type === 'main' ? "Удалить Ингредиент?" : "Удалить Разновидность?"}
         description={
           confirmModalData?.type === 'main' 
-            ? "Are you sure you want to delete this Main Item? All its varieties will also be permanently deleted."
-            : "Are you sure you want to delete this variety?"
+            ? "Вы уверены, что хотите удалить этот Ингредиент? Все его разновидности также будут удалены."
+            : "Вы уверены, что хотите удалить эту разновидность?"
         }
         onConfirm={() => {
           if (confirmModalData) {

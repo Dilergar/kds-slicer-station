@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { SystemSettings } from '../../types';
-import { Check, Ban } from 'lucide-react';
+import { Check, Ban, Snowflake } from 'lucide-react';
 
 interface SystemSettingsTabProps {
   settings: SystemSettings;
@@ -12,15 +12,15 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
 
   return (
     <div className="bg-kds-card rounded-lg p-6 max-w-2xl">
-      <h2 className="text-xl font-bold text-white mb-6">System Settings</h2>
+      <h2 className="text-xl font-bold text-white mb-6">Общие Настройки</h2>
 
       <div className="space-y-8">
         {/* 1. Business Hours */}
         <div className="border-b border-gray-700 pb-8">
-          <label className="block text-gray-400 font-bold mb-4">Restaurant Business Hours</label>
+          <label className="block text-gray-400 font-bold mb-4">Время работы ресторана</label>
           <div className="flex gap-4">
             <div className="flex-1">
-              <label className="block text-xs text-gray-500 mb-1">Open Time</label>
+              <label className="block text-xs text-gray-500 mb-1">Время открытия</label>
               <input
                 type="time"
                 value={settings.restaurantOpenTime || "12:00"}
@@ -29,7 +29,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
               />
             </div>
             <div className="flex-1">
-              <label className="block text-xs text-gray-500 mb-1">Close Time</label>
+              <label className="block text-xs text-gray-500 mb-1">Время закрытия</label>
               <input
                 type="time"
                 value={settings.restaurantCloseTime || "00:00"}
@@ -38,12 +38,12 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
               />
             </div>
           </div>
-          <p className="text-xs text-gray-500 mt-2">Downtime KPI will only be calculated during these hours.</p>
+          <p className="text-xs text-gray-500 mt-2">Downtime KPI будет рассчитываться только в эти часы.</p>
         </div>
 
         {/* 2. Excluded Dates Calendar */}
         <div className="border-b border-gray-700 pb-8">
-          <label className="block text-gray-400 font-bold mb-4">Excluded Dates (Holidays / Closed)</label>
+          <label className="block text-gray-400 font-bold mb-4">Исключенные Дни (Выходные / Праздники)</label>
           <div className="bg-gray-900/50 p-4 rounded-lg border border-gray-700">
             {/* Calendar Header */}
             <div className="flex justify-between items-center mb-4">
@@ -55,7 +55,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
                 }}
                 className="p-1 hover:bg-gray-700 rounded text-gray-400"
               >
-                &lt; Prev
+                &lt; Пред
               </button>
               <span className="text-white font-bold">
                 {currentDate.toLocaleString('default', { month: 'long', year: 'numeric' })}
@@ -68,7 +68,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
                 }}
                 className="p-1 hover:bg-gray-700 rounded text-gray-400"
               >
-                Next &gt;
+                След &gt;
               </button>
             </div>
 
@@ -130,11 +130,11 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
             <div className="mt-4 flex gap-4 text-xs">
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 bg-gray-800 rounded border border-gray-700"></div>
-                <span className="text-gray-400">Working Day</span>
+                <span className="text-gray-400">Рабочий день</span>
               </div>
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 bg-red-900/50 rounded border border-red-500"></div>
-                <span className="text-gray-400">Excluded (Holiday/Closed)</span>
+                <span className="text-gray-400">Исключенный день</span>
               </div>
             </div>
           </div>
@@ -142,8 +142,8 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
 
         {/* 3. Other Settings */}
         <div>
-          <label className="block text-gray-400 font-bold mb-2">History Retention (Minutes)</label>
-          <p className="text-xs text-gray-500 mb-2">How long completed orders remain in the history list (Max 120 min).</p>
+          <label className="block text-gray-400 font-bold mb-2">Хранение истории (минуты)</label>
+          <p className="text-xs text-gray-500 mb-2">Как долго отданные заказы висят на доске истории (Макс 120 мин).</p>
           <input
             type="number"
             min={1}
@@ -159,14 +159,75 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
           />
         </div>
 
+        {/* Разморозка (миграция 016) — время таймера + звук уведомления.
+            Применяется только к блюдам с requires_defrost=true (настраивается
+            в RecipeEditor). Snapshot в момент запуска — изменение этого поля
+            не сбивает уже запущенные таймеры. */}
+        <div className="border-t border-gray-700 pt-6">
+          <label className="block text-gray-400 font-bold mb-2 flex items-center gap-2">
+            <Snowflake size={16} className="text-blue-400" />
+            Время разморозки (минуты)
+          </label>
+          <p className="text-xs text-gray-500 mb-2">
+            Сколько минут размораживаются блюда с флагом «Требует разморозки?» в рецепте. От 1 до 60, по умолчанию 15.
+          </p>
+          <input
+            type="number"
+            min={1}
+            max={60}
+            value={settings.defrostDurationMinutes ?? 15}
+            onChange={(e) => {
+              let val = parseInt(e.target.value) || 15;
+              if (val > 60) val = 60;
+              if (val < 1) val = 1;
+              setSettings({ ...settings, defrostDurationMinutes: val });
+            }}
+            className="bg-gray-900 border border-gray-700 text-white p-3 rounded w-full md:w-48 focus:border-blue-500 outline-none"
+          />
+
+          {/* Toggle звука при истечении таймера */}
+          <div className="flex justify-between items-start mt-6">
+            <div>
+              <label className="block text-gray-400 text-sm font-bold mb-1">
+                Звук при готовности разморозки
+              </label>
+              <p className="text-gray-500 text-xs max-w-md">
+                Короткий сигнал когда таймер на мини-карточке достиг 0. Помогает не пропустить готовую рыбу в шумной кухне.
+              </p>
+            </div>
+            <div className="flex items-center bg-gray-900 rounded-lg p-1 border border-gray-700 ml-4">
+              <button
+                onClick={() => setSettings({ ...settings, enableDefrostSound: false })}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                  settings.enableDefrostSound === false
+                    ? 'bg-red-900/80 text-red-100 shadow-[0_0_10px_rgba(153,27,27,0.4)]'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                ВЫКЛ
+              </button>
+              <button
+                onClick={() => setSettings({ ...settings, enableDefrostSound: true })}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                  settings.enableDefrostSound !== false
+                    ? 'bg-blue-600 text-white shadow-[0_0_10px_rgba(37,99,235,0.4)]'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                ВКЛ
+              </button>
+            </div>
+          </div>
+        </div>
+
         <div className="border-t border-gray-700 pt-6">
           <div className="flex justify-between items-start mb-2">
             <div>
               <label className="block text-gray-400 text-sm font-bold mb-1">
-                Aggregation Window (minutes)
+                Окно Агрегации (минуты)
               </label>
               <p className="text-gray-500 text-sm mb-3 max-w-md">
-                Orders for the same dish will only stack together if the existing order has been waiting less than this time.
+                Одинаковые блюда с разных столов сольются вместе, только если между заказами прошло меньше этого времени.
               </p>
             </div>
             {/* On/Off Toggle */}
@@ -178,7 +239,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
                   : 'text-gray-500 hover:text-gray-300'
                   }`}
               >
-                OFF
+                ВЫКЛ
               </button>
               <button
                 onClick={() => setSettings({ ...settings, enableAggregation: true, enableSmartAggregation: false })}
@@ -187,7 +248,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
                   : 'text-gray-500 hover:text-gray-300'
                   }`}
               >
-                ON
+                ВКЛ
               </button>
             </div>
           </div>
@@ -201,7 +262,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
               onChange={(e) => setSettings({ ...settings, aggregationWindowMinutes: parseInt(e.target.value) || 5 })}
               className="w-24 bg-gray-900 border border-gray-700 rounded p-3 text-white text-center font-mono text-xl focus:border-blue-500 outline-none"
             />
-            <span className="text-gray-400">minutes</span>
+            <span className="text-gray-400">минут</span>
           </div>
 
           {/* Smart Wave Aggregation Toggle */}
@@ -209,9 +270,9 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
             <div>
               <div className="flex items-center">
                 <label className="block text-gray-400 text-sm font-bold mb-1">
-                  Smart Wave Aggregation
+                  Волновая Агрегация (Умная)
                 </label>
-                <span className="ml-2 bg-yellow-500/20 text-yellow-300 text-[10px] px-1.5 py-0.5 rounded uppercase font-bold tracking-wider border border-yellow-500/30">New</span>
+                <span className="ml-2 bg-yellow-500/20 text-yellow-300 text-[10px] px-1.5 py-0.5 rounded uppercase font-bold tracking-wider border border-yellow-500/30">Новое</span>
               </div>
               <p className="text-gray-500 text-sm mb-3 max-w-md">
                 Волновая система: строит оптимальную очередь по категориям (суп→салат→горячее→десерт), объединяя одинаковые блюда из разных столов. Использует ⏱️ COURSE_FIFO окно для FIFO между волнами.
@@ -225,7 +286,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
                   : 'text-gray-500 hover:text-gray-300'
                   }`}
               >
-                OFF
+                ВЫКЛ
               </button>
               <button
                 onClick={() => setSettings({ ...settings, enableSmartAggregation: true, enableAggregation: false })}
@@ -234,7 +295,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
                   : 'text-gray-500 hover:text-gray-300'
                   }`}
               >
-                ON
+                ВКЛ
               </button>
             </div>
           </div>
@@ -243,7 +304,7 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
         <div className="border-t border-gray-700 pt-4">
           <p className="text-green-400 text-sm flex items-center gap-2">
             <Check size={16} />
-            Settings are saved automatically
+            Настройки сохраняются автоматически
           </p>
         </div>
       </div>

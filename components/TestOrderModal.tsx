@@ -27,16 +27,16 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-[100]">
       <div className="bg-kds-card p-6 rounded-lg w-[32rem] border border-slate-700 shadow-2xl">
         <h3 className="text-lg font-bold text-white mb-6 flex items-center border-b border-slate-800 pb-4">
-          <Zap className="mr-2 text-yellow-400" /> Simulate Waiter Terminal
+          <Zap className="mr-2 text-yellow-400" /> Симулятор Терминала Официанта
         </h3>
 
         <div className="space-y-4">
           {/* Ticket Header (Table Number) */}
           <div>
-            <label className="text-xs font-bold text-slate-400 uppercase mb-2 block">Table Number</label>
+            <label className="text-xs font-bold text-slate-400 uppercase mb-2 block">Номер Стола</label>
             <input
               type="number"
-              placeholder="Enter Table #"
+              placeholder="Укажите стол"
               value={testTableInput}
               onChange={(e) => setTestTableInput(e.target.value)}
               className="w-full bg-slate-900 text-white p-3 rounded border border-slate-700 outline-none focus:border-blue-500 transition-colors font-mono text-xl font-bold"
@@ -47,7 +47,7 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
           <div className="bg-slate-800/50 p-4 rounded-lg border border-slate-700">
             <div className="flex gap-4 mb-4">
               <div className="flex-1">
-                <label className="text-xs font-bold text-slate-400 uppercase mb-1 block">Dish</label>
+                <label className="text-xs font-bold text-slate-400 uppercase mb-1 block">Блюдо</label>
                 <select
                   className="w-full bg-slate-900 text-white p-2 rounded border border-slate-700 outline-none focus:border-blue-500"
                   value={testDishId}
@@ -62,7 +62,7 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
                 </select>
               </div>
               <div className="w-20">
-                <label className="text-xs font-bold text-slate-400 uppercase mb-1 block">Qty</label>
+                <label className="text-xs font-bold text-slate-400 uppercase mb-1 block">Кол-во</label>
                 <input
                   type="number"
                   min="1"
@@ -72,13 +72,13 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
                 />
               </div>
               <div className="w-1/3">
-                <label className="text-xs font-bold text-slate-400 uppercase mb-1 block">Priority</label>
+                <label className="text-xs font-bold text-slate-400 uppercase mb-1 block">Приоритет</label>
                 <select
                   className="w-full bg-slate-900 text-white p-2 rounded border border-slate-700 outline-none focus:border-blue-500"
                   value={testPriority}
                   onChange={(e) => setTestPriority(parseInt(e.target.value))}
                 >
-                  <option value={PriorityLevel.NORMAL}>Normal</option>
+                  <option value={PriorityLevel.NORMAL}>Обычный</option>
                   <option value={PriorityLevel.ULTRA}>🚨 ULTRA</option>
                 </select>
               </div>
@@ -100,7 +100,7 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
               }}
               className="w-full bg-slate-700 hover:bg-slate-600 text-white font-bold py-2 rounded transition-colors text-sm flex items-center justify-center"
             >
-              <Plus size={16} className="mr-2" /> Add Selection to Ticket
+              <Plus size={16} className="mr-2" /> Добавить в Чек
             </button>
           </div>
 
@@ -109,7 +109,7 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
             {testTicketItems.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-slate-500 opacity-50">
                 <span className="text-4xl mb-2">🧾</span>
-                <span className="text-sm">Ticket is empty</span>
+                <span className="text-sm">Чек пуст</span>
               </div>
             ) : (
               <div className="space-y-1">
@@ -123,7 +123,7 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
                         </div>
                         <div>
                           <div className={item.priority === PriorityLevel.ULTRA ? 'text-red-400 font-bold' : 'text-gray-300'}>
-                            {d?.name || 'Unknown'}
+                            {d?.name || 'Неизвестно'}
                           </div>
                           {item.priority === PriorityLevel.ULTRA && <span className="text-[10px] bg-red-900 text-red-100 px-1 rounded inline-block mt-0.5">ULTRA</span>}
                         </div>
@@ -150,13 +150,13 @@ export const TestOrderModal: React.FC<TestOrderModalProps> = ({ dishes, onClose,
               disabled={testTicketItems.length === 0}
               className="flex-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold py-3 rounded transition-colors flex items-center justify-center"
             >
-              <Send size={20} className="mr-2" /> Send Order to Kitchen
+              <Send size={20} className="mr-2" /> Отправить Заказ на Кухню
             </button>
             <button
               onClick={onClose}
               className="bg-slate-800 hover:bg-slate-700 text-white font-bold py-3 px-6 rounded transition-colors border border-slate-700"
             >
-              Cancel
+              Отмена
             </button>
           </div>
         </div>

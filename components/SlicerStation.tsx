@@ -21,7 +21,9 @@ import { Dish, Order, Category, IngredientBase, PriorityLevel, OrderHistoryEntry
 import { Clock, Flame, Check, Layers, AlertTriangle, PauseCircle, Car, X, CalendarClock, History, Undo, ArrowLeft, MoveLeft, ArrowUp, PieChart } from 'lucide-react';
 import { PartialCompletionModal } from './PartialCompletionModal';
 import { OrderCard } from './OrderCard';
-import { buildSmartQueue } from '../smartQueue';
+import { DefrostRow } from './DefrostRow';
+import { DefrostModal } from './DefrostModal';
+import { buildSmartQueue, isDefrostActive, hasDefrostBeenStarted } from '../smartQueue';
 
 interface SlicerStationProps {
   orders: Order[];
@@ -40,6 +42,12 @@ interface SlicerStationProps {
   orderHistory?: OrderHistoryEntry[];
   onRestoreOrder?: (id: string) => void;
   settings?: SystemSettings;
+  // Разморозка (миграция 016). Все три принимают sourceOrderItemIds для
+  // Smart Wave: резолв виртуального id → реальные order_item_id делается
+  // здесь внутри через smartQueueMappingRef.
+  onStartDefrost?: (orderId: string, sourceOrderItemIds?: string[]) => void;
+  onCancelDefrost?: (orderId: string, sourceOrderItemIds?: string[]) => void;
+  onCompleteDefrost?: (orderId: string, sourceOrderItemIds?: string[]) => void;
 }
 
 export const SlicerStation: React.FC<SlicerStationProps> = ({
@@ -58,7 +66,10 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   onCancelOrder,
   orderHistory = [],
   onRestoreOrder,
-  settings
+  settings,
+  onStartDefrost,
+  onCancelDefrost,
+  onCompleteDefrost
 }) => {
   const retentionMinutes = settings?.historyRetentionMinutes || 60;
   const [showTestModal, setShowTestModal] = useState(false);
@@ -95,6 +106,133 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
 
   // === Трекинг виртуальных заказов, которые были "merged" (нажата кнопка объединения) ===
   const [mergedVirtualIds, setMergedVirtualIds] = useState<Set<string>>(new Set());
+
+  // === «В работе» — локальный визуальный claim карточки ===
+  // Чисто UI-состояние для координации двух нарезчиков за одним планшетом:
+  // тап по карточке → неоновая рамка + 🔪 у количества порции. Повторный
+  // тап снимает. Не пишется в БД, не переживает F5, не участвует в отчётах —
+  // только сигнал «эту уже кто-то взял, не трогай».
+  const [inWorkIds, setInWorkIds] = useState<Set<string>>(new Set());
+
+  const toggleInWork = useCallback((orderId: string) => {
+    setInWorkIds(prev => {
+      const next = new Set(prev);
+      if (next.has(orderId)) next.delete(orderId);
+      else next.add(orderId);
+      return next;
+    });
+  }, []);
+
+  // === Разморозка: группировка и маппинг (миграция 016) ===
+  // Группируем активно размораживающиеся заказы по (dish_id + started_at с
+  // точностью до 5 сек). Это объединяет Smart Wave «вспышки» (когда клик по
+  // одной виртуальной карточке стартует разморозку на 3 реальных order_item_id)
+  // в одну мини-карточку, но оставляет независимые разморозки того же блюда
+  // в разное время как отдельные карточки. Каждой группе выдаём синтетический
+  // Order — им кормим DefrostRow и DefrostModal как обычной карточкой.
+  const defrostingGroups = useMemo(() => {
+    const BUCKET_MS = 5000; // допуск между связанными source_order_id
+    const groups = new Map<string, {
+      virtualId: string;
+      dishId: string;
+      startedAt: number;
+      durationSec: number;
+      earliestCreatedAt: number;
+      sourceOrderIds: string[];
+      totalQuantity: number;
+      tableBlocks: number[][];
+      accumulatedTimeMs: number;
+    }>();
+
+    for (const o of orders) {
+      if (!isDefrostActive(o, now)) continue;
+      const bucket = Math.floor((o.defrost_started_at ?? 0) / BUCKET_MS);
+      const key = `${o.dish_id}_${bucket}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          virtualId: `defrost_${o.dish_id}_${bucket}`,
+          dishId: o.dish_id,
+          startedAt: o.defrost_started_at!,
+          durationSec: o.defrost_duration_seconds ?? 0,
+          earliestCreatedAt: o.created_at,
+          sourceOrderIds: [],
+          totalQuantity: 0,
+          tableBlocks: [],
+          accumulatedTimeMs: 0,
+        };
+        groups.set(key, g);
+      }
+      g.sourceOrderIds.push(o.id);
+      // Для FIFO внутри карточки берём самый ранний created_at — соответствует
+      // логике Smart Wave (earliestOrderTime группы).
+      if (o.created_at < g.earliestCreatedAt) g.earliestCreatedAt = o.created_at;
+      // Аккумулируем время (накопленное из парковки) — максимум по группе.
+      if ((o.accumulated_time_ms ?? 0) > g.accumulatedTimeMs) {
+        g.accumulatedTimeMs = o.accumulated_time_ms ?? 0;
+      }
+      const qty = o.quantity_stack.reduce((a, b) => a + b, 0);
+      g.totalQuantity += qty;
+      // Столы: каждый source order вносит свой блок. Если столов нет — пустой
+      // блок пропускаем, иначе table_stack в синтетическом Order будет [[]]
+      // и OrderCard нарисует пустые строки.
+      const tables = (o.table_stack || []).flat().filter(Boolean);
+      if (tables.length > 0) g.tableBlocks.push(tables);
+    }
+
+    return Array.from(groups.values()).map(g => {
+      // Синтетический Order для отрисовки в OrderCard (и модалке, и мини-ряду).
+      // quantity_stack/table_stack — уже «merged» вид, чтобы карточка не
+      // показывала «1+1+1» и красную стрелку Merge.
+      const virtualOrder: Order = {
+        id: g.virtualId,
+        dish_id: g.dishId,
+        quantity_stack: [g.totalQuantity],
+        table_stack: g.tableBlocks.length > 0 ? [g.tableBlocks.flat()] : [[]],
+        created_at: g.earliestCreatedAt,
+        updated_at: Date.now(),
+        status: 'ACTIVE',
+        accumulated_time_ms: g.accumulatedTimeMs,
+        defrost_started_at: g.startedAt,
+        defrost_duration_seconds: g.durationSec,
+      };
+      return { ...g, virtualOrder };
+    });
+  }, [orders, now]);
+
+  // Маппинг virtualId → sourceOrderIds для разморозочных действий.
+  // Строим inline из defrostingGroups — пересобираем при каждом изменении.
+  const defrostGroupMapping = useMemo(() => {
+    const m = new Map<string, string[]>();
+    for (const g of defrostingGroups) m.set(g.virtualId, g.sourceOrderIds);
+    return m;
+  }, [defrostingGroups]);
+
+  // State: id группы разморозки, открытой в DefrostModal (null = закрыта).
+  const [defrostModalGroupId, setDefrostModalGroupId] = useState<string | null>(null);
+  const defrostModalGroup = useMemo(
+    () => defrostingGroups.find(g => g.virtualId === defrostModalGroupId) ?? null,
+    [defrostingGroups, defrostModalGroupId]
+  );
+  // Если таймер истёк (и группа исчезла), а модалка ещё открыта — закрываем её.
+  useEffect(() => {
+    if (defrostModalGroupId && !defrostModalGroup) {
+      setDefrostModalGroupId(null);
+    }
+  }, [defrostModalGroupId, defrostModalGroup]);
+
+  /**
+   * Резолв id карточки, на которой кликнули ❄️, в набор реальных
+   * order_item_id. Для Smart Wave виртуального id берём из smartQueueMappingRef,
+   * для стандартного режима — сам id единственный item.
+   */
+  const resolveSourceOrderIds = useCallback((cardId: string): string[] => {
+    const mapping = smartQueueMappingRef.current.get(cardId);
+    if (mapping) {
+      return Array.from(mapping.itemCountByOrder.keys());
+    }
+    return [cardId];
+  }, []);
 
   const sortedOrders = useMemo(() => {
     const isSmartAggregation = settings?.enableSmartAggregation === true;
@@ -151,6 +289,29 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           tableStack = [allTables];
         }
 
+        // Если группа состоит из уже размороженных source-ов — пробрасываем
+        // defrost-метаданные с одного из них в virtualOrder. Это нужно чтобы
+        // OrderCard увидел hasDefrostBeenStarted(order)=true и (а) отрисовал
+        // серую ❄️-индикацию «уже размораживалось», (б) СКРЫЛ синюю кнопку
+        // запуска. Без этого клик ❄️ на агрегированной карточке перезапускал
+        // разморозку на уже готовой рыбе — см. комментарий к группировке
+        // по (dishId + wasDefrosted) в smartQueue.groupItemsByDish.
+        //
+        // Группировка гарантирует, что все source-ы в группе имеют одинаковый
+        // defrost-статус, поэтому значения из первого source-а корректны
+        // для всей группы.
+        let defrostStartedAt: number | null = null;
+        let defrostDurationSeconds: number | null = null;
+        if (group.wasDefrosted) {
+          const src = activeOrders.find(
+            o => group.sourceOrderIds.includes(o.id) && o.defrost_started_at != null
+          );
+          if (src) {
+            defrostStartedAt = src.defrost_started_at ?? null;
+            defrostDurationSeconds = src.defrost_duration_seconds ?? null;
+          }
+        }
+
         const virtualOrder: Order = {
           id: virtualId,
           dish_id: group.dishId,
@@ -159,6 +320,8 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           created_at: group.earliestOrderTime,
           updated_at: Date.now(),
           status: 'ACTIVE',
+          defrost_started_at: defrostStartedAt,
+          defrost_duration_seconds: defrostDurationSeconds,
         };
 
         return virtualOrder;
@@ -184,7 +347,10 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
       return indices.length > 0 ? Math.min(...indices) : 999;
     };
 
-    return [...activeOrders].sort((a, b) => {
+    // Фильтруем активно размораживающиеся — они отображаются мини-карточкой
+    // в DefrostRow и не должны дублироваться в основной очереди (симметрично
+    // поведению Smart Wave, где фильтр стоит внутри `smartQueue.flattenOrders`).
+    return [...activeOrders].filter(o => !isDefrostActive(o, now)).sort((a, b) => {
       const dishA = dishes.find(d => d.id === a.dish_id);
       const dishB = dishes.find(d => d.id === b.dish_id);
 
@@ -192,8 +358,12 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
 
       for (const rule of rules) {
         if (rule === 'ULTRA') {
-          const isUltraA = dishA.priority_flag === PriorityLevel.ULTRA;
-          const isUltraB = dishB.priority_flag === PriorityLevel.ULTRA;
+          // ULTRA лишается приоритета после разморозки — такой же контракт
+          // как в Smart Wave (smartQueue.buildSmartQueue ULTRA-split).
+          // Бизнес-требование: после истечения таймера карточка возвращается
+          // в очередь БЕЗ ULTRA-обгона.
+          const isUltraA = dishA.priority_flag === PriorityLevel.ULTRA && !hasDefrostBeenStarted(a);
+          const isUltraB = dishB.priority_flag === PriorityLevel.ULTRA && !hasDefrostBeenStarted(b);
           if (isUltraA && !isUltraB) return -1;
           if (!isUltraA && isUltraB) return 1;
           if (isUltraA && isUltraB) return a.created_at - b.created_at;
@@ -250,12 +420,12 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   const handleParkSubmit = () => {
     const tableNum = parseInt(parkTableInput);
     if (isNaN(tableNum)) {
-      setErrorMsg('Invalid table number');
+      setErrorMsg('Неверный номер стола');
       return;
     }
 
     if (!parkTimeInput) {
-      setErrorMsg('Time is required');
+      setErrorMsg('Укажите время');
       return;
     }
 
@@ -268,7 +438,7 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
     if (returnDate.getTime() < now.getTime()) {
       // Check if maybe user meant tomorrow (e.g. now 23:00, input 01:00)
       // But simplifying: just forbid past time
-      setErrorMsg('Return time cannot be in the past');
+      setErrorMsg('Время возврата не может быть в прошлом');
       return;
     }
 
@@ -353,7 +523,62 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 pb-20">
+      {/* Ряд мини-карточек размораживающихся блюд (миграция 016).
+          Между заголовком «KDS Board» и основной сеткой. Голубоватый фон
+          визуально отделяет зону разморозки. Мини-карточки агрегированы:
+          Smart Wave «вспышка» (3 стола одной рыбы) = одна мини-карточка. */}
+      <DefrostRow
+        orders={defrostingGroups.map(g => g.virtualOrder)}
+        dishes={dishes}
+        now={now}
+        settings={settings}
+        onOpenModal={(vid) => setDefrostModalGroupId(vid)}
+        onCancelDefrost={(vid) => {
+          const sourceIds = defrostGroupMapping.get(vid);
+          onCancelDefrost?.(sourceIds?.[0] ?? vid, sourceIds);
+        }}
+        onCompleteDefrost={(vid) => {
+          const sourceIds = defrostGroupMapping.get(vid);
+          onCompleteDefrost?.(sourceIds?.[0] ?? vid, sourceIds);
+        }}
+      />
+
+      {/* Модалка разморозки — стандартный OrderCard с кнопкой «РАЗМОРОЗИЛАСЬ».
+          Синтетический virtualOrder передаётся как обычный Order; при клике
+          «Разморозилась» резолвим источники и шлём defrost-complete на все. */}
+      {defrostModalGroup && (
+        <DefrostModal
+          order={defrostModalGroup.virtualOrder}
+          dish={dishes.find(d => d.id === defrostModalGroup.dishId)!}
+          categories={categories}
+          ingredients={ingredients}
+          now={now}
+          onClose={() => setDefrostModalGroupId(null)}
+          onConfirmDefrosted={() => {
+            const sourceIds = defrostModalGroup.sourceOrderIds;
+            onCompleteDefrost?.(sourceIds[0], sourceIds);
+          }}
+          onCompleteOrder={() => { /* заменяется на onConfirmDefrosted внутри DefrostModal */ }}
+          onStackMerge={() => { /* в разморозке merge не применяется — стек уже [total] */ }}
+          onCancelOrder={(id) => {
+            // «Отмена заказа» изнутри модалки — отменяет разморозку + сам заказ.
+            // Достаточно отменить разморозку (юзер сам закроет модалку или
+            // сделает следующее действие). Здесь пассивно пропускаем.
+            onCancelOrder?.(id);
+          }}
+          onPreviewImage={onPreviewImage}
+        />
+      )}
+
+      {/* Auto-fill grid — количество колонок определяется шириной контейнера:
+          каждая карточка минимум 320px, дальше Tailwind-аналог делит остаток
+          поровну. Раньше было grid-cols-1..xl:grid-cols-4 — после 1280px
+          ширина колонок фиксировалась на 4, и на больших мониторах / при
+          зуме-аут карточки оставались теми же 4 с пустым местом. */}
+      <div
+        className="grid gap-4 pb-20"
+        style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}
+      >
         {sortedOrders.map(order => {
           const dish = dishes.find(d => d.id === order.dish_id);
           if (!dish) return null;
@@ -415,6 +640,15 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
               }}
               onCancelOrder={onCancelOrder}
               onPreviewImage={onPreviewImage}
+              isInWork={inWorkIds.has(order.id)}
+              onToggleInWork={toggleInWork}
+              // ❄️ Запуск разморозки — резолвим Smart Wave virtual id в реальные
+              // source_order_ids (через smartQueueMappingRef). Для стандартного
+              // режима sourceIds = [order.id].
+              onStartDefrost={(id) => {
+                const sourceIds = resolveSourceOrderIds(id);
+                onStartDefrost?.(sourceIds[0], sourceIds);
+              }}
             />
           );
         })}
@@ -425,8 +659,8 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
             <div className="bg-slate-800/50 p-6 rounded-full mb-4">
               <Check size={48} className="text-slate-500" />
             </div>
-            <h3 className="text-xl font-bold mb-2">All Orders Complete</h3>
-            <p>Cutting station clear.</p>
+            <h3 className="text-xl font-bold mb-2">Все заказы готовы</h3>
+            <p>Нет новых заказов.</p>
           </div>
         )}
       </div>
@@ -606,9 +840,27 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                   );
                   if (tableOrders.length === 0) return null;
 
-                  const returnTime = tableOrders[0].unpark_at || 0;
-                  const returnDate = new Date(returnTime);
-                  const formattedTime = `${returnDate.getHours().toString().padStart(2, '0')}:${returnDate.getMinutes().toString().padStart(2, '0')}`;
+                  // Форматтер времени возврата. Используется и для заголовка
+                  // стола, и для мини-подписи возле каждой позиции.
+                  const fmt = (ms?: number) => {
+                    if (!ms) return '—';
+                    const d = new Date(ms);
+                    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+                  };
+
+                  // Если у разных позиций стола разные unpark_at (например
+                  // ручная парковка супа + авто-парковка десерта на одном столе),
+                  // показываем диапазон «12:30–12:40», а не одно фейковое время.
+                  // Точное время каждой позиции рисуется возле неё ниже.
+                  const unparkTimes = tableOrders
+                    .map((o: Order) => o.unpark_at)
+                    .filter((t: number | undefined): t is number => !!t);
+                  const minUnpark = unparkTimes.length > 0 ? Math.min(...unparkTimes) : 0;
+                  const maxUnpark = unparkTimes.length > 0 ? Math.max(...unparkTimes) : 0;
+                  const hasMixedTimes = minUnpark !== maxUnpark;
+                  const headerTime = hasMixedTimes
+                    ? `${fmt(minUnpark)}–${fmt(maxUnpark)}`
+                    : fmt(minUnpark);
 
                   // Group by Table -> Then by Category
                   const dishesByCat = tableOrders.reduce((acc, order) => {
@@ -627,7 +879,11 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                           <div className="text-yellow-400 font-bold text-lg mb-1">Стол №{tableNum}</div>
                           <div className="text-slate-400 text-xs flex items-center">
                             <CalendarClock size={14} className="mr-1" />
-                            Возврат в <span className="text-white font-mono ml-1 font-bold">{formattedTime}</span>
+                            Возврат {hasMixedTimes ? '' : 'в '}
+                            <span className="text-white font-mono ml-1 font-bold">{headerTime}</span>
+                            {hasMixedTimes && (
+                              <span className="text-slate-500 ml-1 italic">(разное время)</span>
+                            )}
                           </div>
                         </div>
                         <button
@@ -659,6 +915,10 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                               {catOrders.map(order => {
                                 const dish = dishes.find(d => d.id === order.dish_id);
                                 const totalQty = order.quantity_stack.reduce((a, b) => a + b, 0);
+                                // Время возврата ЭТОЙ позиции. Показываем только
+                                // если на столе смешанные времена — иначе дублирует
+                                // заголовок стола и засоряет UI.
+                                const itemReturnTime = hasMixedTimes ? fmt(order.unpark_at) : null;
                                 return (
                                   <div key={order.id} className="text-sm text-slate-300 flex justify-between items-center pl-2">
                                     <div className="flex items-center gap-2">
@@ -673,7 +933,14 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                                       </button>
                                       <span>{dish?.name}</span>
                                     </div>
-                                    <span className="font-mono text-slate-500">x{totalQty}</span>
+                                    <div className="flex items-center gap-3">
+                                      {itemReturnTime && (
+                                        <span className="text-[10px] font-mono text-cyan-400/80 bg-cyan-900/20 px-1.5 py-0.5 rounded border border-cyan-800/40">
+                                          {itemReturnTime}
+                                        </span>
+                                      )}
+                                      <span className="font-mono text-slate-500">x{totalQty}</span>
+                                    </div>
                                   </div>
                                 )
                               })}

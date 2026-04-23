@@ -1,21 +1,45 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { OrderHistoryEntry, IngredientBase } from '../../types';
 import { formatWeight } from './dashboardUtils';
-import { Package, ChevronRight, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react';
+import { Package, ChevronRight, ArrowUp, ArrowDown, ArrowUpDown, Search, X } from 'lucide-react';
 
 interface IngredientUsageSectionProps {
   orderHistory: OrderHistoryEntry[];
   appliedFilter: { start: string; end: string; timestamp: number };
   ingredients: IngredientBase[];
+  /**
+   * Сохранение bufferPercent. Вызывается при blur поля «+%» (а не onChange),
+   * чтобы не слать PUT на каждое нажатие клавиши. Ставит
+   * `slicer_ingredients.buffer_percent` через PUT /api/ingredients/:id.
+   */
+  onUpdateIngredient: (id: string, updates: Partial<IngredientBase>) => void;
 }
 
-export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ orderHistory, appliedFilter, ingredients }) => {
+export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ orderHistory, appliedFilter, ingredients, onUpdateIngredient }) => {
   const [ingredientSort, setIngredientSort] = useState<{ field: 'name' | 'weight'; direction: 'asc' | 'desc' }>({
     field: 'weight',
     direction: 'desc'
   });
   const [expandedUsageGroups, setExpandedUsageGroups] = useState<Set<string>>(new Set());
+
+  // Поиск по названию родителя или его разновидности. Работает уже по
+  // посчитанным consumptionData, чтобы не дублировать агрегацию.
+  const [searchQuery, setSearchQuery] = useState('');
+
+  // Локальный кеш значений в полях (строка — пока пользователь печатает).
+  // При blur отправляем в БД. При перезагрузке ingredients (reloadIngredients)
+  // — перезаполняем из source of truth. Так UI всегда отображает что реально
+  // в БД, и сразу реагирует на ввод без лага на round-trip.
   const [bufferPercentages, setBufferPercentages] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    const initial: Record<string, string> = {};
+    for (const ing of ingredients) {
+      const v = ing.bufferPercent ?? 0;
+      if (v !== 0) initial[ing.id] = String(v);
+    }
+    setBufferPercentages(initial);
+  }, [ingredients]);
 
   const handleIngredientSort = (field: 'name' | 'weight') => {
     setIngredientSort(prev => ({
@@ -37,6 +61,23 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
     if (value === '' || /^\d*$/.test(value)) {
       setBufferPercentages(prev => ({ ...prev, [id]: value }));
     }
+  };
+
+  /**
+   * Сохраняем в БД на blur — но только если значение реально поменялось.
+   * Иначе каждый фокус-уход дёргал бы API без пользы.
+   * Пустая строка трактуется как 0 (возврат к дефолту).
+   */
+  const handleBufferBlur = (id: string) => {
+    const raw = bufferPercentages[id] ?? '';
+    const nextValue = raw === '' ? 0 : Number(raw);
+    if (!Number.isFinite(nextValue)) return;
+
+    const ing = ingredients.find(i => i.id === id);
+    const currentValue = ing?.bufferPercent ?? 0;
+    if (nextValue === currentValue) return;
+
+    onUpdateIngredient(id, { bufferPercent: nextValue });
   };
 
   const calculateItemGross = (netGrams: number, id: string): number => {
@@ -134,14 +175,51 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
 
   }, [orderHistory, appliedFilter, ingredients, ingredientSort]);
 
+  // Фильтрация группы: совпадение по имени parent ИЛИ по имени любой
+  // разновидности. Если совпало только по разновидности — parent остаётся
+  // в выдаче, а при разворачивании видны все его items (не только совпавшие),
+  // чтобы сохранить контекст группы.
+  const visibleConsumptionData = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return consumptionData;
+    return consumptionData.filter(group => {
+      if (group.parentName.toLowerCase().includes(query)) return true;
+      return group.items.some(item => item.name.toLowerCase().includes(query));
+    });
+  }, [consumptionData, searchQuery]);
+
   return (
     <div className="bg-kds-card p-6 rounded-lg border border-gray-800 mb-8">
-      <h3 className="text-xl font-bold text-green-400 mb-6 flex items-center gap-2">
-        <Package size={22} /> Ingredient Usage
-      </h3>
+      <div className="flex items-center justify-between mb-6 gap-4 flex-wrap">
+        <h3 className="text-xl font-bold text-green-400 flex items-center gap-2">
+          <Package size={22} /> Расход Ингредиентов
+        </h3>
+        {/* Поиск по названию ингредиента или его разновидности. */}
+        <div className="relative">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Поиск ингредиента..."
+            className="bg-slate-900 border border-slate-700 text-white text-sm pl-9 pr-8 py-2 rounded-lg w-64 focus:border-green-500 focus:outline-none transition-colors"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-slate-500 hover:text-white"
+              title="Очистить"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      </div>
 
       {consumptionData.length === 0 ? (
-        <div className="text-center py-8 text-slate-500 italic">No consumption data for this period</div>
+        <div className="text-center py-8 text-slate-500 italic">Нет данных за этот период</div>
+      ) : visibleConsumptionData.length === 0 ? (
+        <div className="text-center py-8 text-slate-500 italic">Ничего не найдено по запросу «{searchQuery}»</div>
       ) : (
         <div className="overflow-hidden rounded-lg border border-gray-700">
           <table className="w-full text-left border-collapse">
@@ -152,7 +230,7 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
                   onClick={() => handleIngredientSort('name')}
                 >
                   <div className="flex items-center gap-1">
-                    Product Information
+                    Информация о Продукте
                     {ingredientSort.field === 'name' ? (
                       ingredientSort.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                     ) : <ArrowUpDown size={14} className="opacity-20" />}
@@ -163,7 +241,7 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
                   onClick={() => handleIngredientSort('weight')}
                 >
                   <div className="flex items-center justify-end gap-1">
-                    Total Weight
+                    Общий Вес
                     {ingredientSort.field === 'weight' ? (
                       ingredientSort.direction === 'asc' ? <ArrowUp size={14} className="text-blue-500" /> : <ArrowDown size={14} className="text-blue-500" />
                     ) : <ArrowUpDown size={14} className="opacity-20" />}
@@ -178,12 +256,12 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
                   + %
                 </th>
                 <th className="p-3 text-slate-400 font-bold uppercase text-xs text-right whitespace-nowrap w-32">
-                  Brutto
+                  Брутто
                 </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
-              {consumptionData.map(group => {
+              {visibleConsumptionData.map(group => {
                 const isExpanded = expandedUsageGroups.has(group.groupId);
 
                 const groupGross = group.items.reduce((sum, item) => {
@@ -215,7 +293,7 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
                                 {group.parentName}
                               </span>
                             </div>
-                            <span className="text-xs text-slate-500">{group.items.length} varieties</span>
+                            <span className="text-xs text-slate-500">{group.items.length} видов</span>
                           </div>
                         </div>
                       </td>
@@ -270,6 +348,7 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
                                 className="w-14 py-0.5 bg-slate-900/80 border border-slate-700 rounded text-center text-white text-xs font-mono focus:border-blue-500 focus:outline-none"
                                 value={bufferPercentages[item.id] || ''}
                                 onChange={(e) => handleBufferChange(item.id, e.target.value)}
+                                onBlur={() => handleBufferBlur(item.id)}
                               />
                             </div>
                           </td>
