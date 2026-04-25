@@ -53,58 +53,99 @@ const KITCHEN_STORAGE_UUIDS = [
 router.get('/', async (_req: Request, res: Response) => {
   try {
     // ----------------------------------------------------------------------
-    // Авто-парковка десертов (миграция 017).
-    // Читаем глобальные настройки; если правило включено и привязана категория —
-    // одним INSERT ... ON CONFLICT DO NOTHING UPSERT'им PARKED-состояние для
-    // всех ещё-не-встречавшихся дессертных позиций. Для уже существующих строк
-    // в slicer_order_state ничего не делаем — нарезчик мог вручную их оттуда
-    // вернуть раньше времени, и мы не хотим его перебивать.
+    // Авто-парковка десертов (миграция 017 + 019).
+    // Паркуем ТОЛЬКО позиции с:
+    //   - категорией = slicer_settings.dessert_category_id,
+    //   - у которых ЕСТЬ хотя бы один модификатор из docm2tabl2_dishmodifiers,
+    //     чьё имя в ctlg20_modifiers совпадает с одним из паттернов ILIKE из
+    //     slicer_settings.dessert_trigger_modifier_patterns (default:
+    //     ['Готовить%', 'Ждать%']).
     //
-    // unpark_at = ordertime + dessert_auto_park_minutes. Если заказ старый
-    // (смена работает несколько часов), время уже в прошлом — автоматическая
-    // разпарковка (блок ниже) тут же переведёт в ACTIVE. Это ожидаемо: десерт
-    // ждали долго, пора резать.
+    // Время возврата (unpark_at):
+    //   - Если найдено имя вида "Готовить к HH.00" / "Готовить к HH:MM" — парковка
+    //     до сегодняшних HH:MM (today + time). Если указанное время уже прошло —
+    //     OK: автоматическая разпарковка (блок ниже) сразу вернёт в ACTIVE.
+    //   - Иначе ("Готовить позже", "Ждать разъяснений", свои паттерны) — парковка
+    //     на dessert_auto_park_minutes (default 40 мин) от ordertime.
+    //
+    // На уже существующие строки slicer_order_state не переписываем (ON CONFLICT
+    // DO NOTHING) — если нарезчик вручную вернул десерт раньше, мы его не паркуем
+    // повторно, как и было.
     // ----------------------------------------------------------------------
     const dessertCfg = await pool.query(
-      'SELECT dessert_category_id, dessert_auto_park_enabled, dessert_auto_park_minutes FROM slicer_settings WHERE id = 1'
+      `SELECT dessert_category_id, dessert_auto_park_enabled, dessert_auto_park_minutes,
+              dessert_trigger_modifier_patterns
+         FROM slicer_settings WHERE id = 1`
     );
     const dessertRow = dessertCfg.rows[0];
     if (
       dessertRow?.dessert_auto_park_enabled === true &&
       dessertRow?.dessert_category_id
     ) {
+      const patterns: string[] = Array.isArray(dessertRow.dessert_trigger_modifier_patterns)
+        && dessertRow.dessert_trigger_modifier_patterns.length > 0
+          ? dessertRow.dessert_trigger_modifier_patterns
+          : ['Готовить%', 'Ждать%'];
+
       await pool.query(
         `
+        WITH trigger_mods AS (
+          -- Для каждой позиции: MAX(minutes_of_day) по модификаторам типа
+          -- "Готовить к HH.MM" (если несколько — берём самое ПОЗДНЕЕ время,
+          -- консервативно). NULL в minutes_of_day = у позиции есть временной
+          -- модификатор без конкретного часа ("Готовить позже" / "Ждать…" и т.п.).
+          -- Позиции без совпадающих модификаторов в CTE не попадают, значит не
+          -- паркуются.
+          SELECT
+            dm.docm2tabl2_itemrow AS item_id,
+            MAX(
+              CASE
+                WHEN m.name ~ 'к\s*\d{1,2}[.:]\d{2}' THEN
+                  (regexp_match(m.name, 'к\s*(\d{1,2})[.:](\d{2})'))[1]::int * 60
+                  + (regexp_match(m.name, 'к\s*(\d{1,2})[.:](\d{2})'))[2]::int
+                ELSE NULL
+              END
+            ) AS minutes_of_day
+          FROM docm2tabl2_dishmodifiers dm
+          INNER JOIN ctlg20_modifiers m
+            ON m.suuid = dm.docm2tabl2_ctlg20_uuid__modifier
+          WHERE m.name ILIKE ANY ($3::text[])
+          GROUP BY dm.docm2tabl2_itemrow
+        )
         INSERT INTO slicer_order_state
           (order_item_id, status, quantity_stack, table_stack, parked_at, unpark_at, was_parked, parked_tables, parked_by_auto, updated_at)
         SELECT
           items.suuid::text,
           'PARKED',
-          -- Реальное кол-во порций из чужой таблицы, обёрнутое в jsonb-стек.
-          -- Без этого колонка получала бы DEFAULT '[1]' и затирала правильное
-          -- quantity (тот же баг что для defrost-start UPSERT'а).
           jsonb_build_array(items.docm2tabl1_quantity),
-          -- Столы из JOIN'а с ctlg13_halltables (может быть NULL для заказов
-          -- без привязки — тогда пустой вложенный массив, фолбэк в GET /orders
-          -- подставит tableNumber из запроса).
           CASE
             WHEN tables.ctlg13_tablenumber IS NOT NULL
               THEN jsonb_build_array(jsonb_build_array(tables.ctlg13_tablenumber))
             ELSE '[[]]'::jsonb
           END,
           items.docm2tabl1_ordertime,
-          items.docm2tabl1_ordertime + ($1::text || ' minutes')::interval,
+          -- unpark_at:
+          --   * minutes_of_day NOT NULL → сегодняшняя дата + это число минут от 00:00.
+          --     Если указанное время уже в прошлом — auto-unpark ниже сразу вернёт
+          --     в ACTIVE (и в этом случае KPI парковки в итоге составит <1 polling).
+          --   * minutes_of_day NULL → ordertime + dessert_auto_park_minutes минут
+          --     (стандартное поведение «Готовить позже» / «Ждать разъяснений»).
+          CASE
+            WHEN tm.minutes_of_day IS NOT NULL THEN
+              (CURRENT_DATE + (tm.minutes_of_day || ' minutes')::interval)::timestamp
+            ELSE
+              items.docm2tabl1_ordertime + ($1::text || ' minutes')::interval
+          END,
           TRUE,
           CASE WHEN tables.ctlg13_tablenumber IS NOT NULL
                THEN jsonb_build_array(tables.ctlg13_tablenumber)
                ELSE '[]'::jsonb
           END,
-          -- parked_by_auto=TRUE: маркируем как автопарковку, чтобы /unpark и
-          -- авто-разпарковка применили логику «десерт как новый заказ» (миграция 019).
           TRUE,
           NOW()
         FROM docm2tabl1_items items
         INNER JOIN docm2_orders orders ON orders.suuid = items.owner
+        INNER JOIN trigger_mods tm ON tm.item_id = items.suuid
         LEFT JOIN slicer_dish_aliases alias
           ON alias.alias_dish_id = items.docm2tabl1_ctlg15_uuid__dish::text
         LEFT JOIN ctlg13_halltables tables
@@ -113,16 +154,23 @@ router.get('/', async (_req: Request, res: Response) => {
           ON state.order_item_id = items.suuid::text
         WHERE orders.docm2_closed = false
           AND (items.docm2tabl1_cooked IS NULL OR items.docm2tabl1_cooked = false)
-          AND items.docm2tabl1_ctlg17_uuid__storage IN (${KITCHEN_STORAGE_UUIDS.map((_, i) => `$${i + 3}`).join(', ')})
+          AND items.docm2tabl1_ctlg17_uuid__storage IN (${KITCHEN_STORAGE_UUIDS.map((_, i) => `$${i + 4}`).join(', ')})
           AND state.order_item_id IS NULL
           AND EXISTS (
             SELECT 1 FROM slicer_dish_categories dc
             WHERE dc.dish_id = COALESCE(alias.primary_dish_id, items.docm2tabl1_ctlg15_uuid__dish::text)
               AND dc.category_id = $2
           )
+          -- Симметрично GET /api/orders ниже: не паркуем призраков с qty<=0.
+          AND items.docm2tabl1_quantity > 0
         ON CONFLICT (order_item_id) DO NOTHING
         `,
-        [String(dessertRow.dessert_auto_park_minutes), dessertRow.dessert_category_id, ...KITCHEN_STORAGE_UUIDS]
+        [
+          String(dessertRow.dessert_auto_park_minutes),
+          dessertRow.dessert_category_id,
+          patterns,
+          ...KITCHEN_STORAGE_UUIDS,
+        ]
       );
     }
 
@@ -212,6 +260,11 @@ router.get('/', async (_req: Request, res: Response) => {
           SELECT 1 FROM slicer_dish_categories dc
           WHERE dc.dish_id = COALESCE(alias.primary_dish_id, items.docm2tabl1_ctlg15_uuid__dish::text)
         )
+        -- Только реальные позиции с количеством > 0. Касса умеет создавать
+        -- строки в чеке с qty=0 (обнулена), qty=-1 (возврат) и т.п. — они не
+        -- закрываются как готовые, проходят все остальные фильтры и оседают на
+        -- доске призраками. Нарезчику резать по 0 порций нечего.
+        AND items.docm2tabl1_quantity > 0
       ORDER BY items.docm2tabl1_ordertime ASC
     `, KITCHEN_STORAGE_UUIDS);
 
@@ -611,9 +664,10 @@ router.post('/:id/merge', async (req: Request, res: Response) => {
  *
  * Если sourceOrderItemIds не переданы — работаем с одним :id (стандартный режим).
  *
- * Длительность берётся из slicer_settings.defrost_duration_minutes в момент
- * клика и сохраняется снимком (defrost_duration_seconds). Изменение глобальной
- * настройки после старта не сбивает таймер уже запущенных разморозок.
+ * Длительность берётся per-dish из slicer_dish_defrost.defrost_duration_minutes
+ * (миграция 020, резолв alias→primary) в момент клика и сохраняется снимком
+ * (defrost_duration_seconds). Изменение настройки блюда после старта не сбивает
+ * таймер уже запущенных разморозок. Фолбэк 15 мин если записи нет.
  *
  * UPSERT важен: у позиции может ещё не быть строки в slicer_order_state
  * (нарезчик не трогал заказ до клика по ❄️).
@@ -627,14 +681,14 @@ router.post('/:id/defrost-start', async (req: Request, res: Response) => {
       ? sourceOrderItemIds
       : [id];
 
-    // Длительность снимаем одним запросом до цикла — одинаковая для всех items.
-    const settingsRes = await pool.query(
-      'SELECT defrost_duration_minutes FROM slicer_settings WHERE id = 1'
-    );
-    const durationMin = settingsRes.rows[0]?.defrost_duration_minutes ?? 15;
-    const durationSec = durationMin * 60;
-
+    // Длительность — per-dish (миграция 020). Резолвим в SELECT через alias→primary,
+    // COALESCE на 15 минут если записи в slicer_dish_defrost нет (хотя если у
+    // блюда requires_defrost=false, фронт ❄️ не покажет — всё равно защитимся).
+    // Smart Wave гарантирует одинаковое блюдо на всех items группы, поэтому
+    // duration_seconds получится одинаковым для всей транзакции — мини-карточка
+    // в DefrostRow останется консистентной.
     const client = await pool.connect();
+    let firstDurationSec = 15 * 60;
     try {
       await client.query('BEGIN');
       // Важно: при INSERT свежей строки нельзя полагаться на DEFAULT'ы для
@@ -647,7 +701,7 @@ router.post('/:id/defrost-start', async (req: Request, res: Response) => {
       // в новую строку. На UPDATE (строка уже была от park/partial-complete)
       // эти колонки не трогаем — там актуальные значения нарезчика.
       for (const itemId of ids) {
-        await client.query(
+        const upsertRes = await client.query(
           `INSERT INTO slicer_order_state
              (order_item_id, status, quantity_stack, table_stack, defrost_started_at, defrost_duration_seconds)
            SELECT
@@ -660,17 +714,27 @@ router.post('/:id/defrost-start', async (req: Request, res: Response) => {
                ELSE '[[]]'::jsonb
              END,
              NOW(),
-             $2
+             -- Per-dish длительность: alias→primary→slicer_dish_defrost.
+             -- Фолбэк 15 мин если записи нет (защита на случай рассинхрона UI).
+             COALESCE(dd.defrost_duration_minutes, 15) * 60
            FROM docm2tabl1_items items
            LEFT JOIN docm2_orders orders ON orders.suuid = items.owner
            LEFT JOIN ctlg13_halltables tables ON tables.suuid = orders.docm2_ctlg13_uuid__halltable
+           LEFT JOIN slicer_dish_aliases alias
+             ON alias.alias_dish_id = items.docm2tabl1_ctlg15_uuid__dish::text
+           LEFT JOIN slicer_dish_defrost dd
+             ON dd.dish_id = COALESCE(alias.primary_dish_id, items.docm2tabl1_ctlg15_uuid__dish::text)
            WHERE items.suuid::text = $1
            ON CONFLICT (order_item_id) DO UPDATE SET
              defrost_started_at       = EXCLUDED.defrost_started_at,
              defrost_duration_seconds = EXCLUDED.defrost_duration_seconds,
-             updated_at               = NOW()`,
-          [itemId, durationSec]
+             updated_at               = NOW()
+           RETURNING defrost_duration_seconds`,
+          [itemId]
         );
+        // Сохраняем первый вычисленный duration, чтобы отдать его клиенту.
+        const returnedSec = upsertRes.rows[0]?.defrost_duration_seconds;
+        if (returnedSec != null) firstDurationSec = Number(returnedSec);
       }
       await client.query('COMMIT');
     } catch (e) {
@@ -680,7 +744,7 @@ router.post('/:id/defrost-start', async (req: Request, res: Response) => {
       client.release();
     }
 
-    res.json({ started: true, durationSeconds: durationSec, items: ids.length });
+    res.json({ started: true, durationSeconds: firstDurationSec, items: ids.length });
   } catch (err) {
     console.error('[Orders] Ошибка defrost-start:', err);
     res.status(500).json({ error: 'Ошибка запуска разморозки' });
@@ -729,8 +793,9 @@ router.post('/:id/defrost-cancel', async (req: Request, res: Response) => {
  * Отдельную колонку «вручную завершено» не заводим — состояние однозначно
  * выражается этой парой полей (см. комментарий к миграции 016).
  *
- * ULTRA-downgrade сохраняется — defrost_started_at остаётся NOT NULL, значит
- * smartQueue лишает карточку ULTRA-приоритета.
+ * ULTRA-приоритет сохраняется после разморозки — раз блюдо ULTRA, оно остаётся
+ * ULTRA. smartQueue смотрит ТОЛЬКО на dish.priority_flag, флаг разморозки не
+ * влияет (см. fix 949ecfd).
  */
 router.post('/:id/defrost-complete', async (req: Request, res: Response) => {
   try {

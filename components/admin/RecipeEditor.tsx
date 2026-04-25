@@ -176,9 +176,14 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
       // и primary в UI отдельные карточки и могут иметь разный priority_flag.
       await updateDishCategories(dishId, currentDish.category_ids);
       await updateDishPriority(dishId, currentDish.priority_flag ?? 1);
-      // Флаг разморозки (миграция 016) пишем на primary — общий для всех
-      // вариантов блюда, как и рецепт. Alias наследует через recipe_source_id.
-      await updateDishDefrost(recipeDishId, currentDish.requires_defrost ?? false);
+      // Флаг и per-dish время разморозки (миграции 016, 020) пишем на primary —
+      // общие для всех вариантов блюда, как и рецепт. Alias наследует через
+      // recipe_source_id. Если минуты не проставлены — бэк подставит дефолт 15.
+      await updateDishDefrost(
+        recipeDishId,
+        currentDish.requires_defrost ?? false,
+        currentDish.defrost_duration_minutes
+      );
       await updateRecipe(recipeDishId, ingredientsPayload);
 
       // Фото: upload или delete в самом конце, чтобы не блокировать
@@ -676,38 +681,62 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                   </select>
                 </div>
 
-                {/* Требует разморозки? (миграция 016)
-                    Значение сохраняется на primary-блюдо (recipe_source_id),
-                    алиасы наследуют. По умолчанию — Нет. На карточке в KDS
-                    Board появится кликабельная ❄️ для запуска разморозки. */}
+                {/* Требует разморозки? (миграция 016) + per-dish время (миграция 020).
+                    Значения сохраняются на primary-блюдо (recipe_source_id),
+                    алиасы наследуют. По умолчанию — Нет / 15 мин. На карточке
+                    в KDS Board появится кликабельная ❄️ для запуска разморозки.
+                    Поле минут показывается только когда выбрано «Да» — чтобы
+                    не путать пользователя неактивным инпутом. */}
                 <div>
                   <label className="block text-gray-400 text-sm font-bold mb-2">Требует разморозки?</label>
-                  <div className="flex bg-gray-900 rounded border border-gray-700 overflow-hidden w-fit">
-                    <button
-                      type="button"
-                      onClick={() => setCurrentDish({ ...currentDish, requires_defrost: false })}
-                      className={`px-5 py-2 text-sm font-bold transition-all ${
-                        !(currentDish.requires_defrost ?? false)
-                          ? 'bg-slate-700 text-white shadow-inner'
-                          : 'text-gray-500 hover:text-gray-300'
-                      }`}
-                    >
-                      Нет
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setCurrentDish({ ...currentDish, requires_defrost: true })}
-                      className={`px-5 py-2 text-sm font-bold transition-all ${
-                        currentDish.requires_defrost
-                          ? 'bg-blue-600 text-white shadow-[0_0_10px_rgba(59,130,246,0.4)]'
-                          : 'text-gray-500 hover:text-gray-300'
-                      }`}
-                    >
-                      Да
-                    </button>
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <div className="flex bg-gray-900 rounded border border-gray-700 overflow-hidden w-fit">
+                      <button
+                        type="button"
+                        onClick={() => setCurrentDish({ ...currentDish, requires_defrost: false })}
+                        className={`px-5 py-2 text-sm font-bold transition-all ${
+                          !(currentDish.requires_defrost ?? false)
+                            ? 'bg-slate-700 text-white shadow-inner'
+                            : 'text-gray-500 hover:text-gray-300'
+                        }`}
+                      >
+                        Нет
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setCurrentDish({ ...currentDish, requires_defrost: true })}
+                        className={`px-5 py-2 text-sm font-bold transition-all ${
+                          currentDish.requires_defrost
+                            ? 'bg-blue-600 text-white shadow-[0_0_10px_rgba(59,130,246,0.4)]'
+                            : 'text-gray-500 hover:text-gray-300'
+                        }`}
+                      >
+                        Да
+                      </button>
+                    </div>
+                    {currentDish.requires_defrost && (
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          min={1}
+                          max={60}
+                          value={currentDish.defrost_duration_minutes ?? 15}
+                          onChange={(e) => {
+                            // Clamp 1..60 как в CHECK БД. Пустая строка / NaN → 15.
+                            let val = parseInt(e.target.value);
+                            if (!Number.isFinite(val)) val = 15;
+                            if (val < 1) val = 1;
+                            if (val > 60) val = 60;
+                            setCurrentDish({ ...currentDish, defrost_duration_minutes: val });
+                          }}
+                          className="w-20 bg-gray-900 border border-gray-700 rounded p-2 text-white text-center font-mono focus:border-blue-500 outline-none"
+                        />
+                        <span className="text-xs text-gray-400">минут</span>
+                      </div>
+                    )}
                   </div>
                   <p className="text-xs text-gray-500 mt-1">
-                    На карточке появится ❄️ для запуска таймера разморозки (время — в Настройках).
+                    На карточке появится <span className="text-blue-400">❄️</span> для запуска таймера разморозки. Время — от 1 до 60 минут.
                   </p>
                 </div>
 

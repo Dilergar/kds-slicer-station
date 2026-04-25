@@ -23,7 +23,7 @@ import { PartialCompletionModal } from './PartialCompletionModal';
 import { OrderCard } from './OrderCard';
 import { DefrostRow } from './DefrostRow';
 import { DefrostModal } from './DefrostModal';
-import { buildSmartQueue, isDefrostActive, hasDefrostBeenStarted } from '../smartQueue';
+import { buildSmartQueue, isDefrostActive } from '../smartQueue';
 
 interface SlicerStationProps {
   orders: Order[];
@@ -32,7 +32,6 @@ interface SlicerStationProps {
   ingredients: IngredientBase[];
   onCompleteOrder: (orderId: string) => void;
   onStackMerge: (orderId: string) => void;
-  onAddTestOrder: (dishId: string, priority: PriorityLevel) => void;
   onPreviewImage: (url: string) => void;
   onParkTable: (tableNumber: number, returnTimestamp: number) => void;
   onUnparkTable: (tableNumber: number) => void;
@@ -57,7 +56,6 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   ingredients,
   onCompleteOrder,
   onStackMerge,
-  onAddTestOrder,
   onPreviewImage,
   onParkTable,
   onUnparkTable,
@@ -72,7 +70,6 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   onCompleteDefrost
 }) => {
   const retentionMinutes = settings?.historyRetentionMinutes || 60;
-  const [showTestModal, setShowTestModal] = useState(false);
   const [now, setNow] = useState(Date.now());
 
   // Timer update
@@ -104,8 +101,17 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   // Ключ: virtualOrderId, Значение: { sourceOrderIds, itemCountByOrder }
   const smartQueueMappingRef = useRef<Map<string, { sourceOrderIds: string[], itemCountByOrder: Map<string, number> }>>(new Map());
 
-  // === Трекинг виртуальных заказов, которые были "merged" (нажата кнопка объединения) ===
-  const [mergedVirtualIds, setMergedVirtualIds] = useState<Set<string>>(new Set());
+  // === Трекинг merge-состояния виртуальных карточек ===
+  // Ключ: virtualId (стабильный по `dishId + wasDefrosted`, НЕ меняется когда
+  // приходят новые source-ы того же блюда).
+  // Значение: Set source_order_id, которые зафиксированы как «смёрженные».
+  //
+  // Поведение: когда нарезчик жмёт Merge, мы запоминаем ТЕКУЩИЙ список
+  // source-ов как merged. При ребилде эти source-ы отрисуются одним блоком
+  // с суммарным qty, а новые source-ы (пришедшие позже) — отдельными блоками.
+  // Пример: merge 1+1=2, потом пришёл ещё заказ → показываем «2 + 1».
+  // Новый Merge перезапишет Set — всё снова в один блок.
+  const [mergedSources, setMergedSources] = useState<Map<string, Set<string>>>(new Map());
 
   // === «В работе» — локальный визуальный claim карточки ===
   // Чисто UI-состояние для координации двух нарезчиков за одним планшетом:
@@ -249,10 +255,10 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
 
       // Конвертируем SmartQueueGroup[] → виртуальные Order[] для совместимости с OrderCard
       const virtualOrders: Order[] = smartQueue.map((group) => {
-        // Стабильный virtual ID: основан на dishId + sourceOrderIds (не position!)
-        // Это предотвращает потерю merge-состояния при сдвиге позиций
-        const stableKey = group.sourceOrderIds.sort().join('_');
-        const virtualId = `smart_${group.dishId}_${stableKey}`;
+        // Стабильный virtual ID: только `dishId + wasDefrosted`. НЕ зависит
+        // от списка source-ов, поэтому при добавлении нового заказа того же
+        // блюда virtualId не меняется, и merge-состояние не теряется.
+        const virtualId = `smart_${group.dishId}_${group.wasDefrosted ? '1' : '0'}`;
 
         // Считаем сколько порций каждого реального заказа в этой группе
         const itemCountByOrder = new Map<string, number>();
@@ -265,11 +271,15 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           itemCountByOrder,
         });
 
-        // Создаём виртуальный Order-объект (совместимый с OrderCard)
-        // Сохраняем структуру стека: каждый source order = отдельный блок
-        // Это даёт OrderCard'у показать "1 + 1", красную стрелку и "ЕЩЁ ЗАКАЗ"
-        let quantityStack: number[] = [];
-        let tableStack: number[][] = [];
+        // Сборка стека с учётом merge-состояния.
+        // Зафиксированные как merged source-ы → один объединённый блок
+        // (суммарное qty, все столы); новые source-ы (пришли после merge) —
+        // отдельными блоками. Так нарезчик видит "2 + 1" если раньше было
+        // "1+1 merge = 2", а потом пришёл ещё один заказ того же блюда.
+        const mergedSet = mergedSources.get(virtualId);
+        let mergedQty = 0;
+        const mergedTables: number[] = [];
+        const unmergedBlocks: { qty: number; tables: number[] }[] = [];
 
         for (const sourceId of group.sourceOrderIds) {
           const count = itemCountByOrder.get(sourceId) || 0;
@@ -277,29 +287,35 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           const sourceTables = sourceOrder
             ? (sourceOrder.table_stack?.flat() || [sourceOrder.tableNumber || 0]).filter(Boolean)
             : [];
-          quantityStack.push(count);
-          tableStack.push(sourceTables.length > 0 ? sourceTables : [0]);
+          const tablesForBlock = sourceTables.length > 0 ? sourceTables : [0];
+
+          if (mergedSet?.has(sourceId)) {
+            mergedQty += count;
+            mergedTables.push(...tablesForBlock);
+          } else {
+            unmergedBlocks.push({ qty: count, tables: tablesForBlock });
+          }
         }
 
-        // Если пользователь нажал merge — объединяем стек в один блок
-        if (mergedVirtualIds.has(virtualId)) {
-          const totalQty = quantityStack.reduce((a, b) => a + b, 0);
-          const allTables = tableStack.flat();
-          quantityStack = [totalQty];
-          tableStack = [allTables];
+        let quantityStack: number[] = [];
+        let tableStack: number[][] = [];
+        if (mergedQty > 0) {
+          quantityStack.push(mergedQty);
+          tableStack.push(mergedTables);
         }
+        for (const block of unmergedBlocks) {
+          quantityStack.push(block.qty);
+          tableStack.push(block.tables);
+        }
+        // Edge case: если вся группа в mergedSet, unmergedBlocks пусто → получим
+        // [mergedQty] / [[mergedTables]] — один блок, карточка в «merged» виде.
+        // Если merged пустой и unmerged тоже (не должно случиться) — пустой стек.
 
         // Если группа состоит из уже размороженных source-ов — пробрасываем
         // defrost-метаданные с одного из них в virtualOrder. Это нужно чтобы
         // OrderCard увидел hasDefrostBeenStarted(order)=true и (а) отрисовал
         // серую ❄️-индикацию «уже размораживалось», (б) СКРЫЛ синюю кнопку
-        // запуска. Без этого клик ❄️ на агрегированной карточке перезапускал
-        // разморозку на уже готовой рыбе — см. комментарий к группировке
-        // по (dishId + wasDefrosted) в smartQueue.groupItemsByDish.
-        //
-        // Группировка гарантирует, что все source-ы в группе имеют одинаковый
-        // defrost-статус, поэтому значения из первого source-а корректны
-        // для всей группы.
+        // запуска.
         let defrostStartedAt: number | null = null;
         let defrostDurationSeconds: number | null = null;
         if (group.wasDefrosted) {
@@ -312,14 +328,43 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           }
         }
 
+        // Таймер виртуальной карточки: `elapsed = (now - created_at) - accumulated`.
+        // Чтобы на виртуальной показывалось корректное «максимальное активное
+        // время среди source-ов», вычисляем effective_start = min(c_i + a_i).
+        // Тогда elapsed_virtual = now - min(c+a) = max((now - c_i) - a_i) = max
+        // активного времени по source-ам. `accumulated_time_ms` оставляем 0:
+        // само время уже учтено в смещении `created_at`.
+        // Сортировку groups.sort это не трогает — она работает с
+        // SmartQueueGroup.earliestOrderTime, не с virtualOrder.created_at.
+        const sourceOrdersInGroup = group.sourceOrderIds
+          .map(id => activeOrders.find(o => o.id === id))
+          .filter((o): o is Order => !!o);
+        const effectiveStart = sourceOrdersInGroup.length > 0
+          ? Math.min(...sourceOrdersInGroup.map(s => s.created_at + (s.accumulated_time_ms || 0)))
+          : group.earliestOrderTime;
+
+        // История парковок source-ов — нужна OrderCard'у чтобы подсветить столы
+        // фиолетовой рамочкой («этот стол хоть раз паркавался в течение смены»).
+        // `was_parked` = true если хоть один source когда-либо паркавался;
+        // `parked_tables` = объединение всех паркованных столов по source-ам.
+        // Без этого проброса рамочка в Smart Wave пропадала (поля были undefined
+        // на virtualOrder и OrderCard рисовал столы как обычные жёлтые).
+        const wasParkedAny = sourceOrdersInGroup.some(s => !!s.was_parked);
+        const parkedTablesUnion = Array.from(new Set<number>(
+          sourceOrdersInGroup.flatMap(s => s.parked_tables || [])
+        ));
+
         const virtualOrder: Order = {
           id: virtualId,
           dish_id: group.dishId,
           quantity_stack: quantityStack,
           table_stack: tableStack,
-          created_at: group.earliestOrderTime,
+          created_at: effectiveStart,
           updated_at: Date.now(),
           status: 'ACTIVE',
+          accumulated_time_ms: 0,
+          was_parked: wasParkedAny,
+          parked_tables: parkedTablesUnion,
           defrost_started_at: defrostStartedAt,
           defrost_duration_seconds: defrostDurationSeconds,
         };
@@ -358,12 +403,8 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
 
       for (const rule of rules) {
         if (rule === 'ULTRA') {
-          // ULTRA лишается приоритета после разморозки — такой же контракт
-          // как в Smart Wave (smartQueue.buildSmartQueue ULTRA-split).
-          // Бизнес-требование: после истечения таймера карточка возвращается
-          // в очередь БЕЗ ULTRA-обгона.
-          const isUltraA = dishA.priority_flag === PriorityLevel.ULTRA && !hasDefrostBeenStarted(a);
-          const isUltraB = dishB.priority_flag === PriorityLevel.ULTRA && !hasDefrostBeenStarted(b);
+          const isUltraA = dishA.priority_flag === PriorityLevel.ULTRA;
+          const isUltraB = dishB.priority_flag === PriorityLevel.ULTRA;
           if (isUltraA && !isUltraB) return -1;
           if (!isUltraA && isUltraB) return 1;
           if (isUltraA && isUltraB) return a.created_at - b.created_at;
@@ -395,7 +436,7 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
 
       return a.created_at - b.created_at;
     });
-  }, [activeOrders, dishes, categories, settings, mergedVirtualIds]);
+  }, [activeOrders, dishes, categories, settings, mergedSources]);
 
   const checkStopped = (dish: Dish): string | null => {
     // Board ONLY checks Dish status - ingredient logic is synced at App level
@@ -458,14 +499,26 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
         <PartialCompletionModal
           totalQty={partialOrder.quantity_stack.reduce((a, b) => a + b, 0)}
           onConfirm={(qty) => {
-            // Smart Aggregation: распределить PartDone по реальным source orders
+            // Smart Aggregation: распределить PartDone по реальным source orders.
+            // Source-ы сортируем по created_at ASC — закрываем СТАРЫЕ заказы
+            // первыми (FIFO). Без этой сортировки порядок зависел от
+            // Map-insertion-order, который не гарантирует FIFO.
             const mapping = smartQueueMappingRef.current.get(partialOrder.id);
             if (mapping) {
               let remainingToComplete = qty;
-              // Проходим по source orders в порядке FIFO
-              for (const [sourceId, maxCount] of mapping.itemCountByOrder) {
+              const sourceEntries = Array.from(mapping.itemCountByOrder.entries())
+                .map(([sourceId, maxCount]) => {
+                  const sourceOrder = orders.find(o => o.id === sourceId);
+                  return {
+                    sourceId,
+                    maxCount,
+                    sortKey: sourceOrder?.created_at ?? Number.POSITIVE_INFINITY,
+                    sourceOrder,
+                  };
+                })
+                .sort((a, b) => a.sortKey - b.sortKey);
+              for (const { sourceId, maxCount, sourceOrder } of sourceEntries) {
                 if (remainingToComplete <= 0) break;
-                const sourceOrder = orders.find(o => o.id === sourceId);
                 if (!sourceOrder) continue;
                 const sourceTotalQty = sourceOrder.quantity_stack.reduce((a, b) => a + b, 0);
                 const toComplete = Math.min(remainingToComplete, maxCount);
@@ -625,20 +678,31 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                 }
               }}
               onStackMerge={(id) => {
-                // Smart Aggregation: merge на виртуальном заказе
+                // Smart Aggregation: фиксируем ТЕКУЩИЕ source-ы как merged.
+                // Новые source-ы, которые придут позже с тем же virtualId
+                // (стабильный по dishId+wasDefrosted), будут отрисовываться
+                // отдельным блоком — "2 + 1" и т.п.
                 const mapping = smartQueueMappingRef.current.get(id);
                 if (mapping) {
-                  // Добавляем в set merged — виртуальный заказ перестроится с объединённым стеком
-                  setMergedVirtualIds(prev => {
-                    const next = new Set(prev);
-                    next.add(id);
+                  setMergedSources(prev => {
+                    const next = new Map(prev);
+                    next.set(id, new Set(mapping.sourceOrderIds));
                     return next;
                   });
                 } else {
                   onStackMerge(id);
                 }
               }}
-              onCancelOrder={onCancelOrder}
+              onCancelOrder={(id) => {
+                // Smart Wave: virtual id → реальные source order_item_id.
+                // Стопнутое блюдо может быть собрано из нескольких source-ов
+                // (1+1+1 со стола 5,8,12) — отменяем все сразу, иначе на доске
+                // останется огрызок группы.
+                const sourceIds = resolveSourceOrderIds(id);
+                for (const sid of sourceIds) {
+                  onCancelOrder?.(sid);
+                }
+              }}
               onPreviewImage={onPreviewImage}
               isInWork={inWorkIds.has(order.id)}
               onToggleInWork={toggleInWork}

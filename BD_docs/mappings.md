@@ -85,11 +85,11 @@
 | `enableAggregation` | `enable_aggregation` | BOOLEAN | Default: false |
 | `enableSmartAggregation` | `enable_smart_aggregation` | BOOLEAN | Default: true |
 | `enableKdsStoplistSync` | `enable_kds_stoplist_sync` | BOOLEAN | Default: false (миграция 006) |
-| `defrostDurationMinutes` | `defrost_duration_minutes` | INT | Default: 15, CHECK 1..60 (миграция 016) |
-| `enableDefrostSound` | `enable_defrost_sound` | BOOLEAN | Default: true (миграция 016) |
+| `enableDefrostSound` | `enable_defrost_sound` | BOOLEAN | Default: true (миграция 016). Время разморозки per-dish в `slicer_dish_defrost.defrost_duration_minutes` (миграция 020 удалила глобальную колонку из `slicer_settings`) |
 | `dessertCategoryId` | `dessert_category_id` | UUID | FK → slicer_categories(id) (миграция 017) |
 | `dessertAutoParkEnabled` | `dessert_auto_park_enabled` | BOOLEAN | Default: false (миграция 017) |
 | `dessertAutoParkMinutes` | `dessert_auto_park_minutes` | INT | Default: 40, CHECK 1..240 (миграция 017) |
+| `dessertTriggerModifierPatterns` | `dessert_trigger_modifier_patterns` | TEXT[] | Default: `{Готовить%, Ждать%}` (миграция 019) |
 
 ## OrderHistoryEntry (types.ts) ↔ slicer_order_history
 

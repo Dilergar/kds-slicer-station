@@ -209,13 +209,19 @@ router.get('/', async (_req: Request, res: Response) => {
       priorityByDish.set(r.dish_id, Number(r.priority_flag));
     }
 
-    // Флаг «требует разморозки» (миграция 016). Хранится на уровне primary-блюда:
-    // на чтении резолвим через recipe_source_id — алиасы наследуют от primary
-    // (тот же паттерн что и рецепт). Отсутствие записи = false.
-    const defrostResult = await pool.query(`SELECT dish_id, requires_defrost FROM slicer_dish_defrost`);
-    const defrostByDish = new Map<string, boolean>();
+    // Флаг «требует разморозки» (миграция 016) + per-dish время в минутах
+    // (миграция 020). Хранится на уровне primary-блюда: на чтении резолвим
+    // через recipe_source_id — алиасы наследуют от primary (тот же паттерн
+    // что и рецепт). Отсутствие записи = { requires_defrost: false, minutes: 15 }.
+    const defrostResult = await pool.query(
+      `SELECT dish_id, requires_defrost, defrost_duration_minutes FROM slicer_dish_defrost`
+    );
+    const defrostByDish = new Map<string, { requires: boolean; minutes: number }>();
     for (const r of defrostResult.rows) {
-      defrostByDish.set(r.dish_id, Boolean(r.requires_defrost));
+      defrostByDish.set(r.dish_id, {
+        requires: Boolean(r.requires_defrost),
+        minutes: Number(r.defrost_duration_minutes)
+      });
     }
 
     // Формируем ответ в формате Dish[]
@@ -244,8 +250,10 @@ router.get('/', async (_req: Request, res: Response) => {
         recipe_source_id: row.recipe_source_id, // id primary блюда (или сам id если нет алиаса)
         category_ids: assignedCategories,
         priority_flag: priorityByDish.get(row.id) ?? 1, // 1=NORMAL, 3=ULTRA; отсутствие записи = NORMAL
-        // Флаг разморозки читаем по recipe_source_id — алиасы наследуют от primary.
-        requires_defrost: defrostByDish.get(row.recipe_source_id) ?? false,
+        // Флаг и время разморозки читаем по recipe_source_id — алиасы
+        // наследуют от primary. Отсутствие записи = дефолты (false / 15 мин).
+        requires_defrost: defrostByDish.get(row.recipe_source_id)?.requires ?? false,
+        defrost_duration_minutes: defrostByDish.get(row.recipe_source_id)?.minutes ?? 15,
         grams_per_portion: gramsPerPortion,
         ingredients,
         image_url: imagesByDish.get(row.id) || '',
@@ -349,29 +357,42 @@ router.put('/:dishId/priority', async (req: Request, res: Response) => {
 });
 
 /**
- * PUT /api/dishes/:dishId/defrost — Назначить блюду флаг «требует разморозки?».
- * Body: { requires_defrost: boolean }. UPSERT в slicer_dish_defrost.
- * Значение хранится на dish_id как пришёл; резолв alias→primary делает
- * вызывающий код (RecipeEditor подставляет primary перед отправкой — так же
- * как для рецепта), иначе флаг повесится на alias отдельно от primary.
+ * PUT /api/dishes/:dishId/defrost — Назначить блюду флаг «требует разморозки?»
+ * и per-dish время разморозки в минутах (миграция 020).
+ * Body: { requires_defrost: boolean, defrost_duration_minutes?: number }.
+ * UPSERT в slicer_dish_defrost. Значение хранится на dish_id как пришёл;
+ * резолв alias→primary делает вызывающий код (RecipeEditor подставляет primary
+ * перед отправкой — так же как для рецепта), иначе запись повесится на alias
+ * отдельно от primary.
+ * defrost_duration_minutes: если не передан — используем дефолт 15. Валидация
+ * 1..60 дублирует CHECK в БД, чтобы 400 с понятным текстом вместо 500.
  */
 router.put('/:dishId/defrost', async (req: Request, res: Response) => {
   try {
     const { dishId } = req.params;
-    const { requires_defrost } = req.body;
+    const { requires_defrost, defrost_duration_minutes } = req.body;
 
     if (typeof requires_defrost !== 'boolean') {
       res.status(400).json({ error: 'requires_defrost должен быть boolean' });
       return;
     }
 
+    // Дефолт 15 — если клиент отправил только requires_defrost (старый контракт)
+    // или выключает флаг и минуты неважны. CHECK 1..60 в миграции 020.
+    const minutes = defrost_duration_minutes ?? 15;
+    if (typeof minutes !== 'number' || !Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+      res.status(400).json({ error: 'defrost_duration_minutes должен быть целым числом 1..60' });
+      return;
+    }
+
     await pool.query(
-      `INSERT INTO slicer_dish_defrost (dish_id, requires_defrost)
-       VALUES ($1, $2)
+      `INSERT INTO slicer_dish_defrost (dish_id, requires_defrost, defrost_duration_minutes)
+       VALUES ($1, $2, $3)
        ON CONFLICT (dish_id) DO UPDATE SET
          requires_defrost = $2,
+         defrost_duration_minutes = $3,
          updated_at = NOW()`,
-      [dishId, requires_defrost]
+      [dishId, requires_defrost, minutes]
     );
     res.json({ updated: true });
   } catch (err) {

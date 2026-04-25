@@ -90,6 +90,17 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
     const isStopped = !!dish.is_stopped;
     const stopReason = dish.stop_reason || 'Unavailable';
 
+    // Каскадный стоп от ингредиента vs ручной стоп блюда:
+    // если в рецепте есть хоть один ингредиент с is_stopped=true — это каскад,
+    // и затемнять всю карточку не нужно (визуально пометим только конкретные
+    // ингредиенты ниже). Ручной стоп блюда (без стопнутых ингредиентов) —
+    // карточка целиком становится серой как раньше.
+    const hasStoppedIngredient = dish.ingredients.some(dishIng => {
+        const ingBase = ingredients.find(i => i.id === dishIng.id);
+        return ingBase?.is_stopped === true;
+    });
+    const greyOutWholeCard = isStopped && !hasStoppedIngredient;
+
     const isMerged = order.quantity_stack.length === 1;
     const totalQty = order.quantity_stack.reduce((sum, q) => sum + q, 0);
     const stackString = order.quantity_stack.join(' + ');
@@ -190,7 +201,7 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
       `}
         >
             {/* Card Content */}
-            <div className={`flex flex-col flex-1 p-4 pb-0 ${isStopped ? 'opacity-60 grayscale' : ''} overflow-hidden`}>
+            <div className={`flex flex-col flex-1 p-4 pb-0 ${greyOutWholeCard ? 'opacity-60 grayscale' : ''} overflow-hidden`}>
                 {/* Header Row */}
                 <div className="flex justify-between items-start mb-2 shrink-0">
                     <div className="w-3/4 mr-2">
@@ -277,7 +288,7 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                     className="text-slate-500 flex items-center"
                                     title="Это блюдо прошло разморозку"
                                 >
-                                    <Snowflake size={18} />
+                                    <Snowflake size={27} />
                                 </div>
                             ) : (
                                 <button
@@ -285,11 +296,11 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                         e.stopPropagation();
                                         onStartDefrost?.(order.id);
                                     }}
-                                    className="p-1 rounded bg-blue-900/30 hover:bg-blue-800/60 text-blue-300 border border-blue-700/50 transition-colors"
+                                    className="p-2 rounded bg-blue-900/30 hover:bg-blue-800/60 text-blue-300 border border-blue-700/50 transition-colors"
                                     title="Запустить разморозку"
                                     aria-label="Запустить разморозку"
                                 >
-                                    <Snowflake size={18} className="animate-pulse" />
+                                    <Snowflake size={27} className="animate-pulse" />
                                 </button>
                             )
                         )}
@@ -375,8 +386,13 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                         : `${val}г`;
                                 }
 
+                                const ingStopped = ingBase.is_stopped === true;
+
                                 return (
-                                    <div key={idx} className="flex items-center bg-slate-800/50 p-2 rounded border border-slate-700/50 text-sm">
+                                    <div
+                                      key={idx}
+                                      className={`flex items-center bg-slate-800/50 p-2 rounded text-sm border ${ingStopped ? 'border-red-500 grayscale opacity-60' : 'border-slate-700/50'}`}
+                                    >
                                         {imageToUse ? (
                                             <div className="w-8 h-8 rounded bg-slate-700 mr-3 flex-shrink-0 overflow-hidden cursor-zoom-in"
                                                 onDoubleClick={() => onPreviewImage(imageToUse)}>

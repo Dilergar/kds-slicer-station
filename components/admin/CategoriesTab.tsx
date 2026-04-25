@@ -247,11 +247,15 @@ export const CategoriesTab: React.FC<CategoriesTabProps> = ({ categories, setCat
               </div>
 
               {/* Панель авто-парковки — только для дессертной категории.
-                  Тумблер ON/OFF + поле минут. При ВКЛ каждая новая позиция
-                  этой категории сразу уйдёт на парковку на указанное время
-                  (см. server/src/routes/orders.ts → GET /api/orders). */}
+                  Тумблер ON/OFF + поле минут. При ВКЛ правило срабатывает
+                  только для дессертов, у которых официант в кассе поставил
+                  модификатор из списка `slicer_settings.dessert_trigger_modifier_patterns`
+                  (default: «Готовить%», «Ждать%»). Без модификатора десерт идёт
+                  в очередь сразу, как обычное блюдо. См. миграции 017+019 и
+                  server/src/routes/orders.ts → GET /api/orders. */}
               {isDessert && (
-                <div className="bg-pink-950/20 border-t border-pink-900/30 px-3 py-3 flex items-center justify-between gap-4">
+                <div className="bg-pink-950/20 border-t border-pink-900/30 px-3 py-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-4">
                   <div className="flex items-center gap-2 text-pink-200/80 text-sm font-medium">
                     <PauseCircle size={16} className="text-pink-400" />
                     <span>Авто-парковка на</span>
@@ -300,6 +304,12 @@ export const CategoriesTab: React.FC<CategoriesTabProps> = ({ categories, setCat
                       ВКЛ
                     </button>
                   </div>
+                  </div>
+                  {/* Подсказка: правило триггерится модификатором в кассе. */}
+                  <p className="text-[11px] text-pink-200/50 italic leading-snug">
+                    Только для десертов с модификатором «Готовить позже» или «Ждать разъяснений».
+                    Если модификатор «Готовить к HH.00» — парковка до указанного часа.
+                  </p>
                 </div>
               )}
             </li>

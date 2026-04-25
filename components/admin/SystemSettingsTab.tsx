@@ -159,40 +159,19 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
           />
         </div>
 
-        {/* Разморозка (миграция 016) — время таймера + звук уведомления.
-            Применяется только к блюдам с requires_defrost=true (настраивается
-            в RecipeEditor). Snapshot в момент запуска — изменение этого поля
-            не сбивает уже запущенные таймеры. */}
+        {/* Разморозка (миграции 016, 020) — глобальный тумблер звука.
+            Время разморозки задаётся per-dish в RecipeEditor (миграция 020),
+            здесь осталась только настройка звукового сигнала. */}
         <div className="border-t border-gray-700 pt-6">
-          <label className="block text-gray-400 font-bold mb-2 flex items-center gap-2">
-            <Snowflake size={16} className="text-blue-400" />
-            Время разморозки (минуты)
-          </label>
-          <p className="text-xs text-gray-500 mb-2">
-            Сколько минут размораживаются блюда с флагом «Требует разморозки?» в рецепте. От 1 до 60, по умолчанию 15.
-          </p>
-          <input
-            type="number"
-            min={1}
-            max={60}
-            value={settings.defrostDurationMinutes ?? 15}
-            onChange={(e) => {
-              let val = parseInt(e.target.value) || 15;
-              if (val > 60) val = 60;
-              if (val < 1) val = 1;
-              setSettings({ ...settings, defrostDurationMinutes: val });
-            }}
-            className="bg-gray-900 border border-gray-700 text-white p-3 rounded w-full md:w-48 focus:border-blue-500 outline-none"
-          />
-
-          {/* Toggle звука при истечении таймера */}
-          <div className="flex justify-between items-start mt-6">
+          <div className="flex justify-between items-start">
             <div>
-              <label className="block text-gray-400 text-sm font-bold mb-1">
+              <label className="block text-gray-400 text-sm font-bold mb-1 flex items-center gap-2">
+                <Snowflake size={16} className="text-blue-400" />
                 Звук при готовности разморозки
               </label>
               <p className="text-gray-500 text-xs max-w-md">
                 Короткий сигнал когда таймер на мини-карточке достиг 0. Помогает не пропустить готовую рыбу в шумной кухне.
+                Время разморозки настраивается отдельно для каждого блюда в разделе «Рецепты».
               </p>
             </div>
             <div className="flex items-center bg-gray-900 rounded-lg p-1 border border-gray-700 ml-4">

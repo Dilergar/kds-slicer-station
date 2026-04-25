@@ -21,17 +21,17 @@
 | `enable_aggregation` | BOOLEAN | ✅ | `FALSE` | 001 | Стандартная агрегация ВКЛ/ВЫКЛ |
 | `enable_smart_aggregation` | BOOLEAN | ✅ | `TRUE` | 001 | Smart Wave агрегация ВКЛ/ВЫКЛ |
 | `enable_kds_stoplist_sync` | BOOLEAN | ✅ | `FALSE` | 006 | Двусторонняя синхронизация стоп-листа с `rgst3_dishstoplist` (см. раздел 10 Инструкции) |
-| `defrost_duration_minutes` | INT | ✅ | `15` | 016 | Глобальное время разморозки (CHECK 1..60). Snapshot в момент клика ❄️, дальнейшие изменения не сбивают активные таймеры |
-| `enable_defrost_sound` | BOOLEAN | ✅ | `TRUE` | 016 | Web Audio beep при истечении таймера мини-карточки разморозки |
+| `enable_defrost_sound` | BOOLEAN | ✅ | `TRUE` | 016 | Web Audio beep при истечении таймера мини-карточки разморозки. Время разморозки per-dish в `slicer_dish_defrost.defrost_duration_minutes` (миграция 020 удалила глобальную колонку `defrost_duration_minutes`) |
 | `dessert_category_id` | UUID | ❌ | `NULL` | 017 | FK → `slicer_categories(id)` ON DELETE SET NULL. К какой категории применяется правило авто-парковки десертов. NULL = правило отключено |
 | `dessert_auto_park_enabled` | BOOLEAN | ✅ | `FALSE` | 017 | Глобальный тумблер авто-парковки десертов |
 | `dessert_auto_park_minutes` | INT | ✅ | `40` | 017 | На сколько минут уходит в парковку десертная позиция (CHECK 1..240) |
+| `dessert_trigger_modifier_patterns` | TEXT[] | ✅ | `{Готовить%, Ждать%}` | 019 | Паттерны LIKE для имён модификаторов из `ctlg20_modifiers` — при наличии хотя бы одного совпадения у дессертной позиции срабатывает авто-парковка. Имя вида «Готовить к HH.MM» → парковка до сегодняшних HH:MM; иначе → на `dessert_auto_park_minutes` |
 | `updated_at` | TIMESTAMPTZ | ✅ | `NOW()` | 001 | Дата последнего обновления |
 
 ## Constraints
 - `CHECK (id = 1)` — singleton
-- `CHECK (defrost_duration_minutes BETWEEN 1 AND 60)` — `slicer_settings_defrost_duration_valid` (016)
 - `CHECK (dessert_auto_park_minutes BETWEEN 1 AND 240)` — `slicer_settings_dessert_auto_park_minutes_valid` (017)
+- (Миграция 020 удалила `CHECK (defrost_duration_minutes BETWEEN 1 AND 60)` вместе с самой колонкой — правило переехало в `slicer_dish_defrost`.)
 - `FOREIGN KEY (dessert_category_id) REFERENCES slicer_categories(id) ON DELETE SET NULL` — `slicer_settings_dessert_category_fk` (017)
 - `enable_aggregation` и `enable_smart_aggregation` **взаимоисключающие** (логика на уровне приложения)
 
@@ -68,11 +68,12 @@ interface SystemSettings {
   enableAggregation?: boolean;          // → enable_aggregation
   enableSmartAggregation?: boolean;     // → enable_smart_aggregation
   enableKdsStoplistSync?: boolean;      // → enable_kds_stoplist_sync (006)
-  defrostDurationMinutes?: number;      // → defrost_duration_minutes (016)
+  // defrostDurationMinutes удалён в миграции 020 — время per-dish в Dish.defrost_duration_minutes
   enableDefrostSound?: boolean;         // → enable_defrost_sound (016)
   dessertCategoryId?: string | null;    // → dessert_category_id (017)
   dessertAutoParkEnabled?: boolean;     // → dessert_auto_park_enabled (017)
   dessertAutoParkMinutes?: number;      // → dessert_auto_park_minutes (017)
+  dessertTriggerModifierPatterns?: string[]; // → dessert_trigger_modifier_patterns (019)
 }
 ```
 

@@ -119,6 +119,7 @@
 - [016_dish_defrost](migrations/016_dish_defrost.md) — Разморозка блюд: таблица slicer_dish_defrost + defrost_* в order_state + настройки duration/sound
 - [017_dessert_auto_park](migrations/017_dessert_auto_park.md) — Авто-парковка десертов: dessert_* настройки в slicer_settings
 - [018_effective_created_at](migrations/018_effective_created_at.md) — Вариант Б парковки: effective_created_at + parked_by_auto, меняет семантику accumulated_time_ms
+- [019_dessert_modifier_trigger](migrations/019_dessert_modifier_trigger.md) — Авто-парковка десертов только при наличии модификатора времени (ctlg20) + поддержка «Готовить к HH.MM»
 
 ## Связанные документы
 - [mappings.md](mappings.md) — TypeScript interface ↔ DB column маппинг

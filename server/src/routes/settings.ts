@@ -28,14 +28,14 @@ router.get('/', async (_req: Request, res: Response) => {
       enableAggregation: row.enable_aggregation,
       enableSmartAggregation: row.enable_smart_aggregation,
       enableKdsStoplistSync: row.enable_kds_stoplist_sync,
-      // Разморозка (миграция 016): глобальное время в минутах + toggle звука
-      // на истечение таймера. Оба поля singleton-настройки.
-      defrostDurationMinutes: row.defrost_duration_minutes,
+      // Разморозка (миграция 016, 020): глобальное время убрано, живёт per-dish
+      // в slicer_dish_defrost. Здесь остался только toggle звука.
       enableDefrostSound: row.enable_defrost_sound,
-      // Авто-парковка десертов (миграция 017)
+      // Авто-парковка десертов (миграции 017 + 019)
       dessertCategoryId: row.dessert_category_id,
       dessertAutoParkEnabled: row.dessert_auto_park_enabled,
-      dessertAutoParkMinutes: row.dessert_auto_park_minutes
+      dessertAutoParkMinutes: row.dessert_auto_park_minutes,
+      dessertTriggerModifierPatterns: row.dessert_trigger_modifier_patterns
     });
   } catch (err) {
     console.error('[Settings] Ошибка GET:', err);
@@ -57,24 +57,12 @@ router.put('/', async (req: Request, res: Response) => {
       enableAggregation,
       enableSmartAggregation,
       enableKdsStoplistSync,
-      defrostDurationMinutes,
       enableDefrostSound,
       dessertCategoryId,
       dessertAutoParkEnabled,
-      dessertAutoParkMinutes
+      dessertAutoParkMinutes,
+      dessertTriggerModifierPatterns
     } = req.body;
-
-    // Валидация defrostDurationMinutes: CHECK в БД (1..60) всё равно упадёт,
-    // но вернём 400 заранее с понятным текстом, чтобы не ловить 500.
-    if (
-      defrostDurationMinutes != null &&
-      (typeof defrostDurationMinutes !== 'number' ||
-        defrostDurationMinutes < 1 ||
-        defrostDurationMinutes > 60)
-    ) {
-      res.status(400).json({ error: 'defrostDurationMinutes должен быть целым числом 1..60' });
-      return;
-    }
 
     // Валидация dessertAutoParkMinutes (симметрично — CHECK БД 1..240).
     if (
@@ -84,6 +72,16 @@ router.put('/', async (req: Request, res: Response) => {
         dessertAutoParkMinutes > 240)
     ) {
       res.status(400).json({ error: 'dessertAutoParkMinutes должен быть целым числом 1..240' });
+      return;
+    }
+
+    // Валидация dessertTriggerModifierPatterns: массив непустых строк.
+    if (
+      dessertTriggerModifierPatterns != null &&
+      (!Array.isArray(dessertTriggerModifierPatterns) ||
+        !dessertTriggerModifierPatterns.every((p: unknown) => typeof p === 'string' && p.length > 0))
+    ) {
+      res.status(400).json({ error: 'dessertTriggerModifierPatterns должен быть массивом непустых строк' });
       return;
     }
 
@@ -99,13 +97,13 @@ router.put('/', async (req: Request, res: Response) => {
         enable_aggregation = COALESCE($8, enable_aggregation),
         enable_smart_aggregation = COALESCE($9, enable_smart_aggregation),
         enable_kds_stoplist_sync = COALESCE($10, enable_kds_stoplist_sync),
-        defrost_duration_minutes = COALESCE($11, defrost_duration_minutes),
-        enable_defrost_sound = COALESCE($12, enable_defrost_sound),
+        enable_defrost_sound = COALESCE($11, enable_defrost_sound),
         -- Десерты: dessert_category_id может прийти явным null (отвязать),
-        -- поэтому НЕ через COALESCE — используем флаг $16 "трогаем ли это поле".
-        dessert_category_id = CASE WHEN $16::bool THEN $13::uuid ELSE dessert_category_id END,
-        dessert_auto_park_enabled = COALESCE($14, dessert_auto_park_enabled),
-        dessert_auto_park_minutes = COALESCE($15, dessert_auto_park_minutes),
+        -- поэтому НЕ через COALESCE — используем флаг $15 "трогаем ли это поле".
+        dessert_category_id = CASE WHEN $15::bool THEN $12::uuid ELSE dessert_category_id END,
+        dessert_auto_park_enabled = COALESCE($13, dessert_auto_park_enabled),
+        dessert_auto_park_minutes = COALESCE($14, dessert_auto_park_minutes),
+        dessert_trigger_modifier_patterns = COALESCE($16::text[], dessert_trigger_modifier_patterns),
         updated_at = NOW()
        WHERE id = 1
        RETURNING *`,
@@ -120,14 +118,14 @@ router.put('/', async (req: Request, res: Response) => {
         enableAggregation,
         enableSmartAggregation,
         enableKdsStoplistSync,
-        defrostDurationMinutes,
         enableDefrostSound,
         dessertCategoryId ?? null,
         dessertAutoParkEnabled,
         dessertAutoParkMinutes,
         // Флаг: клиент явно прислал поле dessertCategoryId (в т.ч. null) —
         // значит хочет его изменить. Отсутствие ключа в body → не трогаем.
-        Object.prototype.hasOwnProperty.call(req.body, 'dessertCategoryId')
+        Object.prototype.hasOwnProperty.call(req.body, 'dessertCategoryId'),
+        dessertTriggerModifierPatterns ?? null
       ]
     );
 
@@ -147,11 +145,11 @@ router.put('/', async (req: Request, res: Response) => {
       enableAggregation: row.enable_aggregation,
       enableSmartAggregation: row.enable_smart_aggregation,
       enableKdsStoplistSync: row.enable_kds_stoplist_sync,
-      defrostDurationMinutes: row.defrost_duration_minutes,
       enableDefrostSound: row.enable_defrost_sound,
       dessertCategoryId: row.dessert_category_id,
       dessertAutoParkEnabled: row.dessert_auto_park_enabled,
-      dessertAutoParkMinutes: row.dessert_auto_park_minutes
+      dessertAutoParkMinutes: row.dessert_auto_park_minutes,
+      dessertTriggerModifierPatterns: row.dessert_trigger_modifier_patterns
     });
   } catch (err) {
     console.error('[Settings] Ошибка PUT:', err);

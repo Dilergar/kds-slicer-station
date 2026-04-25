@@ -49,15 +49,22 @@ export const clearDishSlicerData = (
   apiFetch(`/dishes/${dishId}/slicer-data`, { method: 'DELETE' });
 
 /**
- * Назначить блюду флаг «требует разморозки?» (миграция 016).
- * В RecipeEditor перед вызовом dishId резолвится в primary через aliasMap —
- * флаг живёт на primary-блюде, алиасы наследуют через recipe_source_id.
+ * Назначить блюду флаг «требует разморозки?» и per-dish время разморозки
+ * в минутах (миграции 016, 020). В RecipeEditor перед вызовом dishId
+ * резолвится в primary через aliasMap — запись живёт на primary-блюде,
+ * алиасы наследуют через recipe_source_id.
+ * Минуты: целое 1..60, по умолчанию 15 если не указано (бэк примет и это,
+ * когда юзер выключил флаг и значение неважно).
  */
 export const updateDishDefrost = (
   dishId: string,
-  requiresDefrost: boolean
+  requiresDefrost: boolean,
+  defrostDurationMinutes?: number
 ): Promise<{ updated: boolean }> =>
   apiFetch(`/dishes/${dishId}/defrost`, {
     method: 'PUT',
-    body: JSON.stringify({ requires_defrost: requiresDefrost })
+    body: JSON.stringify({
+      requires_defrost: requiresDefrost,
+      defrost_duration_minutes: defrostDurationMinutes
+    })
   });

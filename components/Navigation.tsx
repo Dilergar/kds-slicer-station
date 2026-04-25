@@ -1,7 +1,7 @@
 /**
  * Navigation.tsx — Верхняя навигационная панель
  *
- * Отображает логотип, кнопки переключения разделов, кнопку Test Order,
+ * Отображает логотип, кнопки переключения разделов,
  * имя залогиненного пользователя и кнопку «Выйти».
  *
  * Вкладки фильтруются по allowedViews (вычисляется в App по роли юзера из
@@ -11,13 +11,12 @@
 
 import React from 'react';
 import { ViewMode, AuthUser } from '../types';
-import { LayoutGrid, ShoppingBasket, FileText, Settings, Zap, LayoutDashboard, LogOut } from 'lucide-react';
+import { LayoutGrid, ShoppingBasket, FileText, Settings, LayoutDashboard, LogOut } from 'lucide-react';
 
 interface NavigationProps {
   currentView: ViewMode;
   setView: (view: ViewMode) => void;
   activeOrderCount: number;
-  onAddTestOrder?: () => void;
   allowedViews: ViewMode[];
   user: AuthUser | null;
   onLogout: () => void;
@@ -27,7 +26,6 @@ export const Navigation: React.FC<NavigationProps> = ({
   currentView,
   setView,
   activeOrderCount,
-  onAddTestOrder,
   allowedViews,
   user,
   onLogout,
@@ -66,18 +64,8 @@ export const Navigation: React.FC<NavigationProps> = ({
           ))}
         </div>
 
-        {(onAddTestOrder || user) && (
+        {user && (
           <div className="h-6 w-px bg-slate-800 shrink-0 hidden md:block"></div>
-        )}
-
-        {onAddTestOrder && allowedViews.includes('KDS') && (
-          <button
-            onClick={onAddTestOrder}
-            className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-slate-800 text-yellow-500 hover:text-yellow-400 hover:bg-slate-700 rounded-md text-xs font-bold uppercase tracking-wider transition-all border border-slate-700 whitespace-nowrap"
-          >
-            <Zap size={14} className="fill-current" />
-            Тест
-          </button>
         )}
 
         {user && (

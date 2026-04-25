@@ -76,6 +76,10 @@ export interface Dish {
   // запускающая таймер разморозки. Флаг наследуется от primary-блюда через
   // recipe_source_id. Управляется в RecipeEditor.
   requires_defrost?: boolean;
+  // Per-dish длительность разморозки в минутах (миграция 020). 1..60,
+  // по умолчанию 15. Наследуется от primary-блюда. Snapshot пишется в
+  // slicer_order_state.defrost_duration_seconds в момент клика ❄️.
+  defrost_duration_minutes?: number;
 }
 
 // ======================================================================
@@ -204,8 +208,8 @@ export interface SystemSettings {
   enableSmartAggregation?: boolean;     // Smart Wave Aggregation ON/OFF (по умолчанию: true)
   // ❗ Взаимоисключающие: Smart Wave ON → Aggregation OFF (и наоборот)
   enableKdsStoplistSync?: boolean;      // Двусторонняя синхронизация стопа блюд с rgst3_dishstoplist (по умолчанию: false). Включается программистами заказчика — см. Инструкция.md.
-  // Разморозка (миграция 016)
-  defrostDurationMinutes?: number;      // Время разморозки в минутах (1..60, по умолчанию 15)
+  // Разморозка (миграция 016, 020): время per-dish в Dish.defrost_duration_minutes,
+  // здесь остаётся только глобальный toggle звука (время убрано в миграции 020).
   enableDefrostSound?: boolean;         // Звуковой сигнал при истечении таймера (по умолчанию: true)
   // Авто-парковка десертов (миграция 017). Если enabled=true и категория
   // привязана — при первом появлении дессертной позиции в GET /api/orders
@@ -215,6 +219,11 @@ export interface SystemSettings {
   dessertCategoryId?: string | null;    // UUID slicer_categories.id, null = правило отключено
   dessertAutoParkEnabled?: boolean;     // Глобальный тумблер (по умолчанию false)
   dessertAutoParkMinutes?: number;      // На сколько минут паркуем (1..240, по умолчанию 40)
+  // Паттерны LIKE (case-insensitive) для имён модификаторов из ctlg20_modifiers,
+  // при наличии которых дессертная позиция уходит в авто-парковку (миграция 019).
+  // По умолчанию: ['Готовить%', 'Ждать%']. Имя вида "Готовить к HH.MM" дополнительно
+  // парсится и парковка ставится до сегодняшних HH:MM; иначе — на dessertAutoParkMinutes.
+  dessertTriggerModifierPatterns?: string[];
 }
 
 // ======================================================================

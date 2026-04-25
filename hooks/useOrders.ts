@@ -1,5 +1,5 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { Order, OrderHistoryEntry, PriorityLevel, Dish, IngredientBase, SystemSettings } from '../types';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { Order, OrderHistoryEntry, Dish, IngredientBase, SystemSettings } from '../types';
 import { calculateConsumedIngredients } from '../utils';
 import {
   fetchOrders,
@@ -20,7 +20,6 @@ import {
 interface UseOrdersProps {
   settings: SystemSettings;
   dishes: Dish[];
-  setDishes: React.Dispatch<React.SetStateAction<Dish[]>>;
   dishMap: Map<string, Dish>;
   ingredients: IngredientBase[];
 }
@@ -35,7 +34,6 @@ interface UseOrdersProps {
 export const useOrders = ({
   settings,
   dishes,
-  setDishes,
   dishMap,
   ingredients
 }: UseOrdersProps) => {
@@ -86,36 +84,6 @@ export const useOrders = ({
     }, 4000);
     return () => clearInterval(interval);
   }, [loadOrders, loadHistory]);
-
-  /**
-   * Добавляет тестовый заказ (для dev-режима).
-   * В продакшене заказы создаются кассовой системой в docm2_orders.
-   */
-  const handleAddTestOrder = useCallback((dishId: string, priority: PriorityLevel, tableNumber?: number, quantity: number = 1) => {
-    // Временно изменяем приоритет блюда глобально (test feature)
-    setDishes(prevDishes => {
-      const dishIndex = prevDishes.findIndex(d => d.id === dishId);
-      if (dishIndex === -1) return prevDishes;
-      const updated = [...prevDishes];
-      updated[dishIndex] = { ...updated[dishIndex], priority_flag: priority };
-      return updated;
-    });
-
-    // В dev-режиме добавляем заказ локально (без API, т.к. нет endpoint для создания)
-    const now = Date.now();
-    const targetTableNumber = tableNumber !== undefined ? tableNumber : (Math.floor(Math.random() * 100) + 1);
-    const newOrder: Order = {
-      id: `test_${now}_${Math.random().toString(36).substring(2, 9)}`,
-      dish_id: dishId,
-      quantity_stack: [quantity],
-      table_stack: [Array(quantity).fill(targetTableNumber)],
-      parked_tables: [],
-      created_at: now,
-      updated_at: now,
-      status: 'ACTIVE'
-    };
-    setOrders(prev => [...prev, newOrder]);
-  }, [setDishes]);
 
   /**
    * Объединение стеков (Merge). Отправляет на backend.
@@ -269,17 +237,12 @@ export const useOrders = ({
    * 4. Удаляем запись из истории на backend (DELETE /api/history/orders/:id).
    *    Порядок важен: сначала restore, потом delete — если первый упал,
    *    история ещё на месте и пользователь может попробовать снова.
-   *
-   * Для тестовых заказов (id начинается с "test_") — только локальный
-   * state и удаление истории. Они не живут в БД, backend restore им не
-   * нужен.
    */
   const handleRestoreOrder = useCallback(async (historyId: string) => {
     const entry = orderHistory.find(h => h.id === historyId);
     if (!entry || !entry.snapshot) return;
 
     const restoredOrder = entry.snapshot;
-    const isTestOrder = restoredOrder.id.startsWith('test_');
 
     // Вычисляем финальный стек ДО оптимистичного обновления, чтобы отправить то же самое на backend.
     const existing = orders.find(o => o.id === restoredOrder.id);
@@ -308,13 +271,11 @@ export const useOrders = ({
     setOrderHistory(prev => prev.filter(h => h.id !== historyId));
 
     try {
-      if (!isTestOrder) {
-        // Вернуть в slicer_order_state: без этого polling через 4с перезатрёт локальное состояние.
-        await restoreOrder(restoredOrder.id, {
-          quantityStack: newQuantityStack,
-          tableStack: newTableStack,
-        });
-      }
+      // Вернуть в slicer_order_state: без этого polling через 4с перезатрёт локальное состояние.
+      await restoreOrder(restoredOrder.id, {
+        quantityStack: newQuantityStack,
+        tableStack: newTableStack,
+      });
       await deleteOrderHistory(historyId);
     } catch (err) {
       console.error('[useOrders] Ошибка restore:', err);
@@ -471,18 +432,28 @@ export const useOrders = ({
 
   /**
    * Запустить таймер разморозки. Оптимистично проставляем defrost_started_at
-   * = now + snapshot duration из settings, чтобы мини-карточка появилась
-   * мгновенно, не дожидаясь ближайшего polling через 4 сек.
+   * = now + snapshot duration per-dish (миграция 020) из dishMap, чтобы
+   * мини-карточка появилась мгновенно, не дожидаясь ближайшего polling
+   * через 4 сек. Бэкенд пересчитает duration аутентично из slicer_dish_defrost
+   * и следующий polling синхронизирует значение.
    */
   const handleStartDefrost = useCallback(async (
     orderId: string,
     sourceOrderItemIds?: string[]
   ) => {
-    const durationSec = (settings?.defrostDurationMinutes ?? 15) * 60;
-    const now = Date.now();
     const ids = sourceOrderItemIds && sourceOrderItemIds.length > 0
       ? sourceOrderItemIds
       : [orderId];
+
+    // Резолвим dish_id первого item'а → длительность в минутах из справочника
+    // блюд. Smart Wave гарантирует одинаковое блюдо на всех items группы,
+    // поэтому достаточно первого. Фолбэк 15 мин если блюдо почему-то не
+    // нашлось в dishMap.
+    const firstId = ids[0];
+    const firstOrder = orders.find(o => o.id === firstId);
+    const dish = firstOrder ? dishMap.get(firstOrder.dish_id) : undefined;
+    const durationSec = (dish?.defrost_duration_minutes ?? 15) * 60;
+    const now = Date.now();
 
     setOrders(prev => prev.map(o => {
       if (!ids.includes(o.id)) return o;
@@ -495,7 +466,7 @@ export const useOrders = ({
       console.error('[useOrders] Ошибка defrost-start:', err);
       await loadOrders();
     }
-  }, [settings?.defrostDurationMinutes, loadOrders]);
+  }, [orders, dishMap, loadOrders]);
 
   /** Отменить разморозку — возвращает карточку в очередь с исходным ULTRA. */
   const handleCancelDefrost = useCallback(async (
@@ -522,7 +493,8 @@ export const useOrders = ({
   /**
    * «Разморозилась» — ручное подтверждение раньше таймера. Оптимистично
    * бэкдейтим started_at на (duration+1) сек назад, чтобы мини-карточка
-   * исчезла мгновенно и позиция сразу вернулась в очередь (без ULTRA).
+   * исчезла мгновенно и позиция сразу вернулась в очередь. ULTRA-статус
+   * сохраняется (раз блюдо ULTRA — остаётся ULTRA и после разморозки).
    */
   const handleCompleteDefrost = useCallback(async (
     orderId: string,
@@ -556,7 +528,6 @@ export const useOrders = ({
     orderHistory,
     setOrderHistory,
     loading,
-    handleAddTestOrder,
     handleStackMerge,
     handleCompleteOrder,
     handlePartialComplete,

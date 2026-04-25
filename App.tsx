@@ -16,7 +16,6 @@ import { SlicerStation } from './components/SlicerStation';
 import { StopListManager } from './components/StopListManager';
 import { AdminPanel } from './components/AdminPanel';
 import { Dashboard } from './components/Dashboard';
-import { TestOrderModal } from './components/TestOrderModal';
 import { LoginScreen } from './components/LoginScreen';
 import { Check, LogOut, Ban } from 'lucide-react';
 
@@ -44,7 +43,6 @@ function App() {
 
   // === Текущий режим отображения (KDS | STOPLIST | ADMIN | DASHBOARD) ===
   const [currentView, setCurrentView] = useState<ViewMode>('KDS');
-  const [showTestModal, setShowTestModal] = useState(false);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
 
   // Если у юзера нет прав на текущую вкладку (например, Официант залогинился
@@ -170,7 +168,6 @@ function App() {
   const {
     orders,
     orderHistory,
-    handleAddTestOrder,
     handleStackMerge,
     handleCompleteOrder,
     handlePartialComplete,
@@ -185,7 +182,6 @@ function App() {
   } = useOrders({
     settings,
     dishes,
-    setDishes,
     dishMap,
     ingredients
   });
@@ -238,7 +234,6 @@ function App() {
         currentView={currentView}
         setView={setCurrentView}
         activeOrderCount={orders.length}
-        onAddTestOrder={() => setShowTestModal(true)}
         allowedViews={allowedViews}
         user={user}
         onLogout={logout}
@@ -253,7 +248,6 @@ function App() {
             ingredients={ingredients}
             onCompleteOrder={handleCompleteOrder}
             onStackMerge={handleStackMerge}
-            onAddTestOrder={handleAddTestOrder}
             onPreviewImage={setPreviewImage}
             onParkTable={handleParkTable}
             onUnparkTable={handleUnparkNow}
@@ -305,21 +299,6 @@ function App() {
           />
         )}
       </main>
-
-      {/* === МОДАЛЬНОЕ ОКНО ТЕСТОВОГО ЗАКАЗА === */}
-      {showTestModal && (
-        <TestOrderModal
-          dishes={dishes}
-          onClose={() => setShowTestModal(false)}
-          onAddOrder={(items, tableNumber) => {
-            const targetTableNumber = tableNumber !== undefined ? tableNumber : (Math.floor(Math.random() * 100) + 1);
-            items.forEach(item => {
-              handleAddTestOrder(item.dishId, item.priority, targetTableNumber, item.quantity);
-            });
-            setShowTestModal(false);
-          }}
-        />
-      )}
 
       {/* === ПОЛНОЭКРАННЫЙ ПРОСМОТР ИЗОБРАЖЕНИЯ === */}
       {previewImage && (

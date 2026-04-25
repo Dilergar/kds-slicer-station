@@ -117,7 +117,6 @@
 │   ├── PartialCompletionModal.tsx # Numpad для частичного выполнения
 │   ├── DefrostRow.tsx      # Ряд мини-карточек размораживающихся блюд (миграция 016)
 │   ├── DefrostModal.tsx    # Модалка подтверждения «Разморозилась» — обёртка OrderCard с другой подписью кнопки
-│   ├── TestOrderModal.tsx  # Модалка тестового заказа
 │   ├── AdminPanel.tsx      # Админ: категории, рецепты, настройки
 │   ├── Dashboard.tsx       # Аналитика: стопы, скорость, расход
 │   ├── admin/              # Вкладки админки
@@ -175,7 +174,9 @@
 │       ├── 015_rgst3_archive_with_actor.sql      # триггер пишет stopped_by_* из users по OLD.inserter
 │       ├── 016_dish_defrost.sql                  # разморозка: slicer_dish_defrost + defrost_duration/sound в settings + defrost_* в order_state
 │       ├── 017_dessert_auto_park.sql              # авто-парковка десертов: dessert_category_id + dessert_auto_park_enabled/minutes в settings
-│       └── 018_effective_created_at.sql           # Вариант Б парковки: effective_created_at + parked_by_auto, меняет семантику accumulated_time_ms
+│       ├── 018_effective_created_at.sql           # Вариант Б парковки: effective_created_at + parked_by_auto, меняет семантику accumulated_time_ms
+│       ├── 019_dessert_modifier_trigger.sql       # авто-парковка десертов только при наличии модификатора "Готовить%/Ждать%" (ctlg20)
+│       └── 020_per_dish_defrost_duration.sql      # per-dish время разморозки в slicer_dish_defrost; удаление глобального defrost_duration_minutes из settings
 ├── BD_docs/                # Документация БД для программистов
 │   ├── README.md           # Обзор архитектуры, ER-схема
 │   ├── mappings.md         # TypeScript ↔ DB маппинг
@@ -244,7 +245,7 @@
    - **Резолв на backend**: в `GET /api/orders` через `COALESCE(alias.primary_dish_id, dish_id)` подменяется `dish_id` → фронтенд получает заказы как будто алиасов не существует
    - В `GET /api/dishes` возвращается `recipe_source_id` — откуда брать рецепт (primary или сам suuid)
    - **Автокопия категорий**: `POST /api/dish-aliases` в одной транзакции копирует `category_ids` primary → alias (через `slicer_dish_categories`), чтобы alias сразу попадал в те же волны очереди, что и primary
-   - **Канонизация в smartQueue**: `flattenOrders` использует `canonicalDishId = rawDish.recipe_source_id || rawDish.id` — нужно только для тест-заказов, которые добавляются локально с оригинальным alias_dish_id (на реальных `/api/orders` это no-op). `SlicerStation.tsx`, `useOrders.ts` — не знают об алиасах
+   - **Канонизация в smartQueue**: `flattenOrders` использует `canonicalDishId = rawDish.recipe_source_id || rawDish.id`. Резолв на бэке `/api/orders` уже подменяет dish_id на primary, поэтому на реальных заказах это no-op. Сохранено как защита на случай, если когда-нибудь в `dishes` state попадёт алиасный id. `SlicerStation.tsx`, `useOrders.ts` — не знают об алиасах
    - Ограничение: `alias_dish_id` — PK → одно блюдо = один рецепт
    - Управление через UI в `RecipeEditor.tsx` (кнопка "Связать" на карточке блюда)
 
@@ -298,26 +299,28 @@
     - **Старые записи (до миграции 014):** все `actor_*` = NULL, ретро-заполнение не делаем. UI показывает «—».
     - **UI:** в `StopListHistorySection.tsx` компонент `<ActorLine>` рендерит «Поставил: X · Снял: Y» под time range в развёрнутых детальных строках обоих режимов группировки (by-item / by-date). Бейджи `[KDS]` / `[каскад]` подсказывают источник.
 
-11. **Разморозка блюд (миграция 016)**
-    - Для замороженных блюд (сейчас — только рыба): в `RecipeEditor` выставляется флаг «Требует разморозки? Да/Нет» (по умолчанию Нет). Значение пишется в `slicer_dish_defrost.requires_defrost` **на primary-блюдо** (alias наследует через `recipe_source_id` — тот же паттерн что рецепт).
-    - **Глобальная настройка** `slicer_settings.defrost_duration_minutes` (1..60, default 15) задаёт время таймера. Одно значение на все блюда — размораживаем только рыбу, per-dish override не нужен.
+11. **Разморозка блюд (миграции 016 + 020)**
+    - Для замороженных блюд (изначально рыба, дальше по ситуации): в `RecipeEditor` выставляется флаг «Требует разморозки? Да/Нет» (по умолчанию Нет) + per-dish время таймера в минутах (1..60, default 15). Оба значения пишутся в `slicer_dish_defrost` (`requires_defrost`, `defrost_duration_minutes`) **на primary-блюдо** (alias наследует через `recipe_source_id` — тот же паттерн что рецепт). Поле минут показывается только когда выбрано «Да».
+    - **Глобальная настройка `slicer_settings.defrost_duration_minutes` удалена миграцией 020** — время стало per-dish. В `slicer_settings` остался только `enable_defrost_sound`. `POST /api/orders/:id/defrost-start` резолвит длительность через JOIN alias→primary→`slicer_dish_defrost`, COALESCE 15 мин. `useOrders.handleStartDefrost` оптимистично берёт duration из `dishMap`. `slicer_order_state.defrost_duration_seconds` — snapshot в момент клика, остаётся как был.
     - **Три состояния карточки:**
       - **Ожидание** (`defrost_started_at IS NULL`): карточка в очереди, в правом верхнем углу кликабельная синяя ❄️ с pulse.
       - **В процессе** (`started AND now < started + duration*sec`): карточка **не отрисовывается** в основной очереди (в `smartQueue.flattenOrders` стоит фильтр `isDefrostActive(order) → continue`), а показывается мини-карточкой в `DefrostRow` над сеткой. Мини-карточка: ❄️ + код блюда + Nшт + столы + обратный таймер + [×] для отмены.
-      - **Разморожено** (`started AND now >= started + duration*sec`): карточка снова в очереди, но **без ULTRA** (в `smartQueue`: `hasDefrostBeenStarted → priority = NORMAL` всегда). `created_at` сохранён → COURSE_FIFO ставит позицию на её естественное место (после своих салатов, вперёд более поздних заказов). В правом верхнем — статичная серая ❄️ как индикатор.
+      - **Разморожено** (`started AND now >= started + duration*sec`): карточка снова в очереди на том же месте по `created_at` (COURSE_FIFO). ULTRA-приоритет сохраняется — раз блюдо было ULTRA, оно остаётся ULTRA и после разморозки. В правом верхнем — статичная серая ❄️ как индикатор «уже размораживалось» (для защиты от повторного запуска таймера, не для сортировки).
     - **Клик по мини-карточке** → `DefrostModal`: стандартный `<OrderCard>` целиком, только `completeButtonLabel="РАЗМОРОЗИЛАСЬ"` + `onCompleteOrder` → `defrost-complete`. Крестик [×] на самой мини-карточке отменяет без модалки.
-    - **«Разморозилась» (ручное подтверждение)** бэкдейтит `defrost_started_at = NOW() - (duration+1)s` → таймер «истёк», карточка возвращается в очередь. Отдельной колонки `defrost_completed_at` не вводили — состояние однозначно выражается парой started_at/duration. ULTRA остаётся лишённым (started_at ≠ NULL).
+    - **«Разморозилась» (ручное подтверждение)** бэкдейтит `defrost_started_at = NOW() - (duration+1)s` → таймер «истёк», карточка возвращается в очередь. Отдельной колонки `defrost_completed_at` не вводили — состояние однозначно выражается парой started_at/duration.
     - **Smart Wave group**: в `SlicerStation` defrosting orders группируются по `(dish_id + started_at mod 5s)` → одна мини-карточка на «вспышку» (3 стола одной рыбы = одна карточка с агрегированным кол-вом/столами). Резолв виртуального id → `sourceOrderItemIds[]` через inline mapping; бэкенд апдейтит все items одной транзакцией.
-    - **Разделение агрегации по defrost-статусу**: в основной очереди `smartQueue.groupItemsByDish` группирует по паре `(dishId + wasDefrosted)`, а не просто по `dishId`. Уже размороженные (таймер истёк → вернулись в очередь) и свежие порции одного блюда идут в РАЗНЫЕ виртуальные карточки. Без этого клик ❄️ на объединённой карточке вызывал `defrost-start` на всех source-ах и перезапускал 15-минутный таймер на уже готовой рыбе. Флаг `wasDefrosted = hasDefrostBeenStarted(order)` копируется в `FlatOrderItem` в `flattenOrders` и в `SmartQueueGroup`. В `SlicerStation` virtualOrder защищённой группы наследует `defrost_started_at/duration_seconds` с одного из source-ов — `OrderCard` видит `hasDefrostBeenStarted=true`, рисует серую ❄️-индикацию и скрывает кнопку запуска.
+    - **Разделение агрегации по defrost-статусу**: в основной очереди `smartQueue.groupItemsByDish` группирует по паре `(dishId + wasDefrosted)`, а не просто по `dishId`. Уже размороженные (таймер истёк → вернулись в очередь) и свежие порции одного блюда идут в РАЗНЫЕ виртуальные карточки. Это защита от перезапуска разморозки: без этого клик ❄️ на объединённой карточке вызывал `defrost-start` на всех source-ах и стартовал 15-минутный таймер на уже готовой рыбе. Флаг `wasDefrosted = hasDefrostBeenStarted(order)` копируется в `FlatOrderItem` в `flattenOrders` и в `SmartQueueGroup`. В `SlicerStation` virtualOrder защищённой группы наследует `defrost_started_at/duration_seconds` с одного из source-ов — `OrderCard` видит `hasDefrostBeenStarted=true`, рисует серую ❄️-индикацию и скрывает кнопку запуска. На ULTRA-приоритет и сортировку этот флаг **не влияет**.
     - **Сброс defrost-state** при: park (парковка доминирует), restore (восстановленный заказ → чистый лист), defrost-cancel (отмена вручную). complete/cancel — удалять поля не надо, ряд всё равно уходит.
     - **Звук**: при истечении таймера мини-карточки играется Web Audio beep (3-тональный, ~0.5 сек). Флаг `slicer_settings.enable_defrost_sound` (default TRUE). Трекинг «уже отыграл» живёт в ref внутри `DefrostRow` — не повторяется каждую секунду.
 
-12. **Авто-парковка десертов (миграция 017)**
-    - Проблема: десерты в чеке сразу вместе с салатом/горячим, но готовить их нужно через 30–40 мин (гости сами сигналят). Без правила карточка десерта падает в очередь и сбивает FIFO + COURSE_FIFO.
-    - Решение: при первом появлении дессертной позиции в `GET /api/orders` backend INSERT'ит `slicer_order_state` со `status=PARKED`, `parked_at=docm2tabl1_ordertime`, `unpark_at=ordertime + X min`, `was_parked=true`. Авто-разпарковка в том же маршруте (блок выше, `unpark_at <= NOW()`) снимет парковку когда время подойдёт.
-    - Настройки в `slicer_settings`: `dessert_category_id` (UUID, FK→slicer_categories ON DELETE SET NULL), `dessert_auto_park_enabled` (bool, default false), `dessert_auto_park_minutes` (int 1..240, default 40). Seed автоматически привязывает к категории «Десерты» по имени.
-    - UI: тумблер ВКЛ/ВЫКЛ + input минут живут прямо на карточке дессертной категории в `CategoriesTab` (не в общих настройках — контекст категории виднее).
-    - Защита от удаления: `DELETE /api/categories/:id` отдаёт 409 если id совпадает с `dessert_category_id`. В UI кнопка корзины скрыта + бейдж 🔒 «Системная категория». На уровне БД FK с ON DELETE SET NULL — страховка на случай прямого SQL-удаления.
+12. **Авто-парковка десертов (миграции 017 + 019)**
+    - Проблема: десерты в чеке сразу вместе с салатом/горячим, но часто их нужно готовить через 30–40 мин (гости сами сигналят). Без правила карточка десерта падает в очередь и сбивает FIFO. Но иногда десерт хотят «сразу» — правило не должно срабатывать на всех подряд.
+    - Решение (017): при первом появлении дессертной позиции в `GET /api/orders` backend INSERT'ит `slicer_order_state` со `status=PARKED`, `parked_at=docm2tabl1_ordertime`, `unpark_at=ordertime + X min`, `was_parked=true`. Авто-разпарковка в том же маршруте (блок выше, `unpark_at <= NOW()`) снимет парковку когда время подойдёт.
+    - **Триггер через модификатор (019)**: правило срабатывает ТОЛЬКО если у позиции есть модификатор из `ctlg20_modifiers`, чьё имя матчит один из паттернов в `slicer_settings.dessert_trigger_modifier_patterns` (default `{Готовить%, Ждать%}`). Связка через `docm2tabl2_dishmodifiers.docm2tabl2_itemrow = docm2tabl1_items.suuid`. Без такого модификатора десерт идёт в очередь сразу, как обычное блюдо.
+    - **Время возврата из модификатора**: если имя модификатора вида `"Готовить к HH.MM"` (парсится regex `к\s*(\d{1,2})[.:](\d{2})`) → парковка до сегодняшних HH:MM. Если несколько таких у одной позиции — берётся MAX (консервативно). Если модификатор без времени (`"Готовить позже"`, `"Ждать разъяснений"`) → парковка на `dessert_auto_park_minutes` (default 40) от ordertime.
+    - Настройки в `slicer_settings`: `dessert_category_id` (UUID, FK→slicer_categories ON DELETE SET NULL), `dessert_auto_park_enabled` (bool, default false), `dessert_auto_park_minutes` (int 1..240, default 40), `dessert_trigger_modifier_patterns` (TEXT[], default `{Готовить%, Ждать%}`). Seed привязывает `dessert_category_id` к категории «Десерты» по имени.
+    - UI: тумблер ВКЛ/ВЫКЛ + input минут живут на карточке дессертной категории в `CategoriesTab`. Паттерны модификаторов правятся напрямую в БД через SQL (UI не предусмотрен — изменения редкие).
+    - Защита от удаления: `DELETE /api/categories/:id` отдаёт 409 если id совпадает с `dessert_category_id`. В UI кнопка корзины скрыта + бейдж 🔒 «Системная категория». FK `ON DELETE SET NULL` — страховка на уровне БД.
     - `ON CONFLICT (order_item_id) DO NOTHING` — если нарезчик вручную вернул десерт раньше времени, мы его не паркуем повторно. Правило срабатывает только при **первом** появлении позиции в запросе.
 
 ## Навигация (ViewMode)
@@ -392,7 +395,7 @@ cd server && psql -U postgres -d arclient -f migrations/002_seed_defaults.sql
 | `slicer_dish_stoplist` | Актуальный стоп-лист блюд модуля (MANUAL + CASCADE), + колонка `rgst3_row_suuid` для линковки с зеркальной строкой |
 | `slicer_dish_images` | Фото блюд: путь до файла в `server/public/images/dishes/`. Загрузка через multer, раздача Express static + nginx. Миграция 008. |
 | `slicer_dish_priority` | Приоритет отображения блюда (1=NORMAL, 3=ULTRA), per-dish. Отсутствие записи = NORMAL. Миграция 013. |
-| `slicer_dish_defrost` | Per-dish флаг «требует разморозки?». Хранится на primary; alias наследует через recipe_source_id. Миграция 016. |
+| `slicer_dish_defrost` | Per-dish флаг «требует разморозки?» + per-dish время таймера в минутах (`defrost_duration_minutes`, миграция 020). Хранится на primary; alias наследует через recipe_source_id. Миграции 016, 020. |
 | `slicer_kds_sync_config` | Singleton-конфиг для двусторонней синхронизации с `rgst3_dishstoplist` (OFF по умолчанию) |
 | `slicer_order_state` | Состояние заказов нарезчика (парковка, статус, finished_at для метрики повара, defrost_started_at/duration — миграция 016) |
 | `slicer_order_history` | Завершённые заказы (KPI, snapshot) |
@@ -450,10 +453,10 @@ server/
 - `GET /api/dishes` — справочник блюд (из ctlg15_dishes, с recipe_source_id)
 - `PUT /api/dishes/:dishId/categories` — назначить блюду slicer-категории (полная замена)
 - `PUT /api/dishes/:dishId/priority` — назначить приоритет блюда (1=NORMAL, 3=ULTRA), UPSERT в `slicer_dish_priority`
-- `PUT /api/dishes/:dishId/defrost` — назначить флаг «требует разморозки?» (UPSERT в `slicer_dish_defrost`). RecipeEditor перед вызовом резолвит dishId в primary через aliasMap.
-- `POST /api/orders/:id/defrost-start` — запустить таймер разморозки. Body `{sourceOrderItemIds?}`. Snapshot duration из settings, UPSERT в `slicer_order_state` для всех items атомарно (Smart Wave: один клик → N items).
-- `POST /api/orders/:id/defrost-cancel` — сбросить `defrost_started_at/duration` в NULL → карточка возвращается в очередь с восстановленным ULTRA.
-- `POST /api/orders/:id/defrost-complete` — ручное подтверждение «Разморозилась»: бэкдейтит `defrost_started_at` на `(duration+1) sec` назад → таймер «истёк», карточка возвращается без ULTRA.
+- `PUT /api/dishes/:dishId/defrost` — назначить флаг «требует разморозки?» и per-dish время в минутах (UPSERT в `slicer_dish_defrost`, миграция 020). Body `{requires_defrost, defrost_duration_minutes?}`. RecipeEditor перед вызовом резолвит dishId в primary через aliasMap.
+- `POST /api/orders/:id/defrost-start` — запустить таймер разморозки. Body `{sourceOrderItemIds?}`. Snapshot duration читается per-dish из `slicer_dish_defrost` (JOIN alias→primary, COALESCE 15), UPSERT в `slicer_order_state` для всех items атомарно (Smart Wave: один клик → N items).
+- `POST /api/orders/:id/defrost-cancel` — сбросить `defrost_started_at/duration` в NULL → карточка возвращается в очередь.
+- `POST /api/orders/:id/defrost-complete` — ручное подтверждение «Разморозилась»: бэкдейтит `defrost_started_at` на `(duration+1) sec` назад → таймер «истёк», карточка возвращается в очередь.
 - `POST /api/dishes/:dishId/image` — загрузить фото блюда (multipart/form-data, поле `image`, до 5МБ, image/jpeg|png|gif|webp). Файл кладётся в `server/public/images/dishes/<id>.<ext>`, путь — в `slicer_dish_images`.
 - `DELETE /api/dishes/:dishId/image` — удалить фото блюда (файл с диска + запись в `slicer_dish_images`).
 - `POST /api/ingredients/:id/image` — загрузить фото ингредиента (multipart, 5МБ, image/*). Файл → `server/public/images/ingredients/<id>.<ext>`, путь — в `slicer_ingredients.image_url` (миграция 009, раньше там хранился Base64).
