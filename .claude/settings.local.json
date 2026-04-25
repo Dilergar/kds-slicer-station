@@ -21,5 +21,10 @@
       "Bash('/c/Program Files/PostgreSQL/18/bin/psql' -U postgres -h localhost -d postgres -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS arclient;' -c 'CREATE DATABASE arclient;')",
       "Bash('/c/Program Files/PostgreSQL/18/bin/pg_restore' --no-owner --no-privileges -U postgres -h localhost -d arclient c:/Users/SanzharVictus/Desktop/kds-slicer-station/dump-arclient-202604151408)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "postgres",
+    "github",
+    "serena"
+  ]
 }

@@ -54,7 +54,16 @@ DROP TABLE IF EXISTS slicer_kds_sync_config;
 раздел «Двусторонняя синхронизация стоп-листа (опционально)».
 
 Краткое резюме:
-1. Найти UUID-ы ресторана / меню / ответственного сотрудника в БД заказчика
-2. `INSERT INTO slicer_kds_sync_config ... ON CONFLICT DO UPDATE`
+1. **Авто** (если 1 ресторан = 1 меню): `psql -f server/scripts/configure-kds-sync.sql`
+   — заполнит `slicer_kds_sync_config` сам.
+2. **Ручной** (если ресторанов/меню больше одного): найти UUID-ы и сделать
+   `INSERT INTO slicer_kds_sync_config ... ON CONFLICT DO UPDATE` руками.
 3. `GRANT INSERT, DELETE ON rgst3_dishstoplist TO <user>`
 4. `UPDATE slicer_settings SET enable_kds_stoplist_sync = true`
+
+## Per-user атрибуция стопов
+Реальный `responsible` и `inserter` в `rgst3_dishstoplist` подставляются
+из PIN-сессии нарезчика (через `users.uuid → ctlg10_useremployees →
+ctlg5_employees.suuid`). Конфиг `slicer_kds_sync_config.responsible_user_id`
+и `inserter_text` используются только как fallback, когда actor не
+передан или не привязан к employee.

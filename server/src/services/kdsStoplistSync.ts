@@ -12,8 +12,18 @@
  *    делается INSERT в rgst3_dishstoplist; при снятии — DELETE по сохранённому
  *    suuid. Всё в той же транзакции что и slicer_dish_stoplist.
  *
- * Включение: см. раздел «Двусторонняя синхронизация стоп-листа» в
- * корневом файле Инструкция.md.
+ * Per-user атрибуция (актор стопа):
+ *  - actor.uuid (users.uuid из PIN-сессии) резолвится в ctlg5_employees.suuid
+ *    через ctlg10_useremployees → пишется в rgst3_ctlg5_uuid__responsible.
+ *  - actor.uuid (как text) пишется в inserter/updater — позволяет видеть в
+ *    основной KDS «кто конкретно поставил стоп», а в Dashboard JOIN по
+ *    users.uuid::text = r.inserter резолвит ФИО автора.
+ *  - Если actor не передан или не имеет связи с employee → fallback на
+ *    config.responsibleUserId / config.inserterText (заполнено программистами
+ *    заказчика при включении синхронизации).
+ *
+ * Включение/выключение: см. раздел «Двусторонняя синхронизация стоп-листа»
+ * в корневом файле Инструкция.md.
  */
 import type { PoolClient } from 'pg';
 
@@ -22,6 +32,16 @@ interface SyncConfig {
   menuId: string;
   responsibleUserId: string;
   inserterText: string;
+}
+
+/**
+ * Актор toggle-операции — залогиненный по PIN юзер. Используется для
+ * атрибуции стопа в чужой rgst3_dishstoplist (responsible + inserter).
+ * Опционален — при отсутствии используется fallback из slicer_kds_sync_config.
+ */
+export interface SyncActor {
+  uuid?: string | null;
+  name?: string | null;
 }
 
 /**
@@ -59,6 +79,26 @@ async function loadSyncConfig(client: PoolClient): Promise<SyncConfig | null> {
 }
 
 /**
+ * Резолвит users.uuid → ctlg5_employees.suuid через ctlg10_useremployees.
+ * Возвращает null если связи нет (либо актор не передан, либо у юзера
+ * не настроен ctlg10-маппинг). Caller должен использовать fallback.
+ */
+async function resolveEmployeeId(
+  client: PoolClient,
+  actorUuid: string | null | undefined
+): Promise<string | null> {
+  if (!actorUuid) return null;
+  const res = await client.query(
+    `SELECT ctlg10_ctlg5_uuid__employee
+       FROM ctlg10_useremployees
+      WHERE ctlg10_user = $1::uuid
+      LIMIT 1`,
+    [actorUuid]
+  );
+  return res.rows.length > 0 ? res.rows[0].ctlg10_ctlg5_uuid__employee : null;
+}
+
+/**
  * Записать стоп блюда в rgst3_dishstoplist. Возвращает suuid созданной строки
  * (для последующего DELETE) или null если синхронизация выключена.
  *
@@ -68,7 +108,8 @@ async function loadSyncConfig(client: PoolClient): Promise<SyncConfig | null> {
 export async function pushDishStop(
   client: PoolClient,
   dishId: string,
-  reason: string | null
+  reason: string | null,
+  actor: SyncActor = {}
 ): Promise<string | null> {
   const config = await loadSyncConfig(client);
   if (!config) return null;
@@ -86,6 +127,18 @@ export async function pushDishStop(
     );
   }
   const shiftId = shiftRes.rows[0].suuid;
+
+  // Per-user атрибуция: резолвим ctlg5_employees.suuid из users.uuid через
+  // ctlg10_useremployees. Если актор не передан / не привязан к employee —
+  // fallback на config.responsibleUserId (системный employee из конфига).
+  const resolvedEmployeeId = await resolveEmployeeId(client, actor.uuid);
+  const responsibleId = resolvedEmployeeId ?? config.responsibleUserId;
+
+  // inserter — текстовое поле, в которое кладём users.uuid (как text).
+  // Это позволит JOIN-у `users.uuid::text = r.inserter` в /api/stoplist/history
+  // резолвить ФИО актора нашего стопа. Fallback — статичный config.inserterText
+  // ('slicer-module' по умолчанию).
+  const inserterText = actor.uuid && actor.uuid.length > 0 ? actor.uuid : config.inserterText;
 
   // INSERT в rgst3_dishstoplist. Используем DEFAULT для id/uuid/suuid/insert_date/
   // update_date/version (эти поля имеют sane defaults в их схеме). Заполняем все
@@ -105,13 +158,13 @@ export async function pushDishStop(
     )
     RETURNING suuid`,
     [
-      config.inserterText,
+      inserterText,
       reason || 'Stopped by slicer module',
       dishId,
       config.restaurantId,
       shiftId,
       config.menuId,
-      config.responsibleUserId,
+      responsibleId,
     ]
   );
 
@@ -121,6 +174,11 @@ export async function pushDishStop(
 /**
  * Удалить нашу строку из rgst3_dishstoplist по сохранённому suuid.
  * No-op если синхронизация выключена или suuid пустой.
+ *
+ * Используется в **каскадной** ветке (recalculateCascadeStops): когда
+ * ингредиент возвращается, мы убираем только нашу зеркальную строку и
+ * НЕ трогаем чужие стопы кассира на этом же блюде (у кассира могла быть
+ * отдельная причина стопа, не связанная с ингредиентом).
  */
 export async function pushDishUnstop(
   client: PoolClient,
@@ -131,11 +189,50 @@ export async function pushDishUnstop(
   const config = await loadSyncConfig(client);
   if (!config) return;
 
-  // Удаляем РОВНО ту строку которую сами создали — по suuid. Это критично:
-  // другие записи в rgst3_dishstoplist могут принадлежать кассе или менеджерам,
-  // их трогать нельзя.
+  // Удаляем РОВНО ту строку которую сами создали — по suuid. Это критично
+  // для каскадного flow: чужие стопы кассира на этом блюде должны остаться.
   await client.query(
     `DELETE FROM rgst3_dishstoplist WHERE suuid = $1`,
     [rgst3RowSuuid]
+  );
+}
+
+/**
+ * Удалить ВСЕ строки rgst3_dishstoplist для блюда в текущей открытой смене
+ * (и наши зеркальные, и чужие — кассирские, менеджерские).
+ *
+ * Политика «модуль — мастер стоп-листа»: когда нарезчик через UI снимает
+ * блюдо со стопа в нашем модуле, оно должно быть снято со стопа везде.
+ * Используется в **ручной** ветке UNSTOP — `routes/stoplist.ts`.
+ *
+ * Срабатывание триггера `slicer_archive_rgst3_delete_trg` (миграция 021):
+ *   - Для линкованных строк (наши через rgst3_row_suuid) → триггер пропускает,
+ *     история уже записана в коде с resumed_by_*.
+ *   - Для НЕлинкованных (чужие кассирские) → триггер архивирует с actor_source='kds'.
+ *
+ * No-op если синхронизация выключена.
+ */
+export async function pushDishUnstopAll(
+  client: PoolClient,
+  dishId: string
+): Promise<void> {
+  const config = await loadSyncConfig(client);
+  if (!config) return;
+
+  // Открытая смена — стоп-лист в их системе scoped по смене.
+  const shiftRes = await client.query(
+    `SELECT suuid FROM ctlg14_shifts WHERE ctlg14_closed = false ORDER BY ctlg14_opentime DESC LIMIT 1`
+  );
+  if (shiftRes.rows.length === 0) {
+    // Нет открытой смены → стопов в rgst3 для текущей смены тоже нет → no-op.
+    return;
+  }
+  const shiftId = shiftRes.rows[0].suuid;
+
+  await client.query(
+    `DELETE FROM rgst3_dishstoplist
+       WHERE rgst3_ctlg15_uuid__dish::text = $1
+         AND rgst3_ctlg14_uuid__shift = $2`,
+    [dishId, shiftId]
   );
 }

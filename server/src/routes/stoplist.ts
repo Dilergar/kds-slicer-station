@@ -15,7 +15,7 @@
 import { Router, Request, Response } from 'express';
 import type { PoolClient } from 'pg';
 import { pool } from '../config/db';
-import { pushDishStop, pushDishUnstop } from '../services/kdsStoplistSync';
+import { pushDishStop, pushDishUnstop, pushDishUnstopAll } from '../services/kdsStoplistSync';
 
 const router = Router();
 
@@ -51,6 +51,43 @@ const router = Router();
 interface Actor {
   uuid?: string | null;
   name?: string | null;
+}
+
+/**
+ * Резолвит alias-группу блюда: массив dish_id, включающий primary
+ * и все его алиасы. Используется в ручном dish toggle, чтобы стоп/снятие
+ * распространялось на всю группу синхронно — алиасы режут одинаково по
+ * рецепту (Д184 = 184 для нарезчика), поэтому должны быть в одном состоянии.
+ *
+ * Случаи:
+ * - dishId это primary → группа = [primary, все его aliases]
+ * - dishId это alias → находим primary → группа = [primary, все его aliases]
+ * - dishId без алиасов → группа = [dishId]
+ *
+ * Каскадная логика (recalculateCascadeStops) уже сама учитывает алиасы
+ * через UNION с slicer_dish_aliases — этот helper нужен только для ручного
+ * dish toggle, где раньше работали только с одним dish_id.
+ */
+async function resolveAliasGroup(client: PoolClient, dishId: string): Promise<string[]> {
+  // Шаг 1: найти primary. Если dishId — алиас, primary берём из таблицы.
+  // Если нет — primary это сам dishId.
+  const primaryRes = await client.query(
+    `SELECT primary_dish_id FROM slicer_dish_aliases WHERE alias_dish_id = $1`,
+    [dishId]
+  );
+  const primaryId: string = primaryRes.rows.length > 0
+    ? primaryRes.rows[0].primary_dish_id
+    : dishId;
+
+  // Шаг 2: все алиасы primary-блюда (включая dishId если он сам был алиасом).
+  const aliasRes = await client.query(
+    `SELECT alias_dish_id FROM slicer_dish_aliases WHERE primary_dish_id = $1`,
+    [primaryId]
+  );
+  const aliasIds: string[] = aliasRes.rows.map(r => r.alias_dish_id);
+
+  // Шаг 3: дедупликация (на случай битых данных). Primary всегда первым.
+  return Array.from(new Set([primaryId, ...aliasIds]));
 }
 
 async function recalculateCascadeStops(
@@ -195,7 +232,9 @@ async function recalculateCascadeStops(
       const reason = `Missing: ${target.blockingName}`;
       // Sync ДО вставки в slicer_dish_stoplist — если rgst3 INSERT упадёт,
       // транзакция откатит всё. Если sync выключен — pushDishStop вернёт null.
-      const rgst3Suuid = await pushDishStop(client, dishId, reason);
+      // Actor пробрасывается чтобы responsible/inserter в rgst3 указывали на
+      // реального юзера, инициировавшего toggle ингредиента-родителя.
+      const rgst3Suuid = await pushDishStop(client, dishId, reason, actor);
       const insertRes = await client.query(
         `INSERT INTO slicer_dish_stoplist
           (dish_id, stop_type, reason, cascade_ingredient_id, rgst3_row_suuid,
@@ -320,16 +359,17 @@ router.post('/toggle', async (req: Request, res: Response) => {
       }
 
       if (targetType === 'dish') {
-        // Состояние блюда определяется UNION двух источников:
-        //  1. slicer_dish_stoplist — наш модуль (мы можем им управлять)
-        //  2. rgst3_dishstoplist в открытой смене — основная KDS (read-only)
-        //
-        // Без учёта rgst3 был баг бесконечного цикла: блюдо стопнуто только в
-        // rgst3 → backend думал «не стопнуто» → INSERT MANUAL вместо удаления.
+        // Alias-группа: блюдо + все его варианты (Д184 + 184 — режут одинаково).
+        // Стоп/снятие применяется ко ВСЕЙ группе синхронно. Если у блюда нет
+        // алиасов — группа из одного элемента, поведение как раньше.
+        const aliasGroup = await resolveAliasGroup(client, targetId);
+
+        // Состояние КЛИКНУТОГО блюда (targetId) определяет намерение: stop vs unstop.
+        // UNION двух источников чтобы корректно обработать стопы из основной KDS:
+        //  1. slicer_dish_stoplist — наш модуль
+        //  2. rgst3_dishstoplist в открытой смене — основная KDS
         const sliceRes = await client.query(
-          `SELECT stop_type, reason, stopped_at, rgst3_row_suuid,
-                  stopped_by_uuid, stopped_by_name, actor_source
-             FROM slicer_dish_stoplist WHERE dish_id = $1`,
+          `SELECT 1 FROM slicer_dish_stoplist WHERE dish_id = $1 LIMIT 1`,
           [targetId]
         );
         const rgstRes = await client.query(
@@ -340,88 +380,102 @@ router.post('/toggle', async (req: Request, res: Response) => {
              LIMIT 1`,
           [targetId]
         );
-
-        const inSlicer = sliceRes.rows.length > 0;
-        const inRgst3 = rgstRes.rows.length > 0;
-        const isCurrentlyStopped = inSlicer || inRgst3;
+        const isCurrentlyStopped = sliceRes.rows.length > 0 || rgstRes.rows.length > 0;
         const isStopping = !isCurrentlyStopped;
+        const dishName: string = req.body.dishName || 'Unknown';
 
         if (isStopping) {
-          // Ставим MANUAL-стоп. Sync ДО вставки в slicer — если rgst3 INSERT
-          // упадёт, транзакция откатит всё. Если sync выключен → null.
-          const rgst3Suuid = await pushDishStop(client, targetId, reason || 'Manual');
-          await client.query(
-            `INSERT INTO slicer_dish_stoplist
-              (dish_id, stop_type, reason, stopped_at, cascade_ingredient_id, rgst3_row_suuid,
-               stopped_by_uuid, stopped_by_name, actor_source)
-             VALUES ($1, 'MANUAL', $2, NOW(), NULL, $3, $4, $5, 'slicer')
-             ON CONFLICT (dish_id) DO UPDATE SET
-               stop_type = 'MANUAL',
-               reason = EXCLUDED.reason,
-               cascade_ingredient_id = NULL,
-               rgst3_row_suuid = COALESCE(EXCLUDED.rgst3_row_suuid, slicer_dish_stoplist.rgst3_row_suuid),
-               stopped_by_uuid = EXCLUDED.stopped_by_uuid,
-               stopped_by_name = EXCLUDED.stopped_by_name,
-               actor_source = 'slicer'`,
-            [targetId, reason || 'Manual', rgst3Suuid, actor.uuid, actor.name]
-          );
+          // STOP всей alias-группы. Для каждого блюда:
+          //  - если ещё не стопнуто (не в slicer_dish_stoplist) → INSERT + push в rgst3
+          //  - если уже стопнуто → пропускаем (избегаем дублей и orphan-rgst3-строк)
+          // ON CONFLICT DO NOTHING — защита от race-condition на уровне БД.
+          for (const id of aliasGroup) {
+            const exists = await client.query(
+              `SELECT 1 FROM slicer_dish_stoplist WHERE dish_id = $1 LIMIT 1`,
+              [id]
+            );
+            if (exists.rows.length > 0) continue;
+
+            // Sync ДО вставки в slicer — если rgst3 INSERT упадёт, транзакция
+            // откатит всё. Если sync выключен → null.
+            const rgst3Suuid = await pushDishStop(client, id, reason || 'Manual', actor);
+            await client.query(
+              `INSERT INTO slicer_dish_stoplist
+                (dish_id, stop_type, reason, stopped_at, cascade_ingredient_id, rgst3_row_suuid,
+                 stopped_by_uuid, stopped_by_name, actor_source)
+               VALUES ($1, 'MANUAL', $2, NOW(), NULL, $3, $4, $5, 'slicer')
+               ON CONFLICT (dish_id) DO NOTHING`,
+              [id, reason || 'Manual', rgst3Suuid, actor.uuid, actor.name]
+            );
+          }
 
           await client.query('COMMIT');
-          res.json({ toggled: true, is_stopped: true });
+          res.json({ toggled: true, is_stopped: true, alias_group_size: aliasGroup.length });
           return;
         }
 
-        // Пользователь хочет СНЯТЬ стоп.
-        if (inSlicer) {
-          const row = sliceRes.rows[0];
-          const now = new Date();
-          const stoppedAt = new Date(row.stopped_at);
-          const durationMs = now.getTime() - stoppedAt.getTime();
-          const dishName: string = req.body.dishName || 'Unknown';
-
-          await client.query(
-            `INSERT INTO slicer_stop_history
-              (target_type, target_id, target_name, stopped_at, resumed_at, reason, duration_ms,
-               stopped_by_uuid, stopped_by_name,
-               resumed_by_uuid, resumed_by_name,
-               actor_source)
-             VALUES ('dish', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-            [
-              targetId, dishName, stoppedAt, now,
-              row.reason || 'Manual', durationMs,
-              row.stopped_by_uuid, row.stopped_by_name,
-              actor.uuid, actor.name,
-              row.actor_source || 'slicer',
-            ]
+        // UNSTOP всей alias-группы.
+        // Политика «модуль — мастер стоп-листа»: снятие в нашем UI снимает
+        // блюдо со стопа везде, включая стопы кассира в основной KDS.
+        // Подробности в Инструкция.md → раздел 10 → «Политика mastership».
+        //
+        // Для каждого блюда в группе порядок шагов важен из-за триггера
+        // slicer_archive_rgst3_delete (миграция 021):
+        //   1. Если есть в slicer — пишем нашу историю с resumed_by_*.
+        //   2. pushDishUnstopAll — DELETE всех rgst3 строк для этого блюда:
+        //      - линкованные (наши) — триггер пропускает, история уже есть
+        //      - нелинкованные (кассирские) — триггер архивирует с actor_source='kds'
+        //   3. DELETE из slicer_dish_stoplist (после rgst3, чтобы линковка жила).
+        for (const id of aliasGroup) {
+          const idSliceRes = await client.query(
+            `SELECT stop_type, reason, stopped_at, rgst3_row_suuid,
+                    stopped_by_uuid, stopped_by_name, actor_source
+               FROM slicer_dish_stoplist WHERE dish_id = $1`,
+            [id]
           );
+          const idInSlicer = idSliceRes.rows.length > 0;
 
-          // Sync: убираем нашу зеркальную строку из rgst3 (no-op если sync off)
-          await pushDishUnstop(client, row.rgst3_row_suuid);
+          if (idInSlicer) {
+            const row = idSliceRes.rows[0];
+            const now = new Date();
+            const stoppedAt = new Date(row.stopped_at);
+            const durationMs = now.getTime() - stoppedAt.getTime();
 
-          await client.query(
-            `DELETE FROM slicer_dish_stoplist WHERE dish_id = $1`,
-            [targetId]
-          );
+            await client.query(
+              `INSERT INTO slicer_stop_history
+                (target_type, target_id, target_name, stopped_at, resumed_at, reason, duration_ms,
+                 stopped_by_uuid, stopped_by_name,
+                 resumed_by_uuid, resumed_by_name,
+                 actor_source)
+               VALUES ('dish', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+              [
+                id, dishName, stoppedAt, now,
+                row.reason || 'Manual', durationMs,
+                row.stopped_by_uuid, row.stopped_by_name,
+                actor.uuid, actor.name,
+                row.actor_source || 'slicer',
+              ]
+            );
+          }
 
-          // После ручного снятия могло оказаться, что блюдо должно оставаться
-          // на каскадном стопе (если ингредиент всё ещё на стопе). Пересчёт
-          // добавит новую CASCADE-строку — с текущим actor'ом.
-          await recalculateCascadeStops(client, actor);
+          // Удаляем все rgst3 строки для этого блюда (наши + чужие).
+          await pushDishUnstopAll(client, id);
+
+          if (idInSlicer) {
+            await client.query(
+              `DELETE FROM slicer_dish_stoplist WHERE dish_id = $1`,
+              [id]
+            );
+          }
         }
 
-        // Финальная проверка: если блюдо всё ещё в rgst3 (или было только там),
-        // мы не можем его «разблокировать» — это чужой стоп-лист основной KDS.
-        if (inRgst3) {
-          await client.query('ROLLBACK');
-          res.status(409).json({
-            error: 'Это блюдо в стоп-листе основной KDS. Снимите стоп через основную KDS — модуль нарезчика не управляет чужим стоп-листом.',
-            stopped_in: 'rgst3_dishstoplist'
-          });
-          return;
-        }
+        // После снятия пересчитываем каскады — если ингредиент всё ещё на
+        // стопе, recalculateCascadeStops вернёт CASCADE-строки для нужных
+        // блюд (включая их алиасы — это уже умеет SQL внутри функции).
+        await recalculateCascadeStops(client, actor);
 
         await client.query('COMMIT');
-        res.json({ toggled: true, is_stopped: false });
+        res.json({ toggled: true, is_stopped: false, alias_group_size: aliasGroup.length });
         return;
       }
 

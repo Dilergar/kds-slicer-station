@@ -40,6 +40,8 @@
 - **Создавать** новые таблицы с префиксом `slicer_`
 - **Создавать** свои индексы только на новых `slicer_*` таблицах
 - **Опционально:** `INSERT/DELETE` в `rgst3_dishstoplist` через адаптер `server/src/services/kdsStoplistSync.ts`. Только если включен флаг `slicer_settings.enable_kds_stoplist_sync = true` (по умолчанию false). Это **единственное место** в коде, где модуль может трогать чужую таблицу для записи. Конфиг включения — `slicer_kds_sync_config`. См. `Инструкция.md` → раздел «Двусторонняя синхронизация стоп-листа».
+  - **Политика mastership (с миграции 021):** при ручном снятии блюда со стопа в нашем UI модуль удаляет **все** строки `rgst3_dishstoplist` для этого блюда в текущей смене — включая поставленные кассиром. Семантика: «у нарезчика финальное слово по поводу что готовится». Каскадное снятие (через ингредиент) удаляет только нашу зеркальную строку — кассирские стопы не трогает.
+  - Триггер `slicer_archive_rgst3_delete_trg` (миграции 011/015/021) определяет «наш DELETE» через линковку `slicer_dish_stoplist.rgst3_row_suuid` и пропускает архивацию для своих строк, чтобы избежать дублей в `slicer_stop_history`.
 
 #### ⚠️ РАНЬШЕ ПИСАЛИ, ТЕПЕРЬ НЕТ: `docm2tabl1_items.docm2tabl1_cooked`
 Модуль **НЕ** пишет в это поле (убрано в миграции 007, 2026-04-18). Причина: блюдо может отображаться на других панелях основной KDS (раздача, пасс, мобильное приложение официанта), и нажатие нарезчиком «Готово» путало их, давая ложный сигнал «готово всё блюдо». Нарезчик закрывает позицию **только** в своей теневой таблице: `slicer_order_state.status = 'COMPLETED'` + `slicer_order_state.finished_at = NOW()`. Поле `docm2tabl1_cooked` / `docm2tabl1_cooktime` остаётся под управлением основной KDS. Разница `docm2tabl1_cooktime - slicer_order_state.finished_at` = время готовки повара (используется в отчётах Dashboard, см. `Инструкция.md` раздел 11).
@@ -176,7 +178,8 @@
 │       ├── 017_dessert_auto_park.sql              # авто-парковка десертов: dessert_category_id + dessert_auto_park_enabled/minutes в settings
 │       ├── 018_effective_created_at.sql           # Вариант Б парковки: effective_created_at + parked_by_auto, меняет семантику accumulated_time_ms
 │       ├── 019_dessert_modifier_trigger.sql       # авто-парковка десертов только при наличии модификатора "Готовить%/Ждать%" (ctlg20)
-│       └── 020_per_dish_defrost_duration.sql      # per-dish время разморозки в slicer_dish_defrost; удаление глобального defrost_duration_minutes из settings
+│       ├── 020_per_dish_defrost_duration.sql      # per-dish время разморозки в slicer_dish_defrost; удаление глобального defrost_duration_minutes из settings
+│       └── 021_unstop_master_policy.sql            # триггер архивации rgst3 определяет «наш DELETE» через линковку rgst3_row_suuid, а не inserter_text
 ├── BD_docs/                # Документация БД для программистов
 │   ├── README.md           # Обзор архитектуры, ER-схема
 │   ├── mappings.md         # TypeScript ↔ DB маппинг
@@ -248,6 +251,7 @@
    - **Канонизация в smartQueue**: `flattenOrders` использует `canonicalDishId = rawDish.recipe_source_id || rawDish.id`. Резолв на бэке `/api/orders` уже подменяет dish_id на primary, поэтому на реальных заказах это no-op. Сохранено как защита на случай, если когда-нибудь в `dishes` state попадёт алиасный id. `SlicerStation.tsx`, `useOrders.ts` — не знают об алиасах
    - Ограничение: `alias_dish_id` — PK → одно блюдо = один рецепт
    - Управление через UI в `RecipeEditor.tsx` (кнопка "Связать" на карточке блюда)
+   - **Синхронный стоп-лист по группе** (с миграции 021+): ручной toggle блюда в `POST /api/stoplist/toggle` через `resolveAliasGroup()` распространяется на ВСЮ группу (primary + все его алиасы). Если стопишь Д163 — 163 тоже встаёт на стоп (и наоборот). Такое же поведение для UNSTOP — снятие в любом из вариантов снимает всю группу. История пишется для каждого блюда группы отдельно (для алиасов GET `/api/stoplist/history` уже резолвит display name на primary, поэтому в UI они выглядят как одна запись, см. `aliasDisplayName` в маршруте). Каскадные стопы от ингредиента уже работали с алиасами через UNION в SQL — этот фикс касается только manual dish toggle.
 
 6. **Ручное назначение категорий блюдам (slicer_dish_categories)**
    - Чужая `ctlg15_dishes.ctlg15_ctlg38_uuid__goodcategory` не маппится на slicer-категории напрямую
