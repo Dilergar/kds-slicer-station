@@ -472,7 +472,7 @@ server/
 - `PUT /api/categories/reorder` — пакетная смена порядка
 - `GET/PUT /api/recipes/:dishId` — рецепты
 - `GET/PUT /api/settings` — настройки
-- `POST /api/stoplist/toggle` — стоп-лист
+- `POST /api/stoplist/toggle` — стоп-лист. Для блюд распространяется на всю alias-группу (`resolveAliasGroup` → primary + все его aliases). При снятии используется `pushDishUnstopAll` (политика «модуль — мастер»): удаляются все строки `rgst3_dishstoplist` для блюда в текущей смене, включая поставленные кассиром. Для каскадных стопов через ингредиент остаётся `pushDishUnstop` (только наша линкованная строка).
 - `GET /api/stoplist/history` — история стопов
 - `GET /api/history/orders` — история завершённых заказов
 - `GET /api/history/dashboard/speed-kpi` — KPI скорости (нарезчик)

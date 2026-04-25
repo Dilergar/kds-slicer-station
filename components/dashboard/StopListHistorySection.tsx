@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { StopHistoryEntry, IngredientBase, Dish, SystemSettings } from '../../types';
 import {
   calculateBusinessOverlap,
@@ -6,11 +6,14 @@ import {
   formatDuration,
   mergeIntervals,
   sumMergedMs,
+  getStorageRank,
+  getStorageRankLabel,
   DashboardHistoryEntry,
   DateGroup,
   HistoryGroup
 } from './dashboardUtils';
-import { ChevronRight, Package, Calendar, Search, X, User } from 'lucide-react';
+import type { HistoryReport } from '../../services/excelExport';
+import { ChevronRight, Package, Calendar, Search, X, User, UtensilsCrossed, Sprout, LayoutList } from 'lucide-react';
 
 /**
  * Подпись актора для одной entry: «Поставил: Иванов · Снял: Петров».
@@ -52,6 +55,14 @@ const ActorLine: React.FC<{ entry: DashboardHistoryEntry }> = ({ entry }) => {
 
 /** Режим группировки в «Истории Стоп-листов». */
 type GroupMode = 'by-item' | 'by-date';
+
+/**
+ * Фильтр по типу записи: показывать всё подряд / только блюда / только ингредиенты.
+ * Различение делается по префиксу `[DISH]` в `ingredientName`, который ставит
+ * backend (routes/stoplist.ts → resolveDishName) для dish-записей. Ингредиенты
+ * приходят без префикса.
+ */
+type TargetTypeFilter = 'all' | 'dish' | 'ingredient';
 
 const MicroTimeline: React.FC<{
   entries: DashboardHistoryEntry[];
@@ -185,14 +196,55 @@ const DateGroupRow: React.FC<{
  * здесь DateGroup верхнеуровневый, а не вложенный в HistoryGroup.
  * Внутри — плоский список entries этого дня с их именами.
  */
+
+/**
+ * Строка-разделитель между группами в Истории Стоп-листов: «Ингредиенты»,
+ * «Кухня», «Бар», «Прочие склады», «Без склада». Подсвечивается ярче
+ * обычных строк, чтобы было сразу видно где заканчивается одна секция и
+ * начинается другая. colSpan=4 покрывает все колонки таблицы.
+ *
+ * compact=true — короче по высоте, для использования внутри развёрнутого
+ * дня в by-date режиме (там разделители вторичны).
+ */
+const SectionHeaderRow: React.FC<{ rank: number; compact?: boolean }> = ({ rank, compact }) => {
+  const label = getStorageRankLabel(rank);
+  // Цветовая подсветка по рангу — тонкая, чтобы не перетягивала внимание
+  // с самих строк, но позволяла «глазом сразу найти границу».
+  const bgClass = (() => {
+    switch (rank) {
+      case 0: return 'bg-emerald-900/30 text-emerald-300';
+      case 1: return 'bg-orange-900/30 text-orange-300';
+      case 2: return 'bg-cyan-900/30 text-cyan-300';
+      case 3: return 'bg-slate-700/40 text-slate-300';
+      default: return 'bg-slate-800/50 text-slate-400';
+    }
+  })();
+  return (
+    <tr className={bgClass}>
+      <td
+        colSpan={4}
+        className={`${compact ? 'px-6 py-1.5' : 'px-6 py-2'} text-xs font-bold uppercase tracking-widest border-y border-slate-700/60`}
+      >
+        ── {label} ──
+      </td>
+    </tr>
+  );
+};
+
 const ByDateGroupRow: React.FC<{
   dateGroup: DateGroup;
 }> = ({ dateGroup }) => {
   const [isExpanded, setIsExpanded] = useState(false);
 
-  // Сортируем entries внутри дня: активные наверху, потом по времени начала убыв.
+  // Сортируем entries внутри дня:
+  //  1. Активные наверху.
+  //  2. По типу/складу (ингредиенты → Кухня → Бар → прочие).
+  //  3. По времени начала DESC.
   const sortedEntries = [...dateGroup.entries].sort((a, b) => {
     if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    const rankA = getStorageRank(a);
+    const rankB = getStorageRank(b);
+    if (rankA !== rankB) return rankA - rankB;
     return b.stoppedAt - a.stoppedAt;
   });
 
@@ -222,36 +274,52 @@ const ByDateGroupRow: React.FC<{
         </td>
       </tr>
 
-      {isExpanded && sortedEntries.map((entry, idx) => (
-        <tr
-          key={`${dateGroup.dateStr}-${entry.id || idx}`}
-          className="bg-slate-900/30 border-b border-gray-800/30 text-base hover:bg-slate-800/40"
-        >
-          <td className="px-6 py-3 pl-16 text-base">
-            <div className="flex items-center gap-2">
-              <span className="text-white font-medium">{entry.ingredientName}</span>
-              {entry.isActive && <span className="inline-block w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>}
-            </div>
-            <div className="text-xs text-gray-500 mt-0.5">{entry.reason || 'N/A'}</div>
-          </td>
-          <td className="px-6 py-3"></td>
-          <td className="px-6 py-3 font-mono text-sm">
-            <div className="flex items-center gap-3">
-              <span className="text-blue-300">{formatDate(entry.stoppedAt)}</span>
-              <span className="text-gray-600">→</span>
-              {entry.isActive ? (
-                <span className="text-orange-500 font-bold animate-pulse text-sm uppercase tracking-wider">Active</span>
-              ) : (
-                <span className="text-green-300">{formatDate(entry.resumedAt)}</span>
-              )}
-            </div>
-            <ActorLine entry={entry} />
-          </td>
-          <td className="px-6 py-3 text-right font-mono text-gray-300">
-            {formatDuration(entry.durationMs)}
-          </td>
-        </tr>
-      ))}
+      {isExpanded && (() => {
+        // Вставляем разделители между секциями ранга — внутри развёрнутого дня.
+        // compact=true делает строки короче, чтобы не «съедали» вертикальное
+        // пространство (внутри дня их может быть несколько).
+        const rows: React.ReactNode[] = [];
+        let lastRank: number | null = null;
+        for (let idx = 0; idx < sortedEntries.length; idx++) {
+          const entry = sortedEntries[idx];
+          const currentRank = getStorageRank(entry);
+          if (currentRank !== lastRank) {
+            rows.push(<SectionHeaderRow key={`${dateGroup.dateStr}-section-${currentRank}`} rank={currentRank} compact />);
+            lastRank = currentRank;
+          }
+          rows.push(
+            <tr
+              key={`${dateGroup.dateStr}-${entry.id || idx}`}
+              className="bg-slate-900/30 border-b border-gray-800/30 text-base hover:bg-slate-800/40"
+            >
+              <td className="px-6 py-3 pl-16 text-base">
+                <div className="flex items-center gap-2">
+                  <span className="text-white font-medium">{entry.ingredientName}</span>
+                  {entry.isActive && <span className="inline-block w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>}
+                </div>
+                <div className="text-xs text-gray-500 mt-0.5">{entry.reason || 'N/A'}</div>
+              </td>
+              <td className="px-6 py-3"></td>
+              <td className="px-6 py-3 font-mono text-sm">
+                <div className="flex items-center gap-3">
+                  <span className="text-blue-300">{formatDate(entry.stoppedAt)}</span>
+                  <span className="text-gray-600">→</span>
+                  {entry.isActive ? (
+                    <span className="text-orange-500 font-bold animate-pulse text-sm uppercase tracking-wider">Active</span>
+                  ) : (
+                    <span className="text-green-300">{formatDate(entry.resumedAt)}</span>
+                  )}
+                </div>
+                <ActorLine entry={entry} />
+              </td>
+              <td className="px-6 py-3 text-right font-mono text-gray-300">
+                {formatDuration(entry.durationMs)}
+              </td>
+            </tr>
+          );
+        }
+        return rows;
+      })()}
     </React.Fragment>
   );
 };
@@ -372,9 +440,15 @@ interface StopListHistorySectionProps {
   dishes: Dish[];
   appliedFilter: { start: string; end: string; timestamp: number };
   settings: SystemSettings;
+  /**
+   * Подписка для Excel-экспорта. Передаём `searchedHistory` (после period+type+search
+   * фильтров) + текущие настройки UI (groupMode, targetTypeFilter, searchQuery), чтобы
+   * лист повторил иерархию которую видит пользователь.
+   */
+  onDataReady?: (data: HistoryReport) => void;
 }
 
-export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ stopHistory, ingredients, dishes, appliedFilter, settings }) => {
+export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ stopHistory, ingredients, dishes, appliedFilter, settings, onDataReady }) => {
   // Режим группировки: 'by-item' — как раньше (имя блюда/ингредиента → даты),
   // 'by-date' — обратная иерархия (дата → имена). Переключается тублером.
   const [groupMode, setGroupMode] = useState<GroupMode>('by-item');
@@ -383,6 +457,10 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
   // группировки — в режиме «по датам» день останется в выдаче только если
   // в нём есть entries подходящие под запрос.
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Фильтр по типу: всё / только блюда (с префиксом [DISH]) / только ингредиенты.
+  // Применяется поверх filteredHistory вместе с поисковым запросом.
+  const [targetTypeFilter, setTargetTypeFilter] = useState<TargetTypeFilter>('all');
 
   const filteredHistory = useMemo(() => {
     if (!appliedFilter) return [];
@@ -442,15 +520,44 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
     return [...completed, ...activeIngredients, ...activeDishes].sort((a, b) => b.stoppedAt - a.stoppedAt);
   }, [stopHistory, ingredients, dishes, appliedFilter]);
 
-  // Поисковый фильтр поверх filteredHistory. Сделано отдельным useMemo
+  // Фильтр по типу + поиску поверх filteredHistory. Сделано одним useMemo
   // чтобы агрегация по группам (которая выполняется в render) всегда шла
   // по уже отфильтрованному набору — тогда и счётчики «N раз», и таймлайн
   // отражают именно то что видит пользователь.
   const searchedHistory = useMemo(() => {
+    let result = filteredHistory;
+
+    // Фильтр по типу записи. Префикс «[DISH] » ставится backend'ом для
+    // dish-записей в slicer_stop_history, активные dish-стопы добавляются
+    // на фронте с тем же префиксом (см. activeDishes выше).
+    if (targetTypeFilter !== 'all') {
+      result = result.filter(e => {
+        const isDish = e.ingredientName.startsWith('[DISH]');
+        return targetTypeFilter === 'dish' ? isDish : !isDish;
+      });
+    }
+
     const query = searchQuery.trim().toLowerCase();
-    if (!query) return filteredHistory;
-    return filteredHistory.filter(e => e.ingredientName.toLowerCase().includes(query));
-  }, [filteredHistory, searchQuery]);
+    if (query) {
+      result = result.filter(e => e.ingredientName.toLowerCase().includes(query));
+    }
+
+    return result;
+  }, [filteredHistory, searchQuery, targetTypeFilter]);
+
+  // Подписка для Excel-экспорта — передаём то, что видит пользователь:
+  // searchedHistory + текущие UI-настройки фильтра/группировки.
+  useEffect(() => {
+    if (!onDataReady) return;
+    onDataReady({
+      entries: searchedHistory,
+      groupMode,
+      targetTypeFilter,
+      searchQuery,
+      rangeStart: appliedFilter.start ? new Date(appliedFilter.start).getTime() : 0,
+      rangeEnd: appliedFilter.end ? new Date(appliedFilter.end).getTime() : Date.now(),
+    });
+  }, [searchedHistory, groupMode, targetTypeFilter, searchQuery, appliedFilter, onDataReady]);
 
   return (
     <div className="w-full">
@@ -477,6 +584,46 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
                 <X size={12} />
               </button>
             )}
+          </div>
+          {/* Фильтр по типу записи: всё / только блюда / только ингредиенты.
+              Стилистика — как у тумблера группировки ниже (button group). */}
+          <div className="flex rounded-lg overflow-hidden border border-slate-700 bg-slate-900">
+            <button
+              type="button"
+              onClick={() => setTargetTypeFilter('all')}
+              title="Показать все записи"
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                targetTypeFilter === 'all'
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-slate-900 text-gray-400 hover:text-white'
+              }`}
+            >
+              <LayoutList size={14} /> Всё
+            </button>
+            <button
+              type="button"
+              onClick={() => setTargetTypeFilter('dish')}
+              title="Показать только стопы блюд"
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                targetTypeFilter === 'dish'
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-slate-900 text-gray-400 hover:text-white'
+              }`}
+            >
+              <UtensilsCrossed size={14} /> Блюда
+            </button>
+            <button
+              type="button"
+              onClick={() => setTargetTypeFilter('ingredient')}
+              title="Показать только стопы ингредиентов"
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                targetTypeFilter === 'ingredient'
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-slate-900 text-gray-400 hover:text-white'
+              }`}
+            >
+              <Sprout size={14} /> Ингредиенты
+            </button>
           </div>
           {/* Тублер режима группировки. Две кнопки: по продуктам / по датам.
               Активная подсвечивается синим, неактивная — серая. Иконки
@@ -589,23 +736,56 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
                     }
                   }
 
+                  // Сортировка групп:
+                  //  1. Активные (стопится прямо сейчас) — наверх.
+                  //  2. По типу/складу: ингредиенты → Кухня → Бар → прочие → без склада.
+                  //     Все entries одной группы имеют одинаковое имя и, значит,
+                  //     одинаковый набор storages — берём ранг с первого entry.
+                  //  3. Внутри одинакового ранга — по длительности downtime DESC.
                   const sortedGroups = (Object.values(groupedHistory) as HistoryGroup[]).sort((a, b) => {
                     if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+                    const rankA = getStorageRank(a.entries[0]);
+                    const rankB = getStorageRank(b.entries[0]);
+                    if (rankA !== rankB) return rankA - rankB;
                     return b.totalDuration - a.totalDuration;
                   });
 
                   const timelineStart = appliedFilter.start ? new Date(appliedFilter.start).getTime() : (searchedHistory.length > 0 ? searchedHistory[searchedHistory.length - 1].stoppedAt : Date.now() - 86400000);
                   const timelineEnd = appliedFilter.end ? new Date(appliedFilter.end).getTime() : Date.now();
 
-                  return sortedGroups.map((group) => (
-                    <HistoryGroupRow
-                      key={group.name}
-                      group={group}
-                      rangeStart={timelineStart}
-                      rangeEnd={timelineEnd}
-                      settings={settings}
-                    />
-                  ));
+                  // Вставляем строку-разделитель ПЕРЕД первой группой каждого
+                  // ранга. Активные стопы выводим отдельной секцией сверху —
+                  // так пользователь не теряет красные «горящие» строки в
+                  // середине списка после ранг-сортировки.
+                  const elements: React.ReactNode[] = [];
+                  let lastRank: number | 'active' | null = null;
+                  for (const group of sortedGroups) {
+                    const currentRank: number | 'active' = group.isActive ? 'active' : getStorageRank(group.entries[0]);
+                    if (currentRank !== lastRank) {
+                      if (currentRank === 'active') {
+                        elements.push(
+                          <tr key="section-active" className="bg-red-900/30 text-red-300">
+                            <td colSpan={4} className="px-6 py-2 text-xs font-bold uppercase tracking-widest border-y border-red-700/40">
+                              ── Активные сейчас ──
+                            </td>
+                          </tr>
+                        );
+                      } else {
+                        elements.push(<SectionHeaderRow key={`section-${currentRank}`} rank={currentRank} />);
+                      }
+                      lastRank = currentRank;
+                    }
+                    elements.push(
+                      <HistoryGroupRow
+                        key={group.name}
+                        group={group}
+                        rangeStart={timelineStart}
+                        rangeEnd={timelineEnd}
+                        settings={settings}
+                      />
+                    );
+                  }
+                  return elements;
                 }
 
                 // === Режим «по датам»: дата → entries с именами ===

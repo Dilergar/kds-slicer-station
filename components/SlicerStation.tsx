@@ -284,8 +284,13 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
         for (const sourceId of group.sourceOrderIds) {
           const count = itemCountByOrder.get(sourceId) || 0;
           const sourceOrder = activeOrders.find(o => o.id === sourceId);
+          // Order не имеет поля `tableNumber` — все столы лежат в `table_stack`
+          // (массив массивов: один блок на каждый стек после merge). Раньше тут
+          // был фолбэк на `sourceOrder.tableNumber || 0`, который всегда
+          // резолвился в [0] и давал phantom-блок «стол 0» в Smart Wave defrost
+          // mini-cards. Убираем фолбэк, оставляем только реальные столы.
           const sourceTables = sourceOrder
-            ? (sourceOrder.table_stack?.flat() || [sourceOrder.tableNumber || 0]).filter(Boolean)
+            ? (sourceOrder.table_stack?.flat() || []).filter(Boolean)
             : [];
           const tablesForBlock = sourceTables.length > 0 ? sourceTables : [0];
 

@@ -6,13 +6,50 @@
  * Показываются только блюда которые хоть раз заказывались через кухонный склад.
  * Это гарантирует что в "Рецепты" попадают только кухонные блюда (не бар, не хозка).
  */
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { pool } from '../config/db';
 
 const router = Router();
+
+/**
+ * UUID v4-формат (canonical lowercase/uppercase, с дефисами). Используется как
+ * валидатор параметра :dishId перед multer/fs операциями, чтобы предотвратить
+ * path traversal через значения вроде `..`, `con`, `.htaccess`, NUL-bytes и т.п.
+ *
+ * Только этот формат принимается как dish_id в эндпоинтах работы с файлами —
+ * в реальности dish_id в нашей БД это UUID из ctlg15_dishes.suuid.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Middleware: блокирует запрос если :dishId не валидный UUID. Должен идти ПЕРЕД
+ * `upload.single('image')`, чтобы multer не успел записать файл с опасным именем
+ * на диск.
+ */
+function validateDishUuid(req: Request, res: Response, next: NextFunction): void {
+  const dishId = req.params.dishId;
+  if (typeof dishId !== 'string' || !UUID_RE.test(dishId)) {
+    res.status(400).json({ error: 'Некорректный dishId (ожидается UUID)' });
+    return;
+  }
+  next();
+}
+
+/**
+ * Гарантирует что resolved-путь file находится строго внутри baseDir. Защита
+ * от path traversal через символы `..` или абсолютные пути в image_path,
+ * прочитанном из БД (на случай если строка туда попала помимо upload-роута).
+ *
+ * Возвращает true если путь безопасен и можно использовать с fs.unlink/readFile.
+ */
+function isPathInside(filePath: string, baseDir: string): boolean {
+  const resolvedFile = path.resolve(filePath);
+  const resolvedBase = path.resolve(baseDir);
+  return resolvedFile === resolvedBase || resolvedFile.startsWith(resolvedBase + path.sep);
+}
 
 /**
  * Папка для загруженных фото блюд. Создаётся при старте модуля если её нет.
@@ -488,7 +525,7 @@ router.delete('/:dishId/slicer-data', async (req: Request, res: Response) => {
  * multer-ошибки (слишком большой файл, неправильный mimetype) возвращаются
  * как 400 клиенту — их ловит глобальный errorHandler.
  */
-router.post('/:dishId/image', upload.single('image'), async (req: Request, res: Response) => {
+router.post('/:dishId/image', validateDishUuid, upload.single('image'), async (req: Request, res: Response) => {
   try {
     const { dishId } = req.params;
     if (!req.file) {
@@ -506,7 +543,9 @@ router.post('/:dishId/image', upload.single('image'), async (req: Request, res: 
     );
     if (prev.rows.length && prev.rows[0].image_path !== relativePath) {
       const oldFile = path.resolve(__dirname, '../../public' + prev.rows[0].image_path);
-      if (fs.existsSync(oldFile)) {
+      // Defence-in-depth: даже если в БД попал traversal-путь, не unlink-аем
+      // ничего вне UPLOAD_DIR (только наша папка с фото блюд).
+      if (isPathInside(oldFile, UPLOAD_DIR) && fs.existsSync(oldFile)) {
         try { fs.unlinkSync(oldFile); }
         catch (e) { console.warn('[Dishes] Не удалось удалить старый файл:', oldFile, e); }
       }
@@ -535,7 +574,7 @@ router.post('/:dishId/image', upload.single('image'), async (req: Request, res: 
  * Убирает запись из slicer_dish_images и удаляет файл с диска.
  * Идемпотентный: если фото нет — вернёт 200 с deleted:false.
  */
-router.delete('/:dishId/image', async (req: Request, res: Response) => {
+router.delete('/:dishId/image', validateDishUuid, async (req: Request, res: Response) => {
   try {
     const { dishId } = req.params;
     const row = await pool.query(
@@ -547,7 +586,8 @@ router.delete('/:dishId/image', async (req: Request, res: Response) => {
       return;
     }
     const filePath = path.resolve(__dirname, '../../public' + row.rows[0].image_path);
-    if (fs.existsSync(filePath)) {
+    // Defence-in-depth: unlink только если путь внутри UPLOAD_DIR.
+    if (isPathInside(filePath, UPLOAD_DIR) && fs.existsSync(filePath)) {
       try { fs.unlinkSync(filePath); }
       catch (e) { console.warn('[Dishes] Не удалось удалить файл:', filePath, e); }
     }

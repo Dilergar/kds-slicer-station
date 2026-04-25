@@ -266,7 +266,23 @@ export const useOrders = ({
         };
         return updated;
       }
-      return [...prev, { ...restoredOrder, status: 'ACTIVE' as const, quantity_stack: newQuantityStack, table_stack: newTableStack }];
+      // Восстановленный заказ не должен «нести» защёлкнутую парковку или
+      // незавершённую разморозку из старого snapshot'а. Очищаем поля, которые
+      // backend выставил бы заново при следующем polling — но в окно между
+      // оптимистикой и polling они могут попасть в KPI/таймеры и дать ерунду.
+      const sanitized: Order = {
+        ...restoredOrder,
+        status: 'ACTIVE' as const,
+        quantity_stack: newQuantityStack,
+        table_stack: newTableStack,
+        accumulated_time_ms: 0,
+        parked_at: undefined,
+        unpark_at: undefined,
+        parked_by_auto: undefined,
+        defrost_started_at: undefined,
+        defrost_duration_seconds: undefined,
+      };
+      return [...prev, sanitized];
     });
     setOrderHistory(prev => prev.filter(h => h.id !== historyId));
 

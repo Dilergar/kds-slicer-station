@@ -156,11 +156,20 @@ router.get('/', async (_req: Request, res: Response) => {
           AND (items.docm2tabl1_cooked IS NULL OR items.docm2tabl1_cooked = false)
           AND items.docm2tabl1_ctlg17_uuid__storage IN (${KITCHEN_STORAGE_UUIDS.map((_, i) => `$${i + 4}`).join(', ')})
           AND state.order_item_id IS NULL
-          AND EXISTS (
-            SELECT 1 FROM slicer_dish_categories dc
-            WHERE dc.dish_id = COALESCE(alias.primary_dish_id, items.docm2tabl1_ctlg15_uuid__dish::text)
-              AND dc.category_id = $2
-          )
+          -- Auto-park срабатывает только если dessert_category — ОСНОВНАЯ
+          -- категория блюда (с минимальным sort_index среди назначенных).
+          -- Раньше проверяли просто EXISTS — это давало ложные срабатывания
+          -- на блюдах, которым случайно назначили дессертную категорию вторичной
+          -- (Закуска + Десерт). Теперь блюдо паркуется только если оно primarily
+          -- десерт. Тайбрейкер по cat.id для детерминизма.
+          AND (
+            SELECT dc.category_id
+              FROM slicer_dish_categories dc
+              JOIN slicer_categories cat ON cat.id = dc.category_id
+             WHERE dc.dish_id = COALESCE(alias.primary_dish_id, items.docm2tabl1_ctlg15_uuid__dish::text)
+             ORDER BY cat.sort_index ASC, cat.id ASC
+             LIMIT 1
+          ) = $2
           -- Симметрично GET /api/orders ниже: не паркуем призраков с qty<=0.
           AND items.docm2tabl1_quantity > 0
         ON CONFLICT (order_item_id) DO NOTHING

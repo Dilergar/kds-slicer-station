@@ -364,21 +364,24 @@ router.post('/toggle', async (req: Request, res: Response) => {
         // алиасов — группа из одного элемента, поведение как раньше.
         const aliasGroup = await resolveAliasGroup(client, targetId);
 
-        // Состояние КЛИКНУТОГО блюда (targetId) определяет намерение: stop vs unstop.
-        // UNION двух источников чтобы корректно обработать стопы из основной KDS:
-        //  1. slicer_dish_stoplist — наш модуль
-        //  2. rgst3_dishstoplist в открытой смене — основная KDS
+        // Состояние alias-ГРУППЫ определяет намерение: stop vs unstop.
+        // Раньше смотрели только targetId — это давало баг: если primary застопано,
+        // а кликнули alias (который в state ещё не отражён), решали STOP вместо UNSTOP,
+        // и цикл создавал orphan-rgst3 строки для alias.
+        // Теперь: «группа застопована» = ХОТЯ БЫ ОДИН dish из группы есть в slicer
+        // или в открытом rgst3. UNION двух источников чтобы учесть и наш модуль,
+        // и основную KDS.
         const sliceRes = await client.query(
-          `SELECT 1 FROM slicer_dish_stoplist WHERE dish_id = $1 LIMIT 1`,
-          [targetId]
+          `SELECT 1 FROM slicer_dish_stoplist WHERE dish_id = ANY($1::text[]) LIMIT 1`,
+          [aliasGroup]
         );
         const rgstRes = await client.query(
           `SELECT 1 FROM rgst3_dishstoplist r
              JOIN ctlg14_shifts s ON s.suuid = r.rgst3_ctlg14_uuid__shift
-             WHERE r.rgst3_ctlg15_uuid__dish::text = $1
+             WHERE r.rgst3_ctlg15_uuid__dish::text = ANY($1::text[])
                AND s.ctlg14_closed = false
              LIMIT 1`,
-          [targetId]
+          [aliasGroup]
         );
         const isCurrentlyStopped = sliceRes.rows.length > 0 || rgstRes.rows.length > 0;
         const isStopping = !isCurrentlyStopped;
@@ -598,6 +601,38 @@ router.get('/history', async (req: Request, res: Response) => {
     }
     const rgstResult = await pool.query(rgstQuery, rgstParams);
 
+    // === Резолв складов для dish-записей ===
+    // Каждое блюдо может фигурировать на нескольких складах (Кухня/Бар/Склад)
+    // через ctlg18_menuitems. Собираем уникальные target_id всех dish-записей
+    // и одним запросом достаём все привязки. На фронте это даст возможность
+    // фильтровать историю по складу. Ингредиентам storages не нужен (они
+    // живут в slicer_ingredients и не привязаны к складам в чужой схеме).
+    const dishTargetIds = new Set<string>();
+    for (const row of sliceResult.rows) {
+      if (row.target_type === 'dish' && row.target_id) dishTargetIds.add(row.target_id);
+    }
+    for (const row of rgstResult.rows) {
+      if (row.target_id) dishTargetIds.add(row.target_id);
+    }
+    const storageMap = new Map<string, { id: string; name: string }[]>();
+    if (dishTargetIds.size > 0) {
+      const storagesRes = await pool.query(
+        `SELECT DISTINCT
+           mi.ctlg18_ctlg15_uuid__dish::text AS dish_id,
+           stor.suuid::text AS storage_id,
+           stor.name AS storage_name
+         FROM ctlg18_menuitems mi
+         JOIN ctlg17_storages stor ON stor.suuid = mi.ctlg18_ctlg17_uuid__storage
+         WHERE mi.ctlg18_ctlg15_uuid__dish::text = ANY($1::text[])`,
+        [Array.from(dishTargetIds)]
+      );
+      for (const r of storagesRes.rows) {
+        const arr = storageMap.get(r.dish_id) ?? [];
+        arr.push({ id: r.storage_id, name: r.storage_name });
+        storageMap.set(r.dish_id, arr);
+      }
+    }
+
     // === Маппинг к формату StopHistoryEntry ===
     // resumed_at fallback → stopped_at (durationMs=0), чтобы не врать при
     // NULL. На практике для slicer_stop_history всегда заполняется в INSERT.
@@ -624,6 +659,7 @@ router.get('/history', async (req: Request, res: Response) => {
         resumedByUuid: row.resumed_by_uuid || null,
         resumedByName: row.resumed_by_name || null,
         actorSource: row.actor_source || null,
+        storages: row.target_type === 'dish' ? (storageMap.get(row.target_id) || []) : [],
       };
     });
 
@@ -644,6 +680,7 @@ router.get('/history', async (req: Request, res: Response) => {
         resumedByUuid: null,
         resumedByName: null,
         actorSource: 'kds',
+        storages: storageMap.get(row.target_id) || [],
       };
     });
 

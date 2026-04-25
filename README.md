@@ -39,11 +39,11 @@ kds-slicer-station/
 │   ├── src/config/db.ts       # pg.Pool подключение к arclient
 │   ├── .env.example           # Шаблон конфига backend
 │   ├── src/services/          # Адаптеры (kdsStoplistSync — двусторонний стоп-лист)
-│   └── migrations/            # SQL миграции (6 файлов: 001–006)
+│   └── migrations/            # SQL миграции (21 файл: 001–021)
 ├── BD_docs/                   # Документация БД для программистов
 │   ├── README.md              # Обзор архитектуры, ER-схема
-│   ├── tables/                # Описание каждой slicer_ таблицы (12 файлов)
-│   ├── migrations/            # Описание миграций (6 файлов)
+│   ├── tables/                # Описание каждой slicer_ таблицы (15 файлов)
+│   ├── migrations/            # Описание миграций (21 файл)
 │   ├── mappings.md            # TypeScript ↔ DB маппинг
 │   └── existing_tables.md     # Таблицы основной KDS
 └── Инструкция.md              # Гайд по развёртыванию для IT-команды заказчика
@@ -54,11 +54,10 @@ kds-slicer-station/
 ## База данных
 
 ### Подключение
-- **Host:** localhost
+- **Host:** localhost (по умолчанию, см. `server/.env`)
 - **Port:** 5432
 - **Database:** arclient
-- **User:** postgres
-- **Password:** 1234
+- **User/Password:** задаются в `server/.env` (см. `server/.env.example`)
 
 ### Существующие таблицы KDS (чтение):
 - `docm2_orders` — заказы
@@ -66,7 +65,7 @@ kds-slicer-station/
 - `ctlg15_dishes` — блюда
 - `ctlg13_halltables` — столы
 
-### Таблицы модуля нарезчика (prefix `slicer_`, всего 12):
+### Таблицы модуля нарезчика (prefix `slicer_`, всего 15):
 | Таблица | Назначение |
 |---|---|
 | `slicer_categories` | Категории с порядком сортировки |
@@ -75,8 +74,11 @@ kds-slicer-station/
 | `slicer_recipes` | Рецепты: блюдо → ингредиент + граммовка |
 | `slicer_dish_aliases` | Алиасы блюд: общий рецепт для вариантов (163/Д163) |
 | `slicer_dish_stoplist` | Актуальный стоп-лист блюд (MANUAL + CASCADE) |
+| `slicer_dish_images` | Фото блюд: путь до файла в `server/public/images/dishes/` |
+| `slicer_dish_priority` | Приоритет блюда (1=NORMAL, 3=ULTRA), per-dish |
+| `slicer_dish_defrost` | Per-dish флаг «требует разморозки?» + время таймера |
 | `slicer_kds_sync_config` | Конфиг двусторонней синхронизации с rgst3_dishstoplist (OFF по умолчанию) |
-| `slicer_order_state` | Состояние заказов нарезчика (парковка, статус) |
+| `slicer_order_state` | Состояние заказов нарезчика (парковка, статус, finished_at, defrost) |
 | `slicer_order_history` | Завершённые заказы (KPI) |
 | `slicer_ingredient_consumption` | Расход ингредиентов |
 | `slicer_stop_history` | История стоп-листа |

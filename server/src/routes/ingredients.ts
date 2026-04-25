@@ -9,13 +9,36 @@
  * POST /:id/image и DELETE /:id/image — по аналогии с slicer_dish_images
  * (см. routes/dishes.ts).
  */
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { pool } from '../config/db';
 
 const router = Router();
+
+/** UUID v4-формат — `slicer_ingredients.id` всегда UUID. См. dishes.ts для пояснения. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Middleware: блокирует запрос если :id не UUID. Должен идти ПЕРЕД multer-ом
+ * чтобы предотвратить запись опасного имени файла на диск.
+ */
+function validateIngredientUuid(req: Request, res: Response, next: NextFunction): void {
+  const id = req.params.id;
+  if (typeof id !== 'string' || !UUID_RE.test(id)) {
+    res.status(400).json({ error: 'Некорректный id ингредиента (ожидается UUID)' });
+    return;
+  }
+  next();
+}
+
+/** Гарантирует что путь file находится внутри baseDir. См. dishes.ts. */
+function isPathInside(filePath: string, baseDir: string): boolean {
+  const resolvedFile = path.resolve(filePath);
+  const resolvedBase = path.resolve(baseDir);
+  return resolvedFile === resolvedBase || resolvedFile.startsWith(resolvedBase + path.sep);
+}
 
 /**
  * Папка для загруженных фото ингредиентов.
@@ -220,7 +243,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
  * server/public/images/ingredients/<id>.<ext>, путь пишется в image_url.
  * Если было старое фото с другим расширением — удаляется с диска.
  */
-router.post('/:id/image', uploadIngredientImage.single('image'), async (req: Request, res: Response) => {
+router.post('/:id/image', validateIngredientUuid, uploadIngredientImage.single('image'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     if (!req.file) {
@@ -234,7 +257,9 @@ router.post('/:id/image', uploadIngredientImage.single('image'), async (req: Req
     const prev = await pool.query('SELECT image_url FROM slicer_ingredients WHERE id = $1', [id]);
     if (prev.rows.length && prev.rows[0].image_url && prev.rows[0].image_url !== relativePath) {
       const oldFile = path.resolve(__dirname, '../../public' + prev.rows[0].image_url);
-      if (fs.existsSync(oldFile)) {
+      // Defence-in-depth: даже если БД-значение испорчено traversal-сегментами,
+      // не unlink-аем ничего вне UPLOAD_DIR_ING.
+      if (isPathInside(oldFile, UPLOAD_DIR_ING) && fs.existsSync(oldFile)) {
         try { fs.unlinkSync(oldFile); }
         catch (e) { console.warn('[Ingredients] Не удалось удалить старый файл:', oldFile, e); }
       }
@@ -270,13 +295,14 @@ router.post('/:id/image', uploadIngredientImage.single('image'), async (req: Req
  * DELETE /api/ingredients/:id/image — Удалить фото ингредиента.
  * Очищает image_url в БД и удаляет файл с диска. Идемпотентный.
  */
-router.delete('/:id/image', async (req: Request, res: Response) => {
+router.delete('/:id/image', validateIngredientUuid, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const row = await pool.query('SELECT image_url FROM slicer_ingredients WHERE id = $1', [id]);
     if (row.rows.length && row.rows[0].image_url) {
       const filePath = path.resolve(__dirname, '../../public' + row.rows[0].image_url);
-      if (fs.existsSync(filePath)) {
+      // Defence-in-depth: unlink только если внутри UPLOAD_DIR_ING.
+      if (isPathInside(filePath, UPLOAD_DIR_ING) && fs.existsSync(filePath)) {
         try { fs.unlinkSync(filePath); }
         catch (e) { console.warn('[Ingredients] Не удалось удалить файл:', filePath, e); }
       }

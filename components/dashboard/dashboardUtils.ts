@@ -24,6 +24,55 @@ export type SortField = 'name' | 'cycles' | 'time';
 export type SortDirection = 'asc' | 'desc';
 
 /**
+ * Ранг записи истории стопов для упорядочивания по типу/складу:
+ *   0 — ингредиент (наш модуль КДС, нет привязки к чужим складам)
+ *   1 — блюдо со склада «Кухня»
+ *   2 — блюдо со склада «Бар»
+ *   3 — блюдо с любого другого склада
+ *   4 — блюдо без склада (старое/удалённое из меню)
+ *
+ * Опознаём склад по имени (case-insensitive substring) — UUID складов меняются
+ * между ресторанами, а имена «Кухня» / «Бар» в R-Keeper стандартизированы.
+ * Если у блюда несколько складов — берём минимальный ранг (Кухня важнее Бара).
+ *
+ * Используется одинаково в UI (StopListHistorySection) и в Excel-экспорте,
+ * чтобы порядок там и там совпадал.
+ */
+export function getStorageRank(entry: { ingredientName: string; storages?: { id: string; name: string }[] }): number {
+  // Ингредиент — всегда первым
+  if (!entry.ingredientName.startsWith('[DISH]')) return 0;
+  // Блюдо без storages-данных — в конец
+  if (!entry.storages || entry.storages.length === 0) return 4;
+  // Минимальный ранг среди прикреплённых складов
+  let minRank = 4;
+  for (const s of entry.storages) {
+    const n = s.name.toLowerCase();
+    let r: number;
+    if (n.includes('кухн')) r = 1;
+    else if (n.includes('бар')) r = 2;
+    else r = 3;
+    if (r < minRank) minRank = r;
+  }
+  return minRank;
+}
+
+/**
+ * Лейбл секции для разделителей в UI и Excel. Соответствует рангам из
+ * getStorageRank. Используется как заголовок группы между ингредиентами,
+ * кухонными блюдами, барными и прочими в Истории стоп-листов.
+ */
+export function getStorageRankLabel(rank: number): string {
+  switch (rank) {
+    case 0: return 'Ингредиенты';
+    case 1: return 'Кухня';
+    case 2: return 'Бар';
+    case 3: return 'Прочие склады';
+    case 4: return 'Без склада';
+    default: return '—';
+  }
+}
+
+/**
  * Сколько миллисекунд из [periodStart; periodEnd] попадает в бизнес-часы
  * ресторана (openTime→closeTime каждый день, пропуская excludedDates).
  * Поддерживает overnight-смены (например, 22:00→06:00).

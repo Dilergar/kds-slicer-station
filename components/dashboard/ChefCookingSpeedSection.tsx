@@ -11,11 +11,12 @@
  * чтобы поиск и сортировка работали без запросов на сервер.
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { ChefCookingEntry, Dish, Category } from '../../types';
 import { formatDuration, SortField, SortDirection } from './dashboardUtils';
 import { MiniTimelineChart, MiniTimelineEntry } from './MiniTimelineChart';
 import { ChefHat, Search, X, ArrowUp, ArrowDown, ArrowUpDown, ChevronRight, ChevronDown } from 'lucide-react';
+import type { AggregatedChefReport } from '../../services/excelExport';
 
 interface ChefCookingSpeedSectionProps {
   /**
@@ -27,6 +28,8 @@ interface ChefCookingSpeedSectionProps {
   appliedFilter: { start: string; end: string; timestamp: number };
   dishes: Dish[];
   categories: Category[];
+  /** Подписка на агрегаты для Excel-экспорта (см. SpeedKpiSection). */
+  onDataReady?: (data: AggregatedChefReport) => void;
 }
 
 export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = ({
@@ -34,11 +37,15 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
   appliedFilter,
   dishes,
   categories,
+  onDataReady,
 }) => {
   // Локальный поиск по имени блюда — не дергает сервер
   const [searchQuery, setSearchQuery] = useState('');
   // Какие категории развернуты — чтобы не всё сразу было открыто
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
+  // Развёрнутые блюда → drilldown по каждой завершённой партии
+  // (один ChefCookingEntry = один замер cookTime).
+  const [expandedDishes, setExpandedDishes] = useState<Set<string>>(new Set());
   // Сортировка: по имени / кол-ву / среднему времени
   const [sortConfig, setSortConfig] = useState<{ field: SortField; direction: SortDirection }>({
     field: 'name',
@@ -61,6 +68,27 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
       else next.add(catId);
       return next;
     });
+  };
+
+  /** Развернуть/свернуть блюдо */
+  const toggleDish = (dishId: string) => {
+    setExpandedDishes(prev => {
+      const next = new Set(prev);
+      if (next.has(dishId)) next.delete(dishId);
+      else next.add(dishId);
+      return next;
+    });
+  };
+
+  /**
+   * Форматирует timestamp в компактный формат «DD.MM HH:mm» — для drilldown
+   * по порциям. Используется в колонке «Название Блюда» при раскрытии блюда.
+   */
+  const formatPortionTime = (ts: number): string => {
+    const d = new Date(ts);
+    const datePart = d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+    const timePart = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    return `${datePart} ${timePart}`;
   };
 
   /**
@@ -100,23 +128,29 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
       categoryId: string;
       totalCycles: number;
       totalCookTimeMs: number;
+      // Сырые порции — нужны для drilldown в UI: пользователь раскрывает
+      // блюдо и видит каждую партию (когда finishedAt + сколько готовил повар).
+      portions: ChefCookingEntry[];
     }>();
 
     filteredEntries.forEach(entry => {
       const dishDef = dishes.find(d => d.id === entry.dishId);
       const categoryId = dishDef ? (dishDef.category_ids?.[0] || 'unknown') : 'unknown';
 
-      const current = dishMap.get(entry.dishId) || {
-        dishName: entry.dishName,
-        categoryId: categoryId,
-        totalCycles: 0,
-        totalCookTimeMs: 0,
-      };
-      dishMap.set(entry.dishId, {
-        ...current,
-        totalCycles: current.totalCycles + entry.quantity,
-        totalCookTimeMs: current.totalCookTimeMs + entry.cookTimeMs,
-      });
+      let cur = dishMap.get(entry.dishId);
+      if (!cur) {
+        cur = {
+          dishName: entry.dishName,
+          categoryId,
+          totalCycles: 0,
+          totalCookTimeMs: 0,
+          portions: [],
+        };
+        dishMap.set(entry.dishId, cur);
+      }
+      cur.totalCycles += entry.quantity;
+      cur.totalCookTimeMs += entry.cookTimeMs;
+      cur.portions.push(entry);
     });
 
     // Шаг 2: группировка по категории + локальный поиск
@@ -124,7 +158,13 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
       categoryName: string;
       totalCycles: number;
       totalCookTimeMs: number;
-      dishes: Array<{ id: string; dishName: string; totalCycles: number; avgTimeMs: number }>;
+      dishes: Array<{
+        id: string;
+        dishName: string;
+        totalCycles: number;
+        avgTimeMs: number;
+        portions: ChefCookingEntry[];
+      }>;
     }>();
 
     dishMap.forEach((stats, dishId) => {
@@ -148,11 +188,14 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
       const catStats = categoryMap.get(catId)!;
       catStats.totalCycles += stats.totalCycles;
       catStats.totalCookTimeMs += stats.totalCookTimeMs;
+      // Свежие порции сверху для удобного просмотра в drilldown.
+      const sortedPortions = [...stats.portions].sort((a, b) => b.finishedAt - a.finishedAt);
       catStats.dishes.push({
         id: dishId,
         dishName: stats.dishName,
         totalCycles: stats.totalCycles,
         avgTimeMs: stats.totalCycles > 0 ? Math.round(stats.totalCookTimeMs / stats.totalCycles) : 0,
+        portions: sortedPortions,
       });
     });
 
@@ -184,6 +227,11 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
         return sortConfig.direction === 'asc' ? comparison : -comparison;
       });
   }, [entries, appliedFilter, dishes, categories, searchQuery, sortConfig]);
+
+  // Подписка для Excel-экспорта — агрегаты с portions[] на каждом блюде.
+  useEffect(() => {
+    onDataReady?.(cookingStats as AggregatedChefReport);
+  }, [cookingStats, onDataReady]);
 
   return (
     <>
@@ -289,16 +337,43 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
                             {formatDuration(category.avgTimeMs)}
                           </td>
                         </tr>
-                        {isExpanded && category.dishes.map(item => (
-                          <tr key={item.id} className="hover:bg-slate-800/30 transition-colors bg-slate-900/30">
-                            <td className="p-3 pl-8 text-white relative flex items-center">
-                              <div className="w-1.5 h-1.5 rounded-full bg-slate-600 mr-3"></div>
-                              {item.dishName}
-                            </td>
-                            <td className="p-3 text-center font-mono text-slate-300 opacity-80">{item.totalCycles}</td>
-                            <td className="p-3 text-right font-mono text-purple-400/80">{formatDuration(item.avgTimeMs)}</td>
-                          </tr>
-                        ))}
+                        {isExpanded && category.dishes.map(item => {
+                          const isDishExpanded = expandedDishes.has(item.id);
+                          return (
+                            <React.Fragment key={item.id}>
+                              <tr
+                                className="hover:bg-slate-800/30 transition-colors bg-slate-900/30 cursor-pointer"
+                                onClick={() => toggleDish(item.id)}
+                              >
+                                <td className="p-3 pl-8 text-white relative flex items-center gap-2">
+                                  {isDishExpanded ? <ChevronDown size={12} className="text-slate-400" /> : <ChevronRight size={12} className="text-slate-400" />}
+                                  <div className="w-1.5 h-1.5 rounded-full bg-slate-600"></div>
+                                  {item.dishName}
+                                </td>
+                                <td className="p-3 text-center font-mono text-slate-300 opacity-80">{item.totalCycles}</td>
+                                <td className="p-3 text-right font-mono text-purple-400/80">{formatDuration(item.avgTimeMs)}</td>
+                              </tr>
+                              {isDishExpanded && item.portions.map(p => {
+                                const perPortionMs = p.quantity > 0 ? Math.round(p.cookTimeMs / p.quantity) : p.cookTimeMs;
+                                return (
+                                  <tr key={p.orderItemId} className="bg-slate-950/40 hover:bg-slate-900/50 transition-colors text-xs">
+                                    <td className="p-2 pl-16 text-slate-400 font-mono flex items-center gap-2">
+                                      <span className="text-slate-600">└</span>
+                                      {formatPortionTime(p.finishedAt)}
+                                    </td>
+                                    <td className="p-2 text-center font-mono text-slate-400">{p.quantity} шт</td>
+                                    <td className="p-2 text-right font-mono text-purple-300/70">
+                                      {formatDuration(p.cookTimeMs)}
+                                      {p.quantity > 1 && (
+                                        <span className="text-slate-500 ml-2">({formatDuration(perPortionMs)}/шт)</span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </React.Fragment>
+                          );
+                        })}
                       </React.Fragment>
                     );
                   })}

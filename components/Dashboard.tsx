@@ -8,9 +8,9 @@
  * 4. Stop List History
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { IngredientBase, Dish, OrderHistoryEntry, Category, SystemSettings, ChefCookingEntry } from '../types';
-import { Calendar, Filter, X } from 'lucide-react';
+import { Calendar, Filter, X, FileDown } from 'lucide-react';
 
 import { SpeedKpiSection } from './dashboard/SpeedKpiSection';
 import { ChefCookingSpeedSection } from './dashboard/ChefCookingSpeedSection';
@@ -19,6 +19,13 @@ import { StopListHistorySection } from './dashboard/StopListHistorySection';
 import { fetchChefCookingEntries } from '../services/chefCookingApi';
 import { fetchStopHistory } from '../services/stoplistApi';
 import { StopHistoryEntry } from '../types';
+import {
+  exportDashboardToExcel,
+  ExportPayload,
+  AggregatedSpeedReport,
+  AggregatedChefReport,
+  HistoryReport,
+} from '../services/excelExport';
 
 interface DashboardProps {
   categories: Category[];
@@ -116,6 +123,52 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
     setAppliedFilter(null);
   };
 
+  // ──────────────────────────────────────────────────────────────────────
+  // Excel-экспорт: каждая секция отдаёт свои агрегаты в latestReportRef.
+  // На клик «Экспорт в Excel» собираем payload и сохраняем .xlsx через
+  // services/excelExport.ts. Используем ref (а не state), чтобы обновления
+  // от секций не вызывали ре-рендер Dashboard.
+  // ──────────────────────────────────────────────────────────────────────
+  const latestReportRef = useRef<{
+    speedStandard?: AggregatedSpeedReport;
+    speedParked?: AggregatedSpeedReport;
+    chefSpeed?: AggregatedChefReport;
+    history?: HistoryReport;
+  }>({});
+  const [isExporting, setIsExporting] = useState(false);
+
+  const handleSpeedDataReady = useCallback((data: { standard: AggregatedSpeedReport; parked: AggregatedSpeedReport }) => {
+    latestReportRef.current.speedStandard = data.standard;
+    latestReportRef.current.speedParked = data.parked;
+  }, []);
+  const handleChefDataReady = useCallback((data: AggregatedChefReport) => {
+    latestReportRef.current.chefSpeed = data;
+  }, []);
+  const handleHistoryDataReady = useCallback((data: HistoryReport) => {
+    latestReportRef.current.history = data;
+  }, []);
+
+  const handleExport = useCallback(async () => {
+    if (!appliedFilter) return;
+    setIsExporting(true);
+    try {
+      const payload: ExportPayload = {
+        filterRange: { start: appliedFilter.start, end: appliedFilter.end },
+        settings,
+        speedStandard: latestReportRef.current.speedStandard,
+        speedParked: latestReportRef.current.speedParked,
+        chefSpeed: latestReportRef.current.chefSpeed,
+        history: latestReportRef.current.history,
+      };
+      await exportDashboardToExcel(payload);
+    } catch (err) {
+      console.error('[Dashboard] Ошибка экспорта в Excel:', err);
+      alert('Не удалось создать Excel-файл. Подробности в консоли.');
+    } finally {
+      setIsExporting(false);
+    }
+  }, [appliedFilter, settings]);
+
   return (
     <div className="flex-1 bg-kds-bg p-8 overflow-y-auto">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
@@ -157,6 +210,18 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
             OK
           </button>
 
+          {/* Экспорт в Excel — активен только когда фильтр применён, потому что
+              без него секции не сгенерировали данные для выгрузки. */}
+          <button
+            onClick={handleExport}
+            disabled={!appliedFilter || isExporting}
+            className="ml-2 px-4 py-2 bg-green-700 hover:bg-green-600 disabled:bg-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-white text-sm font-bold uppercase tracking-wider rounded shadow-lg shadow-green-900/20 transition-all flex items-center gap-2"
+            title={!appliedFilter ? 'Сначала примените период (OK)' : 'Скачать .xlsx со всеми отчётами'}
+          >
+            <FileDown size={16} />
+            {isExporting ? 'Сохраняю…' : 'Excel'}
+          </button>
+
           {(tempStart || tempEnd || appliedFilter) && (
             <button
               onClick={handleClear}
@@ -181,12 +246,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
             appliedFilter={appliedFilter}
             categories={categories}
             dishes={dishes}
+            onDataReady={handleSpeedDataReady}
           />
           <ChefCookingSpeedSection
             entries={chefCookingEntries}
             appliedFilter={appliedFilter}
             categories={categories}
             dishes={dishes}
+            onDataReady={handleChefDataReady}
           />
           <IngredientUsageSection
             orderHistory={orderHistory}
@@ -200,6 +267,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
             dishes={dishes}
             appliedFilter={appliedFilter}
             settings={settings}
+            onDataReady={handleHistoryDataReady}
           />
         </div>
       )}
