@@ -1,6 +1,6 @@
 # CLAUDE.md — Контекст проекта для AI-агента
 
-> Актуализирован 2026-07-12 по итогам аудита готовности к передаче (полные ревью кода — 2026-07-06 и 2026-07-11). При изменении кода — обновляй этот файл (правило 2).
+> Актуализирован 2026-07-12 по итогам аудита готовности к передаче (полные ревью кода — 2026-07-06 и 2026-07-11) + проверка отчётов/Excel того же дня: фикс таймзоны дат экспорта, свёрнутые группы, звук нового заказа (миграция 026). При изменении кода — обновляй этот файл (правило 2).
 
 ## ⚠️ ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА (ВСЕГДА СОБЛЮДАТЬ)
 
@@ -91,7 +91,7 @@
 ├── postcss.config.js       # PostCSS: @tailwindcss/postcss + autoprefixer
 ├── App.tsx                 # Корневой компонент: роутинг вьюшек, подключение хуков, дебаунс настроек
 ├── types.ts                # TypeScript типы: Order, Dish, Ingredient, Settings...
-├── utils.ts                # Утилиты: generateId(), calculateConsumedIngredients()
+├── utils.ts                # Утилиты: generateId(), calculateConsumedIngredients(), playDefrostBeep(), playNewOrderBeep()
 ├── smartQueue.ts           # Два движка очереди: buildSmartQueue («Темп курсов») + buildSpeedQueue (режим скорости)
 ├── constants.ts            # ROLE_ACCESS + getAllowedViews (живое); INITIAL_* моки — легаси, нигде не импортируются
 ├── vite.config.ts          # Vite: порт 3000, host 0.0.0.0, proxy /api и /images → localhost:3001
@@ -115,7 +115,7 @@
 │   ├── chefCookingApi.ts   # Метрика «Скорость готовки повара» (Dashboard)
 │   ├── dishImagesApi.ts    # Upload/delete фото блюда (multipart)
 │   ├── ingredientImagesApi.ts # Upload/delete фото ингредиента (multipart)
-│   └── excelExport.ts      # Экспорт сводки Dashboard в .xlsx (5 листов, ExcelJS + file-saver, всё на клиенте)
+│   └── excelExport.ts      # Экспорт сводки Dashboard в .xlsx (5 листов, ExcelJS + file-saver, всё на клиенте; даты через toExcelDate — компенсация TZ, группы свёрнуты по умолчанию)
 ├── hooks/
 │   ├── useOrders.ts        # Заказы: polling из БД (4 сек), API actions, парковка, разморозка
 │   ├── useIngredients.ts   # CRUD ингредиентов через API
@@ -176,7 +176,7 @@
 │   │   └── images/
 │   │       ├── dishes/         # Фото блюд (multer → slicer_dish_images, миграция 008)
 │   │       └── ingredients/    # Фото ингредиентов (multer → slicer_ingredients.image_url, миграция 009)
-│   └── migrations/             # 001–025
+│   └── migrations/             # 001–026
 │       ├── 001_create_slicer_tables.sql  # Создание базовых slicer-таблиц
 │       ├── 002_seed_defaults.sql         # Начальные данные (категории, настройки)
 │       ├── 003_dish_aliases.sql          # slicer_dish_aliases
@@ -201,7 +201,8 @@
 │       ├── 022_merge_ack.sql                     # merge_ack: персист merge-подтверждения виртуальных карточек
 │       ├── 023_course_pace.sql                   # course_pace_seconds: шаг курса умной очереди v2 «Темп курсов»
 │       ├── 024_course_pace_default_600.sql       # шаг курса: дефолт 600 + семантика «окно уступки» (заморозка курсов — в коде)
-│       └── 025_course_pace_check.sql             # CHECK 10..3600 на course_pace_seconds (ревью 2026-07-11)
+│       ├── 025_course_pace_check.sql             # CHECK 10..3600 на course_pace_seconds (ревью 2026-07-11)
+│       └── 026_new_order_sound.sql               # звук нового заказа: enable_new_order_sound (default TRUE)
 ├── BD_docs/                # Документация БД для программистов
 │   ├── README.md           # Обзор архитектуры, ER-схема
 │   ├── mappings.md         # TypeScript ↔ DB маппинг
@@ -356,6 +357,7 @@
 - **Шаг курса умной очереди**: `slicer_settings.course_pace_seconds` (по умолчанию 600 сек, миграция 024) — «окно уступки» поздних курсов новым гостям, правится в UI под тумблером «Волновая Агрегация» — см. паттерн 2
 - **Удержание истории**: `slicer_settings.history_retention_minutes` (правится в UI, макс 120)
 - **«Окно Агрегации»** (`enable_aggregation`): тумблер режима скорости — см. паттерн 9. Колонка `aggregation_window_minutes` — легаси, не используется (слияние безлимитное)
+- **Звук нового заказа**: `enable_new_order_sound` (миграция 026, default TRUE) — двойной beep при появлении нового заказа на доске. Эффект `knownOrderIdsRef` в `SlicerStation`: первый снапшот после загрузки запоминается молча (нет ложного сигнала при F5), restore того же id не звучит, один beep на тик поллинга. Тумблер — Админка → Общие Настройки, рядом со звуком разморозки
 - **KITCHEN_STORAGE_UUIDS**: whitelist кухонных складов, жёстко прописан в `server/src/routes/orders.ts` и `server/src/routes/dishes.ts` (при деплое на другой ресторан — обновить)
 
 ## Стилизация
@@ -429,8 +431,8 @@ cd server && psql -U postgres -d arclient -f migrations/001_create_slicer_tables
 | `slicer_stop_history` | История стопов + акторы (stopped_by_*/resumed_by_*/actor_source) |
 | `slicer_settings` | Настройки модуля (singleton, id=1) |
 
-### Колонки `slicer_settings` (актуально на 2026-07-11)
-`aggregation_window_minutes` (легаси, не используется), `history_retention_minutes`, `active_priority_rules` (jsonb), `course_window_seconds` (стандартный режим), `course_pace_seconds` (умная v2, миграции 023/024/025 — «окно уступки», default 600, CHECK 10..3600), `restaurant_open_time`, `restaurant_close_time`, `excluded_dates` (jsonb), `enable_aggregation` (режим скорости, паттерн 9), `enable_smart_aggregation`, `enable_kds_stoplist_sync`, `enable_defrost_sound`, `dessert_category_id`, `dessert_auto_park_enabled`, `dessert_auto_park_minutes`, `dessert_trigger_modifier_patterns` (text[]).
+### Колонки `slicer_settings` (актуально на 2026-07-12)
+`aggregation_window_minutes` (легаси, не используется), `history_retention_minutes`, `active_priority_rules` (jsonb), `course_window_seconds` (стандартный режим), `course_pace_seconds` (умная v2, миграции 023/024/025 — «окно уступки», default 600, CHECK 10..3600), `restaurant_open_time`, `restaurant_close_time`, `excluded_dates` (jsonb), `enable_aggregation` (режим скорости, паттерн 9), `enable_smart_aggregation`, `enable_kds_stoplist_sync`, `enable_defrost_sound`, `enable_new_order_sound` (звук нового заказа, миграция 026, default TRUE), `dessert_category_id`, `dessert_auto_park_enabled`, `dessert_auto_park_minutes`, `dessert_trigger_modifier_patterns` (text[]).
 
 ### ⚠️ ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА работы с БД
 

@@ -191,6 +191,9 @@ function App() {
 
   const {
     orders,
+    // Флаг первой загрузки заказов — прокидывается в SlicerStation для звука
+    // нового заказа: первый снапшот доски запоминается без сигнала.
+    loading: ordersLoading,
     orderHistory,
     handleStackMerge,
     handleMergeAck,
@@ -297,6 +300,7 @@ function App() {
             orderHistory={orderHistory}
             onRestoreOrder={handleRestoreOrder}
             settings={settings}
+            ordersLoading={ordersLoading}
             onStartDefrost={handleStartDefrost}
             onCancelDefrost={handleCancelDefrost}
             onCompleteDefrost={handleCompleteDefrost}

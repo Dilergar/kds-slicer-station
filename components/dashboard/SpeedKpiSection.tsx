@@ -130,7 +130,10 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
         }
 
         const catDef = categories.find(c => c.id === stats.categoryId);
-        const catName = catDef ? catDef.name : 'Unknown Category';
+        // «Без категории» — как в ChefCookingSpeedSection: раньше здесь был
+        // английский 'Unknown Category' и одна и та же группа называлась
+        // по-разному в соседних секциях Dashboard.
+        const catName = catDef ? catDef.name : 'Без категории';
         const catId = stats.categoryId;
 
         if (!categoryMap.has(catId)) {

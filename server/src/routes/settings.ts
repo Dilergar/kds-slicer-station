@@ -57,6 +57,8 @@ router.get('/', async (_req: Request, res: Response) => {
       // Разморозка (миграция 016, 020): глобальное время убрано, живёт per-dish
       // в slicer_dish_defrost. Здесь остался только toggle звука.
       enableDefrostSound: row.enable_defrost_sound,
+      // Звук поступления нового заказа (миграция 026)
+      enableNewOrderSound: row.enable_new_order_sound,
       // Авто-парковка десертов (миграции 017 + 019)
       dessertCategoryId: row.dessert_category_id,
       dessertAutoParkEnabled: row.dessert_auto_park_enabled,
@@ -85,6 +87,7 @@ router.put('/', async (req: Request, res: Response) => {
       enableSmartAggregation,
       enableKdsStoplistSync,
       enableDefrostSound,
+      enableNewOrderSound,
       dessertCategoryId,
       dessertAutoParkEnabled,
       dessertAutoParkMinutes,
@@ -126,6 +129,7 @@ router.put('/', async (req: Request, res: Response) => {
         enable_smart_aggregation = COALESCE($9, enable_smart_aggregation),
         enable_kds_stoplist_sync = COALESCE($10, enable_kds_stoplist_sync),
         enable_defrost_sound = COALESCE($11, enable_defrost_sound),
+        enable_new_order_sound = COALESCE($18, enable_new_order_sound),
         -- Десерты: dessert_category_id может прийти явным null (отвязать),
         -- поэтому НЕ через COALESCE — используем флаг $15 "трогаем ли это поле".
         dessert_category_id = CASE WHEN $15::bool THEN $12::uuid ELSE dessert_category_id END,
@@ -155,7 +159,9 @@ router.put('/', async (req: Request, res: Response) => {
         // значит хочет его изменить. Отсутствие ключа в body → не трогаем.
         Object.prototype.hasOwnProperty.call(req.body, 'dessertCategoryId'),
         dessertTriggerModifierPatterns ?? null,
-        coursePaceSeconds ?? null
+        coursePaceSeconds ?? null,
+        // $18: звук нового заказа (миграция 026)
+        enableNewOrderSound
       ]
     );
 
@@ -177,6 +183,7 @@ router.put('/', async (req: Request, res: Response) => {
       enableSmartAggregation: row.enable_smart_aggregation,
       enableKdsStoplistSync: row.enable_kds_stoplist_sync,
       enableDefrostSound: row.enable_defrost_sound,
+      enableNewOrderSound: row.enable_new_order_sound,
       dessertCategoryId: row.dessert_category_id,
       dessertAutoParkEnabled: row.dessert_auto_park_enabled,
       dessertAutoParkMinutes: row.dessert_auto_park_minutes,

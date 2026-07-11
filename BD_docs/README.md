@@ -126,6 +126,7 @@
 - [023_course_pace](migrations/023_course_pace.md) — course_pace_seconds в slicer_settings: «шаг курса» умной очереди v2 «Темп курсов»
 - [024_course_pace_default_600](migrations/024_course_pace_default_600.md) — Дефолт шага курса 600 сек + семантика «окно уступки»
 - [025_course_pace_check](migrations/025_course_pace_check.md) — CHECK 10..3600 на course_pace_seconds (+ кламп существующих значений)
+- [026_new_order_sound](migrations/026_new_order_sound.md) — enable_new_order_sound: тумблер звука при поступлении нового заказа (default TRUE)
 
 ## Связанные документы
 - [mappings.md](mappings.md) — TypeScript interface ↔ DB column маппинг

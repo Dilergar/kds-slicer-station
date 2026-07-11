@@ -23,6 +23,7 @@
 | `enable_smart_aggregation` | BOOLEAN | ✅ | `TRUE` | 001 | Smart Wave агрегация ВКЛ/ВЫКЛ |
 | `enable_kds_stoplist_sync` | BOOLEAN | ✅ | `FALSE` | 006 | Двусторонняя синхронизация стоп-листа с `rgst3_dishstoplist` (см. раздел 10 Инструкции) |
 | `enable_defrost_sound` | BOOLEAN | ✅ | `TRUE` | 016 | Web Audio beep при истечении таймера мини-карточки разморозки. Время разморозки per-dish в `slicer_dish_defrost.defrost_duration_minutes` (миграция 020 удалила глобальную колонку `defrost_duration_minutes`) |
+| `enable_new_order_sound` | BOOLEAN | ✅ | `TRUE` | 026 | Web Audio beep (двойной тон, отличается от сигнала разморозки) при появлении нового заказа на доске. Логика на фронте: эффект в `SlicerStation` отслеживает новые `order_item_id` в поллинге; первый снапшот после загрузки молчит |
 | `dessert_category_id` | UUID | ❌ | `NULL` | 017 | FK → `slicer_categories(id)` ON DELETE SET NULL. К какой категории применяется правило авто-парковки десертов. NULL = правило отключено |
 | `dessert_auto_park_enabled` | BOOLEAN | ✅ | `FALSE` | 017 | Глобальный тумблер авто-парковки десертов |
 | `dessert_auto_park_minutes` | INT | ✅ | `40` | 017 | На сколько минут уходит в парковку десертная позиция (CHECK 1..240) |
@@ -72,6 +73,7 @@ interface SystemSettings {
   enableKdsStoplistSync?: boolean;      // → enable_kds_stoplist_sync (006)
   // defrostDurationMinutes удалён в миграции 020 — время per-dish в Dish.defrost_duration_minutes
   enableDefrostSound?: boolean;         // → enable_defrost_sound (016)
+  enableNewOrderSound?: boolean;        // → enable_new_order_sound (026)
   dessertCategoryId?: string | null;    // → dessert_category_id (017)
   dessertAutoParkEnabled?: boolean;     // → dessert_auto_park_enabled (017)
   dessertAutoParkMinutes?: number;      // → dessert_auto_park_minutes (017)

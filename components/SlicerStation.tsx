@@ -33,7 +33,7 @@ import { OrderCard } from './OrderCard';
 import { DefrostRow } from './DefrostRow';
 import { DefrostModal } from './DefrostModal';
 import { buildSmartQueue, buildSpeedQueue, isDefrostActive, PersistentVtEntry } from '../smartQueue';
-import { playDefrostBeep } from '../utils';
+import { playDefrostBeep, playNewOrderBeep } from '../utils';
 
 interface SlicerStationProps {
   orders: Order[];
@@ -57,6 +57,12 @@ interface SlicerStationProps {
   orderHistory?: OrderHistoryEntry[];
   onRestoreOrder?: (id: string) => void;
   settings?: SystemSettings;
+  /**
+   * true, пока useOrders не получил первый ответ GET /api/orders. Нужен звуку
+   * нового заказа (миграция 026): первый реальный снапшот доски запоминается
+   * молча, иначе каждый F5 «звенел» бы всеми текущими заказами.
+   */
+  ordersLoading?: boolean;
   // Разморозка (миграция 016). Все три принимают sourceOrderItemIds для
   // Smart Wave: резолв виртуального id → реальные order_item_id делается
   // здесь внутри через smartQueueMappingRef.
@@ -82,6 +88,7 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   orderHistory = [],
   onRestoreOrder,
   settings,
+  ordersLoading,
   onStartDefrost,
   onCancelDefrost,
   onCompleteDefrost
@@ -198,6 +205,44 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
       if (!currentKeys.has(key)) seen.delete(key);
     }
   }, [orders, now, settings?.enableDefrostSound]);
+
+  // === Звук поступления нового заказа (миграция 026) ===
+  // Множество всех id заказов, виденных за жизнь компонента. Появление id,
+  // которого в множестве нет, = новый заказ → двойной beep. Правила:
+  //  - null = первый успешный снапшот ещё не наблюдали. Пока ordersLoading —
+  //    ждём; первый реальный снапшот запоминаем МОЛЧА, иначе F5/переключение
+  //    вкладок «звенело» бы всеми заказами, уже висящими на доске.
+  //  - Множество НЕ чистится при исчезновении заказа: «Готово → Вернуть»
+  //    (restore) возвращает тот же id, повторный сигнал не нужен. Размер за
+  //    смену — сотни строк, умирает вместе с размонтированием компонента.
+  //  - Следим за СЫРЫМИ orders (не виртуальными карточками): id реальных
+  //    позиций стабильны, и звук не зависит от режима очереди. Авто-паркованный
+  //    десерт тоже звучит — это поступивший заказ, просто он сразу в парковке.
+  const knownOrderIdsRef = useRef<Set<string> | null>(null);
+
+  useEffect(() => {
+    if (ordersLoading) return;
+
+    const known = knownOrderIdsRef.current;
+    if (known === null) {
+      knownOrderIdsRef.current = new Set(orders.map(o => o.id));
+      return;
+    }
+
+    let newOrders = 0;
+    for (const o of orders) {
+      if (!known.has(o.id)) {
+        known.add(o.id);
+        newOrders++;
+      }
+    }
+    // Один beep на тик поллинга, сколько бы позиций ни пришло разом (чек на
+    // 5 блюд = 5 новых id): N перекрывающихся AudioContext дают искажённый
+    // звук — тот же урок, что у звука разморозки (ревью 2026-07-11).
+    if (newOrders > 0 && settings?.enableNewOrderSound !== false) {
+      playNewOrderBeep();
+    }
+  }, [orders, ordersLoading, settings?.enableNewOrderSound]);
 
   // === Разморозка: группировка и маппинг (миграция 016) ===
   // Группируем активно размораживающиеся заказы по (dish_id + started_at с

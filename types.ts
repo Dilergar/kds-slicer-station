@@ -264,6 +264,9 @@ export interface SystemSettings {
   // Разморозка (миграция 016, 020): время per-dish в Dish.defrost_duration_minutes,
   // здесь остаётся только глобальный toggle звука (время убрано в миграции 020).
   enableDefrostSound?: boolean;         // Звуковой сигнал при истечении таймера (по умолчанию: true)
+  // Звук поступления нового заказа (миграция 026): двойной beep при появлении
+  // ранее не виденного заказа на доске (эффект knownOrderIdsRef в SlicerStation).
+  enableNewOrderSound?: boolean;        // По умолчанию: true
   // Авто-парковка десертов (миграция 017). Если enabled=true и категория
   // привязана — при первом появлении дессертной позиции в GET /api/orders
   // backend сразу INSERT'ит slicer_order_state со status=PARKED и

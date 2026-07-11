@@ -40,11 +40,11 @@ kds-slicer-station/
 │   ├── src/config/db.ts       # pg.Pool подключение к arclient
 │   ├── .env.example           # Шаблон конфига backend
 │   ├── src/services/          # Адаптеры (kdsStoplistSync — двусторонний стоп-лист)
-│   └── migrations/            # SQL миграции (25 файлов: 001–025)
+│   └── migrations/            # SQL миграции (26 файлов: 001–026)
 ├── BD_docs/                   # Документация БД для программистов
 │   ├── README.md              # Обзор архитектуры, ER-схема
 │   ├── tables/                # Описание каждой slicer_ таблицы (15 файлов)
-│   ├── migrations/            # Описание миграций (25 файлов)
+│   ├── migrations/            # Описание миграций (26 файлов)
 │   ├── mappings.md            # TypeScript ↔ DB маппинг
 │   └── existing_tables.md     # Таблицы основной KDS
 └── Инструкция.md              # Гайд по развёртыванию для IT-команды заказчика
@@ -129,8 +129,8 @@ cd server && npm run migrate
 ```bash
 psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/001_create_slicer_tables.sql
 psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/002_seed_defaults.sql
-# ... и далее строго по номерам до 025_course_pace_check.sql
-# (все 25 команд по порядку — в Инструкция.md, раздел 4.2)
+# ... и далее строго по номерам до 026_new_order_sound.sql
+# (все 26 команд по порядку — в Инструкция.md, раздел 4.2)
 ```
 
 > **Внимание:** перед первым запуском на новом ресторане обновите константу

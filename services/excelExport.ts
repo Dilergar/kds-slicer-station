@@ -13,7 +13,13 @@
  * Лист «История стопов» соблюдает текущие UI-фильтры (тип записи + режим
  * группировки + строка поиска). Листы скоростей всегда показывают полную
  * иерархию Категория → Блюдо → Порция через Excel outline groups (свёрнуто
- * по умолчанию, +/- слева).
+ * по умолчанию: детальные строки скрыты через row.hidden, раскрываются «+»
+ * слева; summaryBelow=false — итоговая строка стоит НАД группой).
+ *
+ * Даты: ExcelJS сериализует JS Date по UTC, а Excel показывает время «как
+ * есть», без часового пояса — поэтому все даты перед записью проходят через
+ * toExcelDate() (сдвиг на локальный offset). Без этого файл отставал от UI
+ * на 5 часов: «12.07 01:32» превращалось в «11.07 20:32».
  */
 import ExcelJS from 'exceljs';
 import { saveAs } from 'file-saver';
@@ -109,6 +115,20 @@ function parseDateTimeLocal(s: string): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
+/**
+ * Готовит timestamp/Date к записи в ячейку Excel.
+ *
+ * ExcelJS переводит JS Date в excel-serial по UTC, а Excel показывает serial
+ * без часового пояса — без компенсации весь файл «отставал» от UI на
+ * локальный offset (для Казахстана −5 часов, даже дата съезжала на вчера).
+ * Сдвигаем на offset КОНКРЕТНОГО момента (а не текущего) — корректно и при
+ * переходах на летнее/зимнее время.
+ */
+function toExcelDate(value: number | Date): Date {
+  const d = typeof value === 'number' ? new Date(value) : value;
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+}
+
 /** Жирный заголовок таблицы + автофильтр + frozen-row. */
 function applyTableStyling(ws: ExcelJS.Worksheet, headerRowNum: number, totalCols: number) {
   const headerRow = ws.getRow(headerRowNum);
@@ -149,6 +169,28 @@ function styleByOutlineLevel(row: ExcelJS.Row, level: 0 | 1 | 2) {
   // level 2 — без фона (чистый белый)
 }
 
+/**
+ * Оформляет только что добавленную строку-заголовок секции листа «Сводка»:
+ * жирный цветной текст + светлая цветная полоса на ширину контентных колонок
+ * (A..F). Полоса делает границы секций видимыми при беглом взгляде — лист
+ * перестаёт быть сплошной «простынёй» строк.
+ */
+function styleSummarySectionRow(ws: ExcelJS.Worksheet, textArgb: string, fillArgb: string): void {
+  const row = ws.getRow(ws.lastRow!.number);
+  row.font = { bold: true, color: { argb: textArgb } };
+  for (let c = 1; c <= 6; c++) {
+    row.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillArgb } };
+  }
+}
+
+/** Шапка мини-таблицы топ-10 в «Сводке» — в стиле шапок больших листов. */
+function styleTopTableHeader(row: ExcelJS.Row): void {
+  row.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  for (let c = 1; c <= 5; c++) {
+    row.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
+  }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Лист 1: Сводка (KPI + топ-10)
 // ───────────────────────────────────────────────────────────────────────────
@@ -174,9 +216,9 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
   ws.getRow(1).font = { bold: true, size: 16 };
   ws.addRow([
     'Период с',
-    start ? start : '',
+    start ? toExcelDate(start) : '',
     'по',
-    end ? end : '',
+    end ? toExcelDate(end) : '',
   ]);
   ws.getCell('B2').numFmt = 'dd.mm.yyyy hh:mm';
   ws.getCell('D2').numFmt = 'dd.mm.yyyy hh:mm';
@@ -189,8 +231,7 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
 
   // === ОТДАЧА ===
   ws.addRow(['ОТДАЧА (нарезчик)']);
-  const otdSection = ws.getRow(ws.lastRow!.number);
-  otdSection.font = { bold: true, color: { argb: 'FF15803D' } };
+  styleSummarySectionRow(ws, 'FF15803D', 'FFDCFCE7'); // green-700 на green-100
 
   const allOrders = [
     ...(payload.speedStandard?.flatMap(c => c.dishes.flatMap(d => d.orders)) ?? []),
@@ -220,7 +261,7 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
 
   // === ПОВАР ===
   ws.addRow(['ГОТОВКА ПОВАРА']);
-  ws.getRow(ws.lastRow!.number).font = { bold: true, color: { argb: 'FF7E22CE' } };
+  styleSummarySectionRow(ws, 'FF7E22CE', 'FFF3E8FF'); // purple-700 на purple-100
 
   const allChef = payload.chefSpeed?.flatMap(c => c.dishes.flatMap(d => d.portions)) ?? [];
   const chefPortions = allChef.reduce((s, p) => s + p.quantity, 0);
@@ -234,7 +275,7 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
 
   // === СТОПЫ ===
   ws.addRow(['СТОПЫ']);
-  ws.getRow(ws.lastRow!.number).font = { bold: true, color: { argb: 'FFDC2626' } };
+  styleSummarySectionRow(ws, 'FFDC2626', 'FFFEE2E2'); // red-600 на red-100
 
   if (payload.history) {
     const h = payload.history;
@@ -267,10 +308,10 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
 
   // === ТОП-10 САМЫХ МЕДЛЕННЫХ БЛЮД (ОТДАЧА) ===
   ws.addRow(['ТОП-10 САМЫХ МЕДЛЕННЫХ БЛЮД (отдача, по ср. времени на порцию)']);
-  ws.getRow(ws.lastRow!.number).font = { bold: true };
+  styleSummarySectionRow(ws, 'FF1E293B', 'FFE2E8F0'); // slate-800 на slate-200
 
   const topSpeedHeader = ws.addRow(['#', 'Категория', 'Блюдо', 'Кол-во', 'Ср. время']);
-  topSpeedHeader.font = { bold: true };
+  styleTopTableHeader(topSpeedHeader);
   const allSpeedDishes: Array<{ cat: string; name: string; cycles: number; avgMs: number }> = [];
   for (const cat of payload.speedStandard ?? []) {
     for (const d of cat.dishes) allSpeedDishes.push({ cat: cat.categoryName, name: d.dishName, cycles: d.totalCycles, avgMs: d.avgTimeMs });
@@ -288,10 +329,10 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
 
   // === ТОП-10 САМЫХ МЕДЛЕННЫХ БЛЮД (ПОВАР) ===
   ws.addRow(['ТОП-10 САМЫХ МЕДЛЕННЫХ БЛЮД (готовка повара)']);
-  ws.getRow(ws.lastRow!.number).font = { bold: true };
+  styleSummarySectionRow(ws, 'FF1E293B', 'FFE2E8F0'); // slate-800 на slate-200
 
   const topChefHeader = ws.addRow(['#', 'Категория', 'Блюдо', 'Кол-во', 'Ср. время']);
-  topChefHeader.font = { bold: true };
+  styleTopTableHeader(topChefHeader);
   const allChefDishes: Array<{ cat: string; name: string; cycles: number; avgMs: number }> = [];
   for (const cat of payload.chefSpeed ?? []) {
     for (const d of cat.dishes) allChefDishes.push({ cat: cat.categoryName, name: d.dishName, cycles: d.totalCycles, avgMs: d.avgTimeMs });
@@ -315,7 +356,12 @@ function buildHistorySheet(
   history: HistoryReport,
   settings: SystemSettings
 ): void {
-  const ws = wb.addWorksheet('История стопов');
+  // summaryBelow=false: наши итоговые строки (Продукт/Дата) стоят НАД своей
+  // группой, поэтому кнопки «+/−» должны рисоваться на них, а не на строке
+  // ПОСЛЕ группы (дефолт Excel).
+  const ws = wb.addWorksheet('История стопов', {
+    properties: { outlineProperties: { summaryBelow: false, summaryRight: false } },
+  });
 
   const filterLabels: Record<HistoryReport['targetTypeFilter'], string> = {
     all: 'Всё',
@@ -421,8 +467,8 @@ function buildHistorySheet(
       'Стоп',
       isDish ? 'Блюдо' : 'Ингредиент',
       cleanName,
-      new Date(e.stoppedAt),
-      e.isActive ? null : new Date(e.resumedAt),
+      toExcelDate(e.stoppedAt),
+      e.isActive ? null : toExcelDate(e.resumedAt),
       durationSec,
       formatDuration(e.durationMs),
       null,                     // % downtime — на уровне группы, не entry
@@ -434,6 +480,9 @@ function buildHistorySheet(
       e.isActive ? 'ДА' : 'НЕТ',
     ]);
     row.outlineLevel = level;
+    // Детальные строки скрыты по умолчанию — лист открывается компактной
+    // сводкой по группам, «+» слева раскрывает конкретные стопы.
+    row.hidden = true;
     if (e.isActive) {
       row.font = { color: { argb: 'FFDC2626' }, bold: true };
     }
@@ -548,6 +597,7 @@ function buildHistorySheet(
           '', '', '', '', '',
         ]);
         dateRow.outlineLevel = 1;
+        dateRow.hidden = true; // свёрнуто по умолчанию (см. addEntryRow)
         styleByOutlineLevel(dateRow, 1);
 
         // Стопы внутри дня — свежие сверху
@@ -632,7 +682,11 @@ function buildSpeedSheet(
   sheetName: string,
   data: AggregatedSpeedReport
 ): void {
-  const ws = wb.addWorksheet(sheetName);
+  // summaryBelow=false — итоговая строка (Категория/Блюдо) над группой,
+  // кнопки «+/−» на ней (см. лист «История стопов»).
+  const ws = wb.addWorksheet(sheetName, {
+    properties: { outlineProperties: { summaryBelow: false, summaryRight: false } },
+  });
 
   ws.addRow([sheetName]).font = { bold: true, size: 14 };
   ws.addRow([]);
@@ -683,6 +737,7 @@ function buildSpeedSheet(
         formatDuration(dish.avgTimeMs),
       ]);
       dishRow.outlineLevel = 1;
+      dishRow.hidden = true; // свёрнуто по умолчанию — лист открывается сводкой по категориям
       styleByOutlineLevel(dishRow, 1);
 
       // Порции: свежие сверху
@@ -691,7 +746,7 @@ function buildSpeedSheet(
         const perPortionMs = o.totalQuantity > 0 ? o.prepTimeMs / o.totalQuantity : o.prepTimeMs;
         const portionRow = ws.addRow([
           'Порция', cat.categoryName, dish.dishName,
-          new Date(o.completedAt),
+          toExcelDate(o.completedAt),
           o.totalQuantity,
           Math.round(o.prepTimeMs / 1000),
           formatDuration(o.prepTimeMs),
@@ -699,6 +754,7 @@ function buildSpeedSheet(
           formatDuration(perPortionMs),
         ]);
         portionRow.outlineLevel = 2;
+        portionRow.hidden = true; // свёрнуто по умолчанию
       }
     }
   }
@@ -711,7 +767,10 @@ function buildSpeedSheet(
 // ───────────────────────────────────────────────────────────────────────────
 
 function buildChefSpeedSheet(wb: ExcelJS.Workbook, data: AggregatedChefReport): void {
-  const ws = wb.addWorksheet('Скорость готовки повара');
+  // summaryBelow=false — как на остальных иерархических листах.
+  const ws = wb.addWorksheet('Скорость готовки повара', {
+    properties: { outlineProperties: { summaryBelow: false, summaryRight: false } },
+  });
 
   ws.addRow(['Скорость готовки повара']).font = { bold: true, size: 14 };
   ws.addRow([]);
@@ -762,6 +821,7 @@ function buildChefSpeedSheet(wb: ExcelJS.Workbook, data: AggregatedChefReport): 
         formatDuration(dish.avgTimeMs),
       ]);
       dishRow.outlineLevel = 1;
+      dishRow.hidden = true; // свёрнуто по умолчанию
       styleByOutlineLevel(dishRow, 1);
 
       const sortedPortions = [...dish.portions].sort((a, b) => b.finishedAt - a.finishedAt);
@@ -769,7 +829,7 @@ function buildChefSpeedSheet(wb: ExcelJS.Workbook, data: AggregatedChefReport): 
         const perPortionMs = p.quantity > 0 ? p.cookTimeMs / p.quantity : p.cookTimeMs;
         const portionRow = ws.addRow([
           'Порция', cat.categoryName, dish.dishName,
-          new Date(p.finishedAt),
+          toExcelDate(p.finishedAt),
           p.quantity,
           Math.round(p.cookTimeMs / 1000),
           formatDuration(p.cookTimeMs),
@@ -777,6 +837,7 @@ function buildChefSpeedSheet(wb: ExcelJS.Workbook, data: AggregatedChefReport): 
           formatDuration(perPortionMs),
         ]);
         portionRow.outlineLevel = 2;
+        portionRow.hidden = true; // свёрнуто по умолчанию
       }
     }
   }

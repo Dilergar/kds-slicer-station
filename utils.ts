@@ -5,6 +5,7 @@
  * - generateId() — генерация уникальных идентификаторов
  * - calculateConsumedIngredients() — расчёт потреблённых ингредиентов при выполнении заказа
  * - playDefrostBeep() — звуковой сигнал готовности разморозки (Web Audio)
+ * - playNewOrderBeep() — звуковой сигнал поступления нового заказа (Web Audio)
  */
 
 import { Dish, OrderHistoryEntry, IngredientBase } from './types';
@@ -114,5 +115,42 @@ export const playDefrostBeep = (): void => {
         setTimeout(() => { try { ctx.close(); } catch { /* контекст уже закрыт */ } }, 1000);
     } catch (err) {
         console.warn('[utils] Ошибка воспроизведения звука разморозки:', err);
+    }
+};
+
+/**
+ * Проигрывает двойной короткий beep («динь-динь») через Web Audio API —
+ * сигнал «поступил новый заказ». Паттерн намеренно отличается от
+ * 3-тонального нарастающего сигнала разморозки (playDefrostBeep), чтобы
+ * нарезчик различал события на слух, не глядя в планшет.
+ *
+ * Вызывается из SlicerStation при появлении в поллинге заказа с ранее не
+ * виденным id (см. эффект knownOrderIdsRef). Глобальный тумблер —
+ * slicer_settings.enable_new_order_sound (миграция 026, по умолчанию ВКЛ).
+ */
+export const playNewOrderBeep = (): void => {
+    try {
+        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        const t0 = ctx.currentTime;
+        // Два одинаковых высоких тона — короче и «легче» сигнала разморозки.
+        const tones = [1040, 1040];
+        tones.forEach((freq: number, i: number) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.0001, t0 + i * 0.16);
+            gain.gain.exponentialRampToValueAtTime(0.22, t0 + i * 0.16 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.16 + 0.12);
+            osc.connect(gain).connect(ctx.destination);
+            osc.start(t0 + i * 0.16);
+            osc.stop(t0 + i * 0.16 + 0.14);
+        });
+        // Закрываем контекст, чтобы не копить ресурсы (как в playDefrostBeep).
+        setTimeout(() => { try { ctx.close(); } catch { /* контекст уже закрыт */ } }, 800);
+    } catch (err) {
+        console.warn('[utils] Ошибка воспроизведения звука нового заказа:', err);
     }
 };

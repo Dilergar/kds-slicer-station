@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { SystemSettings } from '../../types';
-import { Check, Ban, Snowflake } from 'lucide-react';
+import { Check, Ban, Snowflake, Bell } from 'lucide-react';
 
 interface SystemSettingsTabProps {
   settings: SystemSettings;
@@ -194,6 +194,46 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
                 onClick={() => setSettings({ ...settings, enableDefrostSound: true })}
                 className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
                   settings.enableDefrostSound !== false
+                    ? 'bg-blue-600 text-white shadow-[0_0_10px_rgba(37,99,235,0.4)]'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                ВКЛ
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Звук при новом заказе (миграция 026) — двойной beep при появлении
+            нового заказа на доске. Логика — эффект knownOrderIdsRef в
+            SlicerStation; паттерн звука отличается от сигнала разморозки,
+            чтобы события различались на слух. */}
+        <div className="border-t border-gray-700 pt-6">
+          <div className="flex justify-between items-start">
+            <div>
+              <label className="block text-gray-400 text-sm font-bold mb-1 flex items-center gap-2">
+                <Bell size={16} className="text-yellow-400" />
+                Звук при новом заказе
+              </label>
+              <p className="text-gray-500 text-xs max-w-md">
+                Двойной сигнал, когда на доску приходит новый заказ. Помогает не пропустить позицию в шумной кухне, не глядя в планшет. Звучит иначе, чем сигнал разморозки.
+              </p>
+            </div>
+            <div className="flex items-center bg-gray-900 rounded-lg p-1 border border-gray-700 ml-4">
+              <button
+                onClick={() => setSettings({ ...settings, enableNewOrderSound: false })}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                  settings.enableNewOrderSound === false
+                    ? 'bg-red-900/80 text-red-100 shadow-[0_0_10px_rgba(153,27,27,0.4)]'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                ВЫКЛ
+              </button>
+              <button
+                onClick={() => setSettings({ ...settings, enableNewOrderSound: true })}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                  settings.enableNewOrderSound !== false
                     ? 'bg-blue-600 text-white shadow-[0_0_10px_rgba(37,99,235,0.4)]'
                     : 'text-gray-500 hover:text-gray-300'
                 }`}
