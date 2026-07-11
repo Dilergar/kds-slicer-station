@@ -11,10 +11,11 @@
 | Колонка | Тип | NOT NULL | DEFAULT | Миграция | Описание |
 |---|---|---|---|---|---|
 | `id` | INT | ✅ | `1` | 001 | PK, всегда = 1 |
-| `aggregation_window_minutes` | INT | ✅ | `5` | 001 | Окно агрегации заказов (1-60 мин) |
+| `aggregation_window_minutes` | INT | ✅ | `5` | 001 | ⚠️ ЛЕГАСИ (не используется). Лимит времени слияния убран — режим скорости сливает безлимитно |
 | `history_retention_minutes` | INT | ✅ | `15` | 001 | Время хранения истории в UI (1-120 мин) |
-| `active_priority_rules` | JSONB | ✅ | `["ULTRA","COURSE_FIFO"]` | 001 | Порядок правил сортировки |
-| `course_window_seconds` | INT | ✅ | `10` | 001 | Окно FIFO-bucket для COURSE_FIFO (сек) |
+| `active_priority_rules` | JSONB | ✅ | `["ULTRA","COURSE_FIFO"]` | 001 | Порядок правил сортировки (только СТАНДАРТНЫЙ режим, оба тумблера OFF) |
+| `course_window_seconds` | INT | ✅ | `10` | 001 | Окно FIFO-bucket для COURSE_FIFO. Используется в СТАНДАРТНОЙ сортировке (умная перешла на `course_pace_seconds`) |
+| `course_pace_seconds` | INT | ✅ | `600` | 023, 024, 025 | Шаг курса умной очереди v2 «Темп курсов» — «окно уступки»: на сколько курс N стола уступает первым курсам более новых гостей. vt позиции = старт визита + номер_курса × шаг; после наступления vt позицию никто не обгонит. Нарезку не замедляет. CHECK 10..3600 (миграция 025, симметрично API-валидации) |
 | `restaurant_open_time` | VARCHAR(5) | ✅ | `'12:00'` | 001 | Время открытия ресторана (HH:mm) |
 | `restaurant_close_time` | VARCHAR(5) | ✅ | `'23:59'` | 001 | Время закрытия ресторана (HH:mm) |
 | `excluded_dates` | JSONB | ✅ | `[]` | 001 | Выходные дни: `["2026-04-09"]` |
@@ -37,10 +38,10 @@
 
 ## Описание настроек
 
-### Агрегация (взаимоисключающие режимы)
-- **enable_smart_aggregation = true** (по умолчанию): Smart Wave — волновая агрегация на фронтенде, группирует одинаковые блюда по FIFO-bucket'ам
-- **enable_aggregation = true**: Стандартная — физический merge заказов одного блюда в пределах `aggregation_window_minutes`
-- **Оба false**: Без агрегации, каждый заказ = отдельная карточка
+### Два режима очереди (взаимоисключающие) + стандартная сортировка
+- **enable_smart_aggregation = true** (по умолчанию): **«Волновая (Умная)» v2 «Темп курсов»** — каждый гость идёт по своим курсам, `vt = старт визита + номер_курса × course_pace_seconds`, одинаковые блюда сливаются без нарушения курсов. Курсы «заморожены» по визиту (миграция 024 / ревью 2026-07-11): считаются по всем позициям, включая уже отданные (`GET /api/orders` отдаёт `visit_completed_dish_ids` / `visit_started_at` из `slicer_order_state COMPLETED` открытых чеков) — «Готово» не пересобирает очередь. Честность по времени прихода + защита от голодания.
+- **enable_aggregation = true**: **«Окно Агрегации» (режим скорости)** — без порядка категорий, безлимитное слияние одинаковых блюд, строгий FIFO по первому заказу. `aggregation_window_minutes` НЕ используется (легаси).
+- **Оба false**: стандартная сортировка (`active_priority_rules` + `course_window_seconds`), каждая позиция чека = отдельная карточка.
 
 ### Сортировка (active_priority_rules)
 Массив правил в порядке приоритета:
@@ -61,7 +62,8 @@ interface SystemSettings {
   aggregationWindowMinutes: number;     // → aggregation_window_minutes
   historyRetentionMinutes: number;      // → history_retention_minutes
   activePriorityRules: SortRuleType[];  // → active_priority_rules (JSONB)
-  courseWindowSeconds: number;          // → course_window_seconds
+  courseWindowSeconds: number;          // → course_window_seconds (стандартный режим)
+  coursePaceSeconds?: number;           // → course_pace_seconds (023, умная v2)
   restaurantOpenTime: string;           // → restaurant_open_time
   restaurantCloseTime: string;          // → restaurant_close_time
   excludedDates: string[];              // → excluded_dates (JSONB)

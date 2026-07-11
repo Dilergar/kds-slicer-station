@@ -92,7 +92,7 @@
 - [slicer_dish_stoplist](tables/slicer_dish_stoplist.md) — Актуальный стоп-лист блюд (MANUAL + CASCADE)
 - [slicer_dish_images](tables/slicer_dish_images.md) — Фото блюд (путь до файла на диске)
 - [slicer_dish_priority](tables/slicer_dish_priority.md) — Per-dish приоритет (NORMAL/ULTRA), миграция 013
-- [slicer_dish_defrost](tables/slicer_dish_defrost.md) — Per-dish флаг «требует разморозки?», миграция 016
+- [slicer_dish_defrost](tables/slicer_dish_defrost.md) — Per-dish флаг «требует разморозки?» (016) + per-dish время в минутах (020)
 - [slicer_kds_sync_config](tables/slicer_kds_sync_config.md) — Конфиг двусторонней синхронизации с rgst3 (миграция 006)
 - [slicer_order_state](tables/slicer_order_state.md) — Состояние заказов нарезчика
 - [slicer_order_history](tables/slicer_order_history.md) — История завершённых заказов
@@ -120,6 +120,12 @@
 - [017_dessert_auto_park](migrations/017_dessert_auto_park.md) — Авто-парковка десертов: dessert_* настройки в slicer_settings
 - [018_effective_created_at](migrations/018_effective_created_at.md) — Вариант Б парковки: effective_created_at + parked_by_auto, меняет семантику accumulated_time_ms
 - [019_dessert_modifier_trigger](migrations/019_dessert_modifier_trigger.md) — Авто-парковка десертов только при наличии модификатора времени (ctlg20) + поддержка «Готовить к HH.MM»
+- [020_per_dish_defrost_duration](migrations/020_per_dish_defrost_duration.md) — Per-dish время разморозки в slicer_dish_defrost; глобальная колонка defrost_duration_minutes удалена из slicer_settings
+- [021_unstop_master_policy](migrations/021_unstop_master_policy.md) — Триггер-архиватор определяет «наш DELETE» по линковке rgst3_row_suuid; политика «модуль — мастер» при ручном снятии стопа
+- [022_merge_ack](migrations/022_merge_ack.md) — merge_ack в slicer_order_state: персист подтверждения объединения виртуальных карточек Smart Wave
+- [023_course_pace](migrations/023_course_pace.md) — course_pace_seconds в slicer_settings: «шаг курса» умной очереди v2 «Темп курсов»
+- [024_course_pace_default_600](migrations/024_course_pace_default_600.md) — Дефолт шага курса 600 сек + семантика «окно уступки»
+- [025_course_pace_check](migrations/025_course_pace_check.md) — CHECK 10..3600 на course_pace_seconds (+ кламп существующих значений)
 
 ## Связанные документы
 - [mappings.md](mappings.md) — TypeScript interface ↔ DB column маппинг

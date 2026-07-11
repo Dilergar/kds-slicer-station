@@ -37,6 +37,40 @@ const KITCHEN_STORAGE_UUIDS = [
 ];
 
 /**
+ * Ключ «гостя» (визита) по номеру стола и чеку — для контекста «замороженных»
+ * курсов умной очереди: стол → `t<номер>`, позиция без стола (доставка,
+ * самовывоз) → чек чужой KDS `o<suuid>`.
+ *
+ * ⚠️ КОНТРАКТ ФРОНТ↔БЭК: формат обязан байт-в-байт совпадать с waveKeyFor()
+ * в smartQueue.ts — по этим строкам фронт совмещает visit_completed_dish_ids /
+ * visit_started_at с активными позициями доски. Менять только синхронно.
+ *
+ * @param tableNumber Номер стола (0 = стола нет)
+ * @param orderId suuid чека (docm2_orders.suuid)
+ * @returns Строковый ключ гостя
+ */
+const visitKeyFor = (tableNumber: number, orderId: string): string =>
+  tableNumber > 0 ? `t${tableNumber}` : `o${orderId}`;
+
+/**
+ * SQL-фрагмент: реальные quantity_stack / table_stack позиции чека из чужих
+ * таблиц (требует в запросе алиасы `items` = docm2tabl1_items и `tables` =
+ * ctlg13_halltables). Используется во ВСЕХ INSERT ... SELECT, создающих
+ * теневую строку slicer_order_state: при INSERT свежей строки нельзя
+ * полагаться на DEFAULT'ы колонок ('[1]' / '[[]]') — они перетёрли бы
+ * реальные количество и стол, которые GET /api/orders собирает JOIN'ом
+ * (ловушка, которую по очереди ловили defrost-start и merge-ack).
+ * Единая константа — чтобы правка формы стеков не разъезжалась по копиям.
+ */
+const REAL_STACKS_SQL = `
+          jsonb_build_array(items.docm2tabl1_quantity),
+          CASE
+            WHEN tables.ctlg13_tablenumber IS NOT NULL
+              THEN jsonb_build_array(jsonb_build_array(tables.ctlg13_tablenumber))
+            ELSE '[[]]'::jsonb
+          END`;
+
+/**
  * GET /api/orders — Получить активные заказы для KDS-доски нарезчика.
  *
  * Логика:
@@ -117,12 +151,7 @@ router.get('/', async (_req: Request, res: Response) => {
         SELECT
           items.suuid::text,
           'PARKED',
-          jsonb_build_array(items.docm2tabl1_quantity),
-          CASE
-            WHEN tables.ctlg13_tablenumber IS NOT NULL
-              THEN jsonb_build_array(jsonb_build_array(tables.ctlg13_tablenumber))
-            ELSE '[[]]'::jsonb
-          END,
+          ${REAL_STACKS_SQL},
           items.docm2tabl1_ordertime,
           -- unpark_at:
           --   * minutes_of_day NOT NULL → сегодняшняя дата + это число минут от 00:00.
@@ -242,7 +271,10 @@ router.get('/', async (_req: Request, res: Response) => {
         -- длительности в секундах. Если defrost_started_at IS NULL — разморозка
         -- не запускалась. Если NOW() < started + duration → в процессе.
         state.defrost_started_at,
-        state.defrost_duration_seconds
+        state.defrost_duration_seconds,
+        -- Merge-подтверждение виртуальной карточки Smart Wave (миграция 022).
+        -- TRUE = позиция входит в объединённый блок стека, FALSE = отдельный блок.
+        state.merge_ack
       FROM docm2tabl1_items items
       INNER JOIN docm2_orders orders ON orders.suuid = items.owner
       INNER JOIN ctlg15_dishes dishes ON dishes.suuid = items.docm2tabl1_ctlg15_uuid__dish
@@ -277,9 +309,87 @@ router.get('/', async (_req: Request, res: Response) => {
       ORDER BY items.docm2tabl1_ordertime ASC
     `, KITCHEN_STORAGE_UUIDS);
 
+    // ----------------------------------------------------------------------
+    // Контекст визита для «замороженных» курсов умной очереди (2026-07-11).
+    // Номер курса на фронте (smartQueue.buildSmartQueue) считается по ВСЕМ
+    // позициям визита — включая уже отданные нарезчиком. Иначе после «Готово»
+    // следующий курс гостя «повышался» (его виртуальное время падало до
+    // времени пробития), очередь пересобиралась, стол получал все блюда
+    // подряд, а ручка «шаг курса» переставала влиять на живой порядок
+    // (ревью 2026-07-11).
+    //
+    // Отдаём по каждому «гостю» (стол, а для позиций без стола — чек):
+    //   * visit_completed_dish_ids — канонические dish_id уже отданных
+    //     позиций ОТКРЫТЫХ чеков гостя (docm2_closed = false: чек закрыт →
+    //     визит окончен, новая компания за тем же столом начинает с чистых
+    //     курсов);
+    //   * visit_started_at — самое раннее время пробития среди отданных
+    //     позиций (минимум с активными фронт берёт сам).
+    // Дополнительные фильтры (склад, qty, категория) не нужны: строка
+    // COMPLETED в slicer_order_state означает, что позиция уже прошла все
+    // фильтры доски, когда была активной.
+    //
+    // ⚠️ Запрос ограничен чеками, у которых ЕСТЬ живые позиции на доске
+    // (items.owner ∈ чеки основного запроса выше) — по двум причинам
+    // (ревью 2026-07-11):
+    //   1. Корректность: у одного стола может висеть НЕЗАКРЫТЫЙ чек прошлой
+    //      компании (кассир забыл закрыть; на проде у стола бывает несколько
+    //      открытых чеков сразу). Его отданные блюда — НЕ курсы новой
+    //      компании: они завышали номера курсов и ломали «окно уступки»
+    //      (старт визита уезжал в прошлое). Чек без живых позиций на доске
+    //      в контекст визита не попадает.
+    //   2. Стоимость: COMPLETED-строки копятся за весь срок работы модуля и
+    //      не удаляются (их читают отчёты Dashboard) — без ограничения
+    //      запрос сканировал их ВСЕ на каждый polling каждого планшета.
+    // Раздельные чеки одной компании это ограничение не ломает: пока гость
+    // ждёт хоть одно блюдо, его чек «живой» и весь его контекст учитывается.
+    // ----------------------------------------------------------------------
+    const activeOwnerIds = [...new Set(result.rows.map(row => String(row.order_id)))];
+    const visitRes = activeOwnerIds.length === 0
+      // Доска пуста → контекст визитов никому не нужен, запрос пропускаем.
+      ? { rows: [] as any[] }
+      : await pool.query(`
+      SELECT
+        tables.ctlg13_tablenumber AS table_number,
+        items.owner AS order_id,
+        COALESCE(alias.primary_dish_id, items.docm2tabl1_ctlg15_uuid__dish::text) AS dish_id,
+        COALESCE(state.effective_created_at, items.docm2tabl1_ordertime) AS created_at
+      FROM slicer_order_state state
+      INNER JOIN docm2tabl1_items items ON items.suuid::text = state.order_item_id
+      INNER JOIN docm2_orders orders ON orders.suuid = items.owner
+      LEFT JOIN slicer_dish_aliases alias
+        ON alias.alias_dish_id = items.docm2tabl1_ctlg15_uuid__dish::text
+      LEFT JOIN ctlg13_halltables tables ON tables.suuid = orders.docm2_ctlg13_uuid__halltable
+      WHERE state.status = 'COMPLETED'
+        AND orders.docm2_closed = false
+        -- Только чеки, у которых прямо сейчас есть живые позиции на доске
+        -- (см. коммент выше: отсекает зависшие чеки прошлых компаний и
+        -- ограничивает скан накопленных COMPLETED-строк).
+        AND items.owner::text = ANY($1::text[])
+    `, [activeOwnerIds]);
+
+    // Группировка контекста по гостю. Ключи — visitKeyFor (единый контракт
+    // с waveKeyFor на фронте): стол → `t<номер>`, без стола → чек `o<suuid>`.
+    const visitCtx = new Map<string, { dishIds: Set<string>; startedAt: number }>();
+    for (const row of visitRes.rows) {
+      const tn = row.table_number ? Number(row.table_number) : 0;
+      const key = visitKeyFor(tn, String(row.order_id));
+      const at = row.created_at ? new Date(row.created_at).getTime() : Date.now();
+      let ctx = visitCtx.get(key);
+      if (!ctx) {
+        ctx = { dishIds: new Set(), startedAt: at };
+        visitCtx.set(key, ctx);
+      }
+      ctx.dishIds.add(String(row.dish_id));
+      ctx.startedAt = Math.min(ctx.startedAt, at);
+    }
+
     // Маппинг строк БД → объекты Order для фронтенда
     const orders = result.rows.map(row => {
       const tableNumber = row.table_number ? Number(row.table_number) : 0;
+      // Контекст визита этого гостя (см. блок выше) — одинаков для всех
+      // заказов одного стола/чека.
+      const visit = visitCtx.get(visitKeyFor(tableNumber, String(row.order_id)));
       const quantity = Number(row.quantity) || 1;
       const orderTime = row.order_time ? new Date(row.order_time).getTime() : Date.now();
       // Вариант Б (миграция 019): точка отсчёта таймера И сортировки — это
@@ -318,6 +428,10 @@ router.get('/', async (_req: Request, res: Response) => {
       return {
         id: row.item_id,
         dish_id: row.dish_id,
+        // Чек чужой KDS (docm2_orders.suuid). Нужен фронту для группировки
+        // «волн» у заказов без стола (доставка/самовывоз): один чек = один
+        // гость, независимые чеки не должны сцепляться в одну волну.
+        source_order_id: row.order_id,
         quantity_stack,
         table_stack,
         created_at: effectiveCreatedAt,
@@ -335,7 +449,14 @@ router.get('/', async (_req: Request, res: Response) => {
           : null,
         defrost_duration_seconds: row.defrost_duration_seconds != null
           ? Number(row.defrost_duration_seconds)
-          : null
+          : null,
+        // Merge-подтверждение Smart Wave (миграция 022). Нет строки state → false.
+        merge_ack: row.merge_ack === true,
+        // «Замороженные» курсы (2026-07-11): уже отданные позиции визита
+        // гостя + самое раннее время пробития среди них. Пустой массив /
+        // undefined = в визите ещё ничего не отдавали.
+        visit_completed_dish_ids: visit ? [...visit.dishIds] : [],
+        visit_started_at: visit ? visit.startedAt : undefined
       };
     });
 
@@ -614,8 +735,8 @@ router.post('/:id/restore', async (req: Request, res: Response) => {
 
     await pool.query(
       `INSERT INTO slicer_order_state
-         (order_item_id, status, quantity_stack, table_stack, finished_at, parked_at, unpark_at, was_parked, defrost_started_at, defrost_duration_seconds, accumulated_time_ms, effective_created_at, parked_by_auto)
-       VALUES ($1, 'ACTIVE', $2, $3, NULL, NULL, NULL, false, NULL, NULL, 0, NULL, FALSE)
+         (order_item_id, status, quantity_stack, table_stack, finished_at, parked_at, unpark_at, was_parked, defrost_started_at, defrost_duration_seconds, accumulated_time_ms, effective_created_at, parked_by_auto, merge_ack)
+       VALUES ($1, 'ACTIVE', $2, $3, NULL, NULL, NULL, false, NULL, NULL, 0, NULL, FALSE, FALSE)
        ON CONFLICT (order_item_id) DO UPDATE SET
          status                   = 'ACTIVE',
          quantity_stack           = $2,
@@ -632,6 +753,9 @@ router.post('/:id/restore', async (req: Request, res: Response) => {
          accumulated_time_ms      = 0,
          effective_created_at     = NULL,
          parked_by_auto           = FALSE,
+         -- Merge-подтверждение (миграция 022) тоже сбрасываем: восстановленная
+         -- позиция должна заново пройти визуальное объединение на доске.
+         merge_ack                = FALSE,
          updated_at               = NOW()`,
       [id, JSON.stringify(quantityStack), JSON.stringify(tableStack)]
     );
@@ -639,6 +763,69 @@ router.post('/:id/restore', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[Orders] Ошибка restore:', err);
     res.status(500).json({ error: 'Ошибка восстановления заказа' });
+  }
+});
+
+/**
+ * POST /api/orders/merge-ack — Подтвердить объединение виртуальной карточки
+ * Smart Wave (миграция 022).
+ *
+ * Body: `{ orderItemIds: string[] }` — все реальные source-заказы текущей
+ * виртуальной карточки. Каждому проставляется merge_ack=TRUE.
+ *
+ * Семантика рендера на фронте: source-ы с merge_ack=TRUE рисуются одним
+ * объединённым блоком стека, каждый новый (FALSE) — отдельным блоком
+ * («2 + 1»), и карточка снова требует Merge. Так «подтверждение» переживает
+ * F5/переключение вкладок и синхронно между несколькими планшетами.
+ *
+ * UPSERT важен: у позиции может ещё не быть строки в slicer_order_state.
+ * При INSERT свежей строки нельзя полагаться на DEFAULT'ы quantity_stack /
+ * table_stack ('[1]' / '[[]]') — они перетёрли бы реальные количество и стол,
+ * которые GET /api/orders собирает JOIN'ом (та же ловушка, что была в
+ * defrost-start). Поэтому INSERT идёт через SELECT с реальными значениями.
+ */
+router.post('/merge-ack', async (req: Request, res: Response) => {
+  try {
+    const { orderItemIds } = req.body as { orderItemIds?: string[] };
+    if (!Array.isArray(orderItemIds) || orderItemIds.length === 0) {
+      res.status(400).json({ error: 'orderItemIds должен быть непустым массивом' });
+      return;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const itemId of orderItemIds) {
+        await client.query(
+          `INSERT INTO slicer_order_state
+             (order_item_id, status, quantity_stack, table_stack, merge_ack)
+           SELECT
+             items.suuid::text,
+             'ACTIVE',
+             ${REAL_STACKS_SQL},
+             TRUE
+           FROM docm2tabl1_items items
+           LEFT JOIN docm2_orders orders ON orders.suuid = items.owner
+           LEFT JOIN ctlg13_halltables tables ON tables.suuid = orders.docm2_ctlg13_uuid__halltable
+           WHERE items.suuid::text = $1
+           ON CONFLICT (order_item_id) DO UPDATE SET
+             merge_ack  = TRUE,
+             updated_at = NOW()`,
+          [itemId]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    res.json({ acked: true, items: orderItemIds.length });
+  } catch (err) {
+    console.error('[Orders] Ошибка merge-ack:', err);
+    res.status(500).json({ error: 'Ошибка подтверждения объединения' });
   }
 });
 
@@ -716,12 +903,7 @@ router.post('/:id/defrost-start', async (req: Request, res: Response) => {
            SELECT
              items.suuid::text,
              'ACTIVE',
-             jsonb_build_array(items.docm2tabl1_quantity),
-             CASE
-               WHEN tables.ctlg13_tablenumber IS NOT NULL
-                 THEN jsonb_build_array(jsonb_build_array(tables.ctlg13_tablenumber))
-               ELSE '[[]]'::jsonb
-             END,
+             ${REAL_STACKS_SQL},
              NOW(),
              -- Per-dish длительность: alias→primary→slicer_dish_defrost.
              -- Фолбэк 15 мин если записи нет (защита на случай рассинхрона UI).

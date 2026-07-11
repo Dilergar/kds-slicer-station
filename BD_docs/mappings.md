@@ -19,6 +19,7 @@
 | `Order.parked_by_auto` | `slicer_order_state` | `parked_by_auto` | BOOLEAN | Текущая парковка автоматическая (миграция 018) |
 | `Order.defrost_started_at` | `slicer_order_state` | `defrost_started_at` | TIMESTAMPTZ | Момент клика ❄️ (миграция 016) |
 | `Order.defrost_duration_seconds` | `slicer_order_state` | `defrost_duration_seconds` | INT | Snapshot duration в секундах (миграция 016) |
+| `Order.merge_ack` | `slicer_order_state` | `merge_ack` | BOOLEAN | Подтверждение объединения виртуальной карточки Smart Wave (миграция 022). NOT NULL DEFAULT FALSE, сбрасывается при `/restore` |
 | Номер стола | `ctlg13_halltables` | `ctlg13_tablenumber` | NUMERIC | JOIN через docm2_orders.docm2_ctlg13_uuid__halltable |
 
 ## Dish (types.ts) ↔ ctlg15_dishes + slicer_recipes + slicer_categories + slicer_dish_aliases
@@ -30,11 +31,11 @@
 | `Dish.code` | `ctlg15_dishes` | `code` | TEXT | Код блюда (например `Д163`), используется в RecipeEditor |
 | `Dish.recipe_source_id` | `slicer_dish_aliases` | `COALESCE(alias.primary_dish_id, d.suuid::text)` | VARCHAR | Если блюдо — алиас, это primary_dish_id, иначе сам suuid |
 | `Dish.category_ids` | `slicer_dish_categories` | `array_agg(category_id) GROUP BY dish_id` | UUID[] | Ручное назначение через UI «Рецепты» (`PUT /api/dishes/:dishId/categories`). Если строк нет → `[]` → блюдо в секции «Без категории». `ctlg15_ctlg38_uuid__goodcategory` **не используется**: маппинга на slicer_categories нет |
-| `Dish.priority_flag` | — | — | — | Хранится в slicer_order_state или определяется из меню |
+| `Dish.priority_flag` | `slicer_dish_priority` | `priority_flag` | INTEGER | 1=NORMAL, 3=ULTRA; нет записи = NORMAL через COALESCE (миграция 013) |
 | `Dish.grams_per_portion` | — | — | — | Вычисляется из slicer_recipes SUM(quantity_per_portion) по recipe_source_id |
 | `Dish.ingredients` | `slicer_recipes` | `ingredient_id` + `quantity_per_portion` | UUID + NUMERIC | JOIN по `recipe_source_id` (резолв алиасов) |
-| `Dish.image_url` | — | — | — | Хранится локально или в slicer_recipes |
-| `Dish.is_stopped` | `rgst3_dishstoplist` | наличие записи | — | Если есть запись = на стопе |
+| `Dish.image_url` | `slicer_dish_images` | `image_path` | TEXT | Путь к файлу в `server/public/images/dishes/`, отдаётся как `/images/dishes/...` (миграция 008) |
+| `Dish.is_stopped` | `rgst3_dishstoplist` + `slicer_dish_stoplist` | UNION двух источников | — | Стоп из основной KDS **или** из модуля (MANUAL/CASCADE, миграция 005); причина из slicer имеет приоритет |
 
 ## Алиасы блюд (DishAlias) ↔ slicer_dish_aliases
 
@@ -53,7 +54,7 @@
 | `id` | `id` | UUID | gen_random_uuid() |
 | `name` | `name` | VARCHAR(255) | Название |
 | `parentId` | `parent_id` | UUID | FK self-reference |
-| `imageUrl` | `image_url` | TEXT | URL или Base64 |
+| `imageUrl` | `image_url` | TEXT | Путь к файлу на диске (`/images/ingredients/...`); Base64 удалён миграцией 009 |
 | `unitType` | `unit_type` | VARCHAR(10) | 'kg' \| 'piece' |
 | `pieceWeightGrams` | `piece_weight_grams` | NUMERIC(10,2) | Вес 1 штуки в граммах |
 | `is_stopped` | `is_stopped` | BOOLEAN | На стопе? |
@@ -78,7 +79,8 @@
 | `aggregationWindowMinutes` | `aggregation_window_minutes` | INT | Default: 5 |
 | `historyRetentionMinutes` | `history_retention_minutes` | INT | Default: 15 |
 | `activePriorityRules` | `active_priority_rules` | JSONB | `["ULTRA","COURSE_FIFO"]` |
-| `courseWindowSeconds` | `course_window_seconds` | INT | Default: 10 |
+| `courseWindowSeconds` | `course_window_seconds` | INT | Default: 10. Окно COURSE_FIFO (только стандартный режим) |
+| `coursePaceSeconds` | `course_pace_seconds` | INT | Default: 600, CHECK 10..3600 (миграции 023/024/025). «Шаг курса» умной очереди «Темп курсов» — окно уступки поздних курсов |
 | `restaurantOpenTime` | `restaurant_open_time` | VARCHAR(5) | "12:00" |
 | `restaurantCloseTime` | `restaurant_close_time` | VARCHAR(5) | "23:59" |
 | `excludedDates` | `excluded_dates` | JSONB | `["2026-04-09"]` |

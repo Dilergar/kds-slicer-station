@@ -237,11 +237,23 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                             })()}
                         </h2>
 
-                        {/* Table Numbers */}
-                        {order.table_stack && order.table_stack.length > 0 && (
+                        {/* Table Numbers.
+                            Фильтруем фантомный «стол 0» (заказы без стола:
+                            доставка/самовывоз — backend кладёт [[0]] как
+                            плейсхолдер выравнивания блоков) и дедуплицируем
+                            номера внутри блока (после merge порций одного
+                            стола блок содержал [5,5,5] — ревью 2026-07-11).
+                            Блоки, оставшиеся пустыми, пропускаем; если
+                            реальных столов нет вообще — строку не рисуем
+                            (симметрично мини-карточкам DefrostRow). */}
+                        {(() => {
+                            const visibleTableBlocks = (order.table_stack || [])
+                                .map(tables => [...new Set(tables.filter(num => num > 0))])
+                                .filter(tables => tables.length > 0);
+                            return visibleTableBlocks.length > 0 && (
                             <div className="text-xs mt-1 font-medium flex flex-wrap gap-1 items-center">
                                 <span className="text-slate-400 mr-1">столы:</span>
-                                {order.table_stack.map((tables, blockIdx) => (
+                                {visibleTableBlocks.map((tables, blockIdx) => (
                                     <React.Fragment key={blockIdx}>
                                         {blockIdx > 0 && <span className="text-slate-500 mx-0.5">+</span>}
                                         {tables.map((num, tIdx) => {
@@ -267,7 +279,8 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                     </React.Fragment>
                                 ))}
                             </div>
-                        )}
+                            );
+                        })()}
                     </div>
 
                     <div className="flex flex-col items-end shrink-0 gap-1">

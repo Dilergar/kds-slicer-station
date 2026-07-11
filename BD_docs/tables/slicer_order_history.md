@@ -112,4 +112,4 @@ ORDER BY completed_at DESC;
 ## API эндпоинты
 - `GET /api/history/orders?from=&to=` — получить историю
 - `DELETE /api/history/orders/:id` — удалить (при restore)
-- `GET /api/dashboard/speed-kpi?from=&to=` — агрегированные KPI
+- `GET /api/history/dashboard/speed-kpi?from=&to=` — агрегированные KPI

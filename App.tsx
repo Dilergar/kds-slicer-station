@@ -60,16 +60,23 @@ function App() {
   const [categories, setCategories] = useState<Category[]>([]);
   const dishMap = useMemo(() => new Map(dishes.map(d => [d.id, d])), [dishes]);
 
-  // Флаг: настройки реально подтянулись из БД. Нужен чтобы не флэшить
-  // захардкоженные дефолты в UI, пока идёт fetchSettings().
+  // Флаг: настройки реально подтянулись из БД. Пока false — НИ ОДИН экран
+  // не рендерится (глобальный гейт ниже): раньше гейт закрывал только
+  // ADMIN/DASHBOARD, и KDS-доска первые мгновения строила очередь по
+  // захардкоженным дефолтам, а не по значениям из slicer_settings.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   // === Системные настройки (загружаются из slicer_settings) ===
+  // Начальные значения ИНЕРТНЫ: до settingsLoaded=true ни один экран не
+  // рендерится, поэтому эти числа ни на что не влияют. Истина всегда в БД —
+  // в частности, у окна COURSE_FIFO нет «дефолта», используется то, что
+  // указано в UI-настройках (см. CLAUDE.md, паттерн 8).
   const [settings, setSettings] = useState<SystemSettings>({
     aggregationWindowMinutes: 5,
     historyRetentionMinutes: 15,
     activePriorityRules: ['ULTRA', 'COURSE_FIFO'],
     courseWindowSeconds: 10,
+    coursePaceSeconds: 600,
     restaurantOpenTime: '12:00',
     restaurantCloseTime: '23:59',
     excludedDates: [],
@@ -120,6 +127,11 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Флаг «эффект ещё жив» — защита от setState после размонтирования
+    // (StrictMode в dev монтирует эффект дважды).
+    let alive = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
     const loadData = async () => {
       try {
         const [cats, sets, dsh] = await Promise.all([
@@ -127,15 +139,27 @@ function App() {
           fetchSettings(),
           fetchDishes()
         ]);
+        if (!alive) return;
         setCategories(cats);
         setSettings(sets);
         setSettingsLoaded(true);
         setDishes(dsh);
       } catch (err) {
         console.error('[App] Ошибка загрузки данных:', err);
+        // Кухонный планшет: backend мог ещё не подняться. Повторяем каждые
+        // 3 сек, пока не получим настройки — без них экраны не рендерятся
+        // (глобальный гейт), очередь не должна строиться по дефолтам.
+        if (alive) {
+          retryTimer = setTimeout(loadData, 3000);
+        }
       }
     };
     loadData();
+
+    return () => {
+      alive = false;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
   }, []);
 
   // === CUSTOM HOOKS ===
@@ -169,6 +193,7 @@ function App() {
     orders,
     orderHistory,
     handleStackMerge,
+    handleMergeAck,
     handleCompleteOrder,
     handlePartialComplete,
     handleCancelOrder,
@@ -191,6 +216,20 @@ function App() {
   // поэтому F5 не покажет LoginScreen если сессия валидна.
   if (!user) {
     return <LoginScreen onLogin={login} />;
+  }
+
+  // === GATE: настройки ещё не загрузились из БД ===
+  // Ни один экран не рендерится по хардкод-дефолтам: у окна COURSE_FIFO и
+  // прочих настроек нет «дефолта», истина — только slicer_settings. При
+  // недоступном backend loadData ретраит каждые 3 сек (см. useEffect выше).
+  if (!settingsLoaded) {
+    return (
+      <div className="h-screen w-full bg-kds-bg flex flex-col items-center justify-center text-slate-400 gap-3">
+        <div className="animate-pulse text-lg font-bold text-white">KDS Slicer Station</div>
+        <div className="text-sm">Загрузка настроек из базы данных…</div>
+        <div className="text-xs text-slate-600">Если надпись висит долго — проверьте, запущен ли backend (порт 3001)</div>
+      </div>
+    );
   }
 
   // === GATE: залогинен, но роль не даёт доступа ни к одной вкладке ===
@@ -248,6 +287,7 @@ function App() {
             ingredients={ingredients}
             onCompleteOrder={handleCompleteOrder}
             onStackMerge={handleStackMerge}
+            onMergeAck={handleMergeAck}
             onPreviewImage={setPreviewImage}
             onParkTable={handleParkTable}
             onUnparkTable={handleUnparkNow}
@@ -272,7 +312,9 @@ function App() {
             onPreviewImage={setPreviewImage}
           />
         )}
-        {currentView === 'ADMIN' && settingsLoaded && (
+        {/* settingsLoaded здесь проверять не нужно — глобальный гейт выше
+            гарантирует, что до загрузки настроек не рендерится ничего. */}
+        {currentView === 'ADMIN' && (
           <AdminPanel
             categories={categories}
             dishes={dishes}
@@ -285,10 +327,7 @@ function App() {
             onRefreshDishes={reloadDishes}
           />
         )}
-        {currentView === 'ADMIN' && !settingsLoaded && (
-          <div className="p-8 text-gray-400">Загрузка настроек…</div>
-        )}
-        {currentView === 'DASHBOARD' && settingsLoaded && (
+        {currentView === 'DASHBOARD' && (
           <Dashboard
             categories={categories}
             ingredients={ingredients}

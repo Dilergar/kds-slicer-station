@@ -21,7 +21,7 @@
 
 ```bash
 cd server
-psql -U postgres -d arclient -f migrations/003_dish_categories.sql
+psql -U postgres -d arclient -f migrations/004_dish_categories.sql
 ```
 
 Ожидаемый вывод:

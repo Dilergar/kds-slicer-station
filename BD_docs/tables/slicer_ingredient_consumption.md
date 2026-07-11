@@ -74,4 +74,4 @@ ORDER BY parent_name, total_grams DESC;
 ```
 
 ## API эндпоинты
-- `GET /api/dashboard/ingredient-usage?from=&to=` — агрегированный расход
+- `GET /api/history/dashboard/ingredient-usage?from=&to=` — агрегированный расход

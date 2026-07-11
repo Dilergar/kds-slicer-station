@@ -9,6 +9,7 @@ import {
   parkOrder,
   unparkOrder,
   mergeOrder,
+  mergeAckOrders,
   fetchOrderHistory,
   deleteOrderHistory,
   restoreOrder,
@@ -44,6 +45,13 @@ export const useOrders = ({
   // Ref для предотвращения одновременных polling-запросов
   const pollingRef = useRef(false);
 
+  // Id заказов, которым merge_ack проставлен оптимистично и ещё НЕ
+  // подтверждён данными с сервера. Пока id здесь — polling не может откатить
+  // флаг: GET, стартовавший до коммита POST /merge-ack, приносил снапшот с
+  // merge_ack=false, карточка мигала обратно в «1 + 1» и «Готово»
+  // переблокировалось до следующего опроса (ревью 2026-07-11).
+  const pendingMergeAckRef = useRef<Set<string>>(new Set());
+
   /**
    * Загрузка активных заказов из БД.
    * Вызывается при монтировании и каждые 4 секунды (polling).
@@ -55,7 +63,20 @@ export const useOrders = ({
 
     try {
       const data = await fetchOrders();
-      setOrders(data);
+      // Оверлей незакоммиченных merge-ack: сервер подтвердил → снимаем из
+      // pending; заказ исчез с доски → тоже снимаем (Set не растёт); всё
+      // остальное накладываем поверх серверного снапшота.
+      const pending = pendingMergeAckRef.current;
+      if (pending.size > 0) {
+        const boardIds = new Set(data.map(o => o.id));
+        for (const id of [...pending]) {
+          const row = data.find(o => o.id === id);
+          if ((row && row.merge_ack) || !boardIds.has(id)) pending.delete(id);
+        }
+      }
+      setOrders(pending.size === 0
+        ? data
+        : data.map(o => pending.has(o.id) ? { ...o, merge_ack: true } : o));
     } catch (err) {
       console.error('[useOrders] Ошибка загрузки заказов:', err);
     } finally {
@@ -110,6 +131,35 @@ export const useOrders = ({
   }, [orders, loadOrders]);
 
   /**
+   * Подтверждение объединения виртуальной карточки Smart Wave (миграция 022).
+   * Проставляет merge_ack=TRUE всем реальным source-заказам карточки:
+   * оптимистично в локальном стейте (мгновенный «merged» вид) + персист в БД.
+   * В отличие от handleStackMerge не трогает quantity_stack/table_stack —
+   * реальные позиции остаются нетронутыми, меняется только флаг подтверждения.
+   */
+  const handleMergeAck = useCallback(async (sourceOrderIds: string[]) => {
+    if (!sourceOrderIds || sourceOrderIds.length === 0) return;
+
+    // Оптимистичное обновление: следующий рендер соберёт все acked source-ы
+    // в один блок стека виртуальной карточки. Одновременно помечаем id в
+    // pendingMergeAckRef — polling не сможет откатить флаг, пока сервер не
+    // подтвердит запись (см. loadOrders).
+    for (const id of sourceOrderIds) pendingMergeAckRef.current.add(id);
+    setOrders(prev => prev.map(o =>
+      sourceOrderIds.includes(o.id) ? { ...o, merge_ack: true } : o
+    ));
+
+    try {
+      await mergeAckOrders(sourceOrderIds);
+    } catch (err) {
+      console.error('[useOrders] Ошибка merge-ack:', err);
+      // Запись не удалась — оверлей больше не защищаем, откатываемся к БД.
+      for (const id of sourceOrderIds) pendingMergeAckRef.current.delete(id);
+      await loadOrders(); // Откатываем к реальным данным
+    }
+  }, [loadOrders]);
+
+  /**
    * Полное завершение заказа.
    * Отправляет на backend: обновляет docm2tabl1_cooked, создаёт историю и расход.
    */
@@ -125,6 +175,12 @@ export const useOrders = ({
     const now = Date.now();
     // Вариант Б: accumulated_time_ms теперь «время парковок», вычитаем из общего.
     const prepTimeMs = Math.max(0, (now - order.created_at) - (order.accumulated_time_ms || 0));
+
+    // Завершённая позиция больше не нуждается в merge-ack-оверлее. Без этой
+    // строки быстрое «Готово → Вернуть» в одно окно поллинга оставляло id в
+    // pendingMergeAckRef, и оверлей навязывал merge_ack=true вопреки
+    // серверному сбросу в /restore (позиция обязана заново пройти Merge).
+    pendingMergeAckRef.current.delete(orderId);
 
     // Оптимистичное удаление из UI
     setOrders(prev => prev.filter(o => o.id !== orderId));
@@ -243,6 +299,11 @@ export const useOrders = ({
     if (!entry || !entry.snapshot) return;
 
     const restoredOrder = entry.snapshot;
+
+    // /restore на бэке сбрасывает merge_ack=FALSE («чистый лист») — снимаем
+    // id из pending-оверлея, чтобы тот не перекрыл серверный сброс на
+    // ближайшем поллинге (см. комментарий у pendingMergeAckRef).
+    pendingMergeAckRef.current.delete(restoredOrder.id);
 
     // Вычисляем финальный стек ДО оптимистичного обновления, чтобы отправить то же самое на backend.
     const existing = orders.find(o => o.id === restoredOrder.id);
@@ -545,6 +606,7 @@ export const useOrders = ({
     setOrderHistory,
     loading,
     handleStackMerge,
+    handleMergeAck,
     handleCompleteOrder,
     handlePartialComplete,
     handleCancelOrder,

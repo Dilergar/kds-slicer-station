@@ -4,16 +4,25 @@
  * Главный экран нарезчика: карточки заказов, парковка, история.
  *
  * Режимы очереди:
- * 1. Smart Wave Aggregation (ON по умолчанию):
+ * 1. Smart Wave Aggregation — «Волновая (Умная)» (ON по умолчанию):
  *    - Вызывает buildSmartQueue() из smartQueue.ts
  *    - SmartQueueGroup[] → виртуальные Order[] для OrderCard
- *    - Стабильный virtual ID: smart_${dishId}_${sourceOrderIds}
+ *    - Virtual ID: база `smart_${dishId}_${wasDefrosted}` + порядковый суффикс
+ *      для повторных позиций того же блюда (одно блюдо может законно занять
+ *      2+ места в очереди — id обязаны быть уникальными)
  *    - Stack-структура сохраняется (каждый source = блок) → показывает "1+1"
- *    - mergedVirtualIds: локальный state для трекинга merged виртуальных заказов
+ *    - Merge виртуальной карточки = merge_ack=TRUE у source-заказов в БД
+ *      (миграция 022), переживает F5 и синхронен между планшетами
  *    - Done/PartDone/Merge резолвятся через smartQueueMappingRef
  *
- * 2. Стандартная сортировка (Smart Wave OFF):
- *    - ULTRA → COURSE_FIFO по sort_index категории → FIFO по created_at
+ * 2. «Окно Агрегации» — режим скорости (enableAggregation, реализован
+ *    2026-07-06): buildSpeedQueue() — без порядка категорий, безлимитное
+ *    слияние одинаковых блюд, строгий FIFO по первому заказу. Пайплайн
+ *    виртуальных карточек тот же, что у умной.
+ *
+ * 3. Стандартная сортировка (оба режима OFF):
+ *    - ULTRA → COURSE_FIFO по sort_index категории → FIFO по created_at,
+ *      каждая позиция чека — отдельная карточка
  */
 
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
@@ -23,7 +32,8 @@ import { PartialCompletionModal } from './PartialCompletionModal';
 import { OrderCard } from './OrderCard';
 import { DefrostRow } from './DefrostRow';
 import { DefrostModal } from './DefrostModal';
-import { buildSmartQueue, isDefrostActive } from '../smartQueue';
+import { buildSmartQueue, buildSpeedQueue, isDefrostActive, PersistentVtEntry } from '../smartQueue';
+import { playDefrostBeep } from '../utils';
 
 interface SlicerStationProps {
   orders: Order[];
@@ -32,6 +42,12 @@ interface SlicerStationProps {
   ingredients: IngredientBase[];
   onCompleteOrder: (orderId: string) => void;
   onStackMerge: (orderId: string) => void;
+  /**
+   * Merge виртуальной карточки Smart Wave (миграция 022): проставить
+   * merge_ack=TRUE всем реальным source-заказам карточки. Персистится в БД —
+   * переживает F5/переключение вкладок, синхронно между планшетами.
+   */
+  onMergeAck?: (sourceOrderIds: string[]) => void;
   onPreviewImage: (url: string) => void;
   onParkTable: (tableNumber: number, returnTimestamp: number) => void;
   onUnparkTable: (tableNumber: number) => void;
@@ -56,6 +72,7 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   ingredients,
   onCompleteOrder,
   onStackMerge,
+  onMergeAck,
   onPreviewImage,
   onParkTable,
   onUnparkTable,
@@ -101,18 +118,6 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   // Ключ: virtualOrderId, Значение: { sourceOrderIds, itemCountByOrder }
   const smartQueueMappingRef = useRef<Map<string, { sourceOrderIds: string[], itemCountByOrder: Map<string, number> }>>(new Map());
 
-  // === Трекинг merge-состояния виртуальных карточек ===
-  // Ключ: virtualId (стабильный по `dishId + wasDefrosted`, НЕ меняется когда
-  // приходят новые source-ы того же блюда).
-  // Значение: Set source_order_id, которые зафиксированы как «смёрженные».
-  //
-  // Поведение: когда нарезчик жмёт Merge, мы запоминаем ТЕКУЩИЙ список
-  // source-ов как merged. При ребилде эти source-ы отрисуются одним блоком
-  // с суммарным qty, а новые source-ы (пришедшие позже) — отдельными блоками.
-  // Пример: merge 1+1=2, потом пришёл ещё заказ → показываем «2 + 1».
-  // Новый Merge перезапишет Set — всё снова в один блок.
-  const [mergedSources, setMergedSources] = useState<Map<string, Set<string>>>(new Map());
-
   // === «В работе» — локальный визуальный claim карточки ===
   // Чисто UI-состояние для координации двух нарезчиков за одним планшетом:
   // тап по карточке → неоновая рамка + 🔪 у количества порции. Повторный
@@ -120,14 +125,79 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   // только сигнал «эту уже кто-то взял, не трогай».
   const [inWorkIds, setInWorkIds] = useState<Set<string>>(new Set());
 
-  const toggleInWork = useCallback((orderId: string) => {
+  /**
+   * Якорный id карточки для клейма «В работе». Виртуальный id нестабилен:
+   * его порядковый суффикс (`_1`, `_2`) пересчитывается позиционно на каждой
+   * ежесекундной пересборке, и при перестановке двух карточек одного блюда
+   * метка 🔪 перепрыгивала на чужую карточку (ревью 2026-07-11). Поэтому
+   * клейм ключуем по ПЕРВОМУ source-заказу карточки — он фиксируется в момент
+   * её создания и не меняется, пока карточка живёт. В стандартном режиме
+   * (без маппинга) id уже реальный — он и есть якорь.
+   */
+  const claimAnchorOf = useCallback((cardId: string): string => {
+    const mapping = smartQueueMappingRef.current.get(cardId);
+    return mapping?.sourceOrderIds[0] ?? cardId;
+  }, []);
+
+  const toggleInWork = useCallback((cardId: string) => {
+    const anchor = claimAnchorOf(cardId);
     setInWorkIds(prev => {
       const next = new Set(prev);
-      if (next.has(orderId)) next.delete(orderId);
-      else next.add(orderId);
+      if (next.has(anchor)) next.delete(anchor);
+      else next.add(anchor);
       return next;
     });
-  }, []);
+  }, [claimAnchorOf]);
+
+  // === Звук готовности разморозки ===
+  // Трекинг переходов «таймер идёт → таймер истёк» по СЫРЫМ заказам.
+  // Ключ = `${order.id}_${defrost_started_at}`: перезапуск разморозки даёт
+  // новый ключ, значение — последнее увиденное состояние таймера.
+  //
+  // Beep играет ТОЛЬКО на живом переходе active→expired. Ключ, впервые
+  // увиденный уже истёкшим, не звучит — это отсекает ложные сигналы при
+  // F5 (старые размороженные позиции) и при ручном «Разморозилась»
+  // (бэкдейт started_at сразу создаёт «истёкший» ключ).
+  //
+  // Раньше звук жил в DefrostRow и не срабатывал никогда: туда попадали
+  // только АКТИВНЫЕ группы, истёкшая исчезала из списка тем же тиком.
+  const defrostSoundStateRef = useRef<Map<string, 'active' | 'expired'>>(new Map());
+
+  useEffect(() => {
+    const enabled = settings?.enableDefrostSound !== false;
+    const seen = defrostSoundStateRef.current;
+    const currentKeys = new Set<string>();
+    // Считаем переходы active→expired за ЭТОТ тик, а звук играем ОДИН раз
+    // после цикла. Smart Wave «вспышка» (клик ❄️ на объединённой карточке =
+    // N реальных позиций с одним started_at) истекает вся разом — раньше
+    // playDefrostBeep вызывался N раз внахлёст, создавая N AudioContext
+    // (тройной/искажённый сигнал, ревью 2026-07-11).
+    let expiredTransitions = 0;
+
+    for (const o of orders) {
+      if (o.defrost_started_at == null) continue;
+      const key = `${o.id}_${o.defrost_started_at}`;
+      currentKeys.add(key);
+
+      const endsAt = o.defrost_started_at + (o.defrost_duration_seconds ?? 0) * 1000;
+      const state: 'active' | 'expired' = now >= endsAt ? 'expired' : 'active';
+
+      if (seen.get(key) === 'active' && state === 'expired') {
+        expiredTransitions++;
+      }
+      seen.set(key, state);
+    }
+
+    if (expiredTransitions > 0 && enabled) {
+      playDefrostBeep();
+    }
+
+    // Чистим ключи исчезнувших позиций (завершены/отменены/паркованы) —
+    // иначе Map растёт бесконечно за смену.
+    for (const key of Array.from(seen.keys())) {
+      if (!currentKeys.has(key)) seen.delete(key);
+    }
+  }, [orders, now, settings?.enableDefrostSound]);
 
   // === Разморозка: группировка и маппинг (миграция 016) ===
   // Группируем активно размораживающиеся заказы по (dish_id + started_at с
@@ -240,25 +310,61 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
     return [cardId];
   }, []);
 
+  // Липкий кэш виртуального времени позиций между пересборками очереди
+  // (см. параметр persistentVt в buildSmartQueue): vt по дизайну неизменен
+  // всю жизнь позиции, кэш переживает оптимистичные удаления «Готово»
+  // (окно до следующего polling ~4 сек) и правки категорий посреди смены —
+  // карточки не прыгают. Чистится внутри buildSmartQueue по живым заказам.
+  const vtStickyCacheRef = useRef<Map<string, PersistentVtEntry>>(new Map());
+
   const sortedOrders = useMemo(() => {
     const isSmartAggregation = settings?.enableSmartAggregation === true;
+    // «Окно Агрегации» = режим скорости (реализован 2026-07-06): очередь без
+    // порядка категорий, безлимитное слияние одинаковых блюд, строгий FIFO по
+    // первому заказу. Активен только когда умная выключена — тумблеры
+    // взаимоисключающие (SystemSettingsTab).
+    const isSpeedAggregation = !isSmartAggregation && settings?.enableAggregation === true;
 
     // ====================================================================
-    // SMART AGGREGATION: Волновая симуляция очереди
+    // АГРЕГИРОВАННЫЕ РЕЖИМЫ: умная (волновая) ИЛИ скоростная очередь.
+    // Оба движка возвращают SmartQueueGroup[] → дальше единый пайплайн
+    // виртуальных карточек: merge_ack-стеки, маппинг «Готово» по source-ам,
+    // разморозка — всё работает одинаково в обоих режимах.
     // ====================================================================
-    if (isSmartAggregation) {
-      const courseWindowMs = (settings?.courseWindowSeconds || 300) * 1000;
-      const smartQueue = buildSmartQueue(activeOrders, dishes, categories, courseWindowMs);
+    if (isSmartAggregation || isSpeedAggregation) {
+      // Шаг курса умной очереди v2 («Темп курсов», миграции 023/024) —
+      // окно уступки поздних курсов новым гостям. Фолбэк = дефолту БД (600).
+      const coursePaceMs = (settings?.coursePaceSeconds || 600) * 1000;
+      // `now` передаём явно: очередь пересобирается каждую секунду (см. deps),
+      // поэтому позиция с истёкшим таймером разморозки возвращается в сетку
+      // сразу, а не со следующим polling через ~4 сек (раньше блюдо на эти
+      // секунды пропадало с доски целиком: из DefrostRow уже ушло, в сетке
+      // ещё не появилось).
+      const smartQueue = isSmartAggregation
+        ? buildSmartQueue(activeOrders, dishes, categories, coursePaceMs, now, vtStickyCacheRef.current)
+        : buildSpeedQueue(activeOrders, dishes, categories, now);
 
       // Обновляем маппинг виртуальных ID → реальные source orders
       const newMapping = new Map<string, { sourceOrderIds: string[], itemCountByOrder: Map<string, number> }>();
 
+      // Счётчик повторов ключа `dishId + wasDefrosted` в текущей очереди.
+      // Одно блюдо может ЗАКОННО образовать 2+ позиции (пример: стол A заказал
+      // рыбу; стол B позже заказал суп + рыбу → рыба B идёт отдельной позицией
+      // после супа B, не вклиниваясь). Раньше обе позиции получали ОДИН
+      // virtualId: маппинг перезаписывался, «Готово» на первой карточке
+      // закрывало source-ы второй (чужой стол), дублировались React key.
+      const seenVirtualKeys = new Map<string, number>();
+
       // Конвертируем SmartQueueGroup[] → виртуальные Order[] для совместимости с OrderCard
       const virtualOrders: Order[] = smartQueue.map((group) => {
-        // Стабильный virtual ID: только `dishId + wasDefrosted`. НЕ зависит
-        // от списка source-ов, поэтому при добавлении нового заказа того же
-        // блюда virtualId не меняется, и merge-состояние не теряется.
-        const virtualId = `smart_${group.dishId}_${group.wasDefrosted ? '1' : '0'}`;
+        // База ID стабильна по `dishId + wasDefrosted` — не зависит от списка
+        // source-ов, поэтому новые заказы того же блюда не меняют id карточки.
+        // Повторные вхождения того же блюда получают порядковый суффикс:
+        // первая позиция — старый формат (без суффикса), вторая — `..._1` и т.д.
+        const baseVirtualId = `smart_${group.dishId}_${group.wasDefrosted ? '1' : '0'}`;
+        const occurrence = seenVirtualKeys.get(baseVirtualId) ?? 0;
+        seenVirtualKeys.set(baseVirtualId, occurrence + 1);
+        const virtualId = occurrence === 0 ? baseVirtualId : `${baseVirtualId}_${occurrence}`;
 
         // Считаем сколько порций каждого реального заказа в этой группе
         const itemCountByOrder = new Map<string, number>();
@@ -271,12 +377,14 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           itemCountByOrder,
         });
 
-        // Сборка стека с учётом merge-состояния.
-        // Зафиксированные как merged source-ы → один объединённый блок
-        // (суммарное qty, все столы); новые source-ы (пришли после merge) —
-        // отдельными блоками. Так нарезчик видит "2 + 1" если раньше было
-        // "1+1 merge = 2", а потом пришёл ещё один заказ того же блюда.
-        const mergedSet = mergedSources.get(virtualId);
+        // Сборка стека по персистентному флагу merge_ack (миграция 022).
+        // Подтверждённые source-ы (merge_ack=TRUE в slicer_order_state) →
+        // один объединённый блок (суммарное qty, все столы); новые source-ы
+        // (merge_ack=FALSE) — отдельными блоками. Так нарезчик видит "2 + 1",
+        // если раньше было "1+1 merge = 2", а потом пришёл ещё один заказ
+        // того же блюда. Флаг живёт в БД → merge переживает F5, переключение
+        // вкладок и синхронен между несколькими планшетами (раньше состояние
+        // было в локальном стейте и терялось при любом размонтировании).
         let mergedQty = 0;
         const mergedTables: number[] = [];
         const unmergedBlocks: { qty: number; tables: number[] }[] = [];
@@ -294,7 +402,7 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
             : [];
           const tablesForBlock = sourceTables.length > 0 ? sourceTables : [0];
 
-          if (mergedSet?.has(sourceId)) {
+          if (sourceOrder?.merge_ack) {
             mergedQty += count;
             mergedTables.push(...tablesForBlock);
           } else {
@@ -306,7 +414,9 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
         let tableStack: number[][] = [];
         if (mergedQty > 0) {
           quantityStack.push(mergedQty);
-          tableStack.push(mergedTables);
+          // Дедуп столов объединённого блока: N подтверждённых порций одного
+          // стола давали «столы: 5, 5, 5» вместо «стол 5» (ревью 2026-07-11).
+          tableStack.push([...new Set(mergedTables)]);
         }
         for (const block of unmergedBlocks) {
           quantityStack.push(block.qty);
@@ -382,7 +492,8 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
     }
 
     // ====================================================================
-    // СТАНДАРТНАЯ СОРТИРОВКА (Smart Aggregation выключена)
+    // СТАНДАРТНАЯ СОРТИРОВКА (оба режима агрегации выключены):
+    // каждая позиция чека — отдельная карточка, без объединения.
     // ====================================================================
     smartQueueMappingRef.current = new Map(); // Очистить маппинг
 
@@ -441,7 +552,30 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
 
       return a.created_at - b.created_at;
     });
-  }, [activeOrders, dishes, categories, settings, mergedSources]);
+    // `now` в зависимостях = пересборка раз в секунду. Это дёшево (порций на
+    // доске десятки, не тысячи), карточки и так перерисовываются каждый тик
+    // из-за таймеров, зато исчезают гонки со временем: истёкшая разморозка
+    // возвращается в сетку мгновенно в обоих режимах очереди.
+  }, [activeOrders, dishes, categories, settings, now]);
+
+  // Чистка «В работе»: якоря, исчезнувшие с доски (карточка завершена,
+  // отменена или ушла в разморозку), убираем из набора. Без этого якорь
+  // следующего заказа того же блюда появлялся бы уже помеченным 🔪, хотя
+  // его никто не брал. Сравниваем по якорям (см. claimAnchorOf) — метка
+  // следует за карточкой, а не за нестабильным виртуальным id.
+  useEffect(() => {
+    setInWorkIds(prev => {
+      if (prev.size === 0) return prev;
+      const boardAnchors = new Set(sortedOrders.map(o => claimAnchorOf(o.id)));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (boardAnchors.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [sortedOrders, claimAnchorOf]);
 
   const checkStopped = (dish: Dish): string | null => {
     // Board ONLY checks Dish status - ingredient logic is synced at App level
@@ -497,6 +631,13 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
 
   // State for partial completion modal
   const [partialOrder, setPartialOrder] = useState<Order | null>(null);
+  // Снапшот source-ов виртуальной карточки, снятый В МОМЕНТ ОТКРЫТИЯ модалки
+  // «Частично» (ревью 2026-07-11): очередь пересобирается каждую секунду, и
+  // виртуальный id с порядковым суффиксом к моменту «ОК» мог указывать на
+  // ДРУГУЮ карточку того же блюда (частичная отдача ушла бы на чужой стол)
+  // либо исчезнуть из маппинга (отдача молча терялась). null = стандартный
+  // режим, id реальный.
+  const [partialSources, setPartialSources] = useState<Map<string, number> | null>(null);
 
   return (
     <div className="p-6 overflow-y-auto h-full flex flex-col relative">
@@ -505,13 +646,16 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           totalQty={partialOrder.quantity_stack.reduce((a, b) => a + b, 0)}
           onConfirm={(qty) => {
             // Smart Aggregation: распределить PartDone по реальным source orders.
+            // Source-ы берём из СНАПШОТА partialSources (снят при открытии
+            // модалки — см. коммент у стейта), а не из текущего маппинга:
+            // за время набора количества очередь пересобиралась каждую
+            // секунду и виртуальный id мог начать указывать на чужую карточку.
             // Source-ы сортируем по created_at ASC — закрываем СТАРЫЕ заказы
             // первыми (FIFO). Без этой сортировки порядок зависел от
             // Map-insertion-order, который не гарантирует FIFO.
-            const mapping = smartQueueMappingRef.current.get(partialOrder.id);
-            if (mapping) {
+            if (partialSources) {
               let remainingToComplete = qty;
-              const sourceEntries = Array.from(mapping.itemCountByOrder.entries())
+              const sourceEntries = Array.from(partialSources.entries())
                 .map(([sourceId, maxCount]) => {
                   const sourceOrder = orders.find(o => o.id === sourceId);
                   return {
@@ -524,6 +668,8 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                 .sort((a, b) => a.sortKey - b.sortKey);
               for (const { sourceId, maxCount, sourceOrder } of sourceEntries) {
                 if (remainingToComplete <= 0) break;
+                // Source успел завершиться/исчезнуть, пока модалка была
+                // открыта — просто пропускаем его, не роняя остальных.
                 if (!sourceOrder) continue;
                 const sourceTotalQty = sourceOrder.quantity_stack.reduce((a, b) => a + b, 0);
                 const toComplete = Math.min(remainingToComplete, maxCount);
@@ -539,8 +685,9 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
               onPartialComplete(partialOrder.id, qty);
             }
             setPartialOrder(null);
+            setPartialSources(null);
           }}
-          onClose={() => setPartialOrder(null)}
+          onClose={() => { setPartialOrder(null); setPartialSources(null); }}
         />
       )}
       {/* Top Control Panel */}
@@ -589,7 +736,6 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
         orders={defrostingGroups.map(g => g.virtualOrder)}
         dishes={dishes}
         now={now}
-        settings={settings}
         onOpenModal={(vid) => setDefrostModalGroupId(vid)}
         onCancelDefrost={(vid) => {
           const sourceIds = defrostGroupMapping.get(vid);
@@ -674,26 +820,29 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                 // Smart Aggregation: PartDone на виртуальном заказе
                 const mapping = smartQueueMappingRef.current.get(id);
                 if (mapping) {
-                  // Создаём виртуальный Order для модалки PartialCompletion
+                  // Создаём виртуальный Order для модалки PartialCompletion.
+                  // Source-ы фиксируем СЕЙЧАС (снапшот) — к моменту «ОК»
+                  // маппинг мог быть пересобран под другую карточку.
                   const virtualOrder = sortedOrders.find(o => o.id === id);
-                  if (virtualOrder) setPartialOrder(virtualOrder);
+                  if (virtualOrder) {
+                    setPartialOrder(virtualOrder);
+                    setPartialSources(new Map(mapping.itemCountByOrder));
+                  }
                 } else {
                   const o = orders.find(x => x.id === id);
-                  if (o) setPartialOrder(o);
+                  if (o) {
+                    setPartialOrder(o);
+                    setPartialSources(null);
+                  }
                 }
               }}
               onStackMerge={(id) => {
-                // Smart Aggregation: фиксируем ТЕКУЩИЕ source-ы как merged.
-                // Новые source-ы, которые придут позже с тем же virtualId
-                // (стабильный по dishId+wasDefrosted), будут отрисовываться
-                // отдельным блоком — "2 + 1" и т.п.
+                // Smart Aggregation: подтверждаем ТЕКУЩИЕ source-ы карточки —
+                // merge_ack=TRUE в БД (миграция 022). Новые source-ы придут
+                // с merge_ack=FALSE и отрисуются отдельным блоком — "2 + 1".
                 const mapping = smartQueueMappingRef.current.get(id);
                 if (mapping) {
-                  setMergedSources(prev => {
-                    const next = new Map(prev);
-                    next.set(id, new Set(mapping.sourceOrderIds));
-                    return next;
-                  });
+                  onMergeAck?.(mapping.sourceOrderIds);
                 } else {
                   onStackMerge(id);
                 }
@@ -709,7 +858,7 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                 }
               }}
               onPreviewImage={onPreviewImage}
-              isInWork={inWorkIds.has(order.id)}
+              isInWork={inWorkIds.has(claimAnchorOf(order.id))}
               onToggleInWork={toggleInWork}
               // ❄️ Запуск разморозки — резолвим Smart Wave virtual id в реальные
               // source_order_ids (через smartQueueMappingRef). Для стандартного
@@ -899,13 +1048,15 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                 </div>
               ) : (
                 // Group by Table (simplified for display)
+                // table_stack — обязательное поле Order (см. types.ts), фолбэк
+                // на легаси `table_numbers` удалён: такого поля в типе нет.
                 Array.from(new Set(orders
                   .filter(o => o.status === 'PARKED')
-                  .flatMap(o => o.table_stack ? o.table_stack.flat() : (o.table_numbers || []))
+                  .flatMap(o => (o.table_stack || []).flat())
                 )).map(tableNum => {
                   const tableOrders = orders.filter(o =>
                     o.status === 'PARKED' &&
-                    (o.table_stack ? o.table_stack.flat().includes(tableNum) : (o.table_numbers?.includes(tableNum)))
+                    (o.table_stack || []).flat().includes(tableNum)
                   );
                   if (tableOrders.length === 0) return null;
 

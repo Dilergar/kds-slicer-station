@@ -4,6 +4,7 @@
  * Содержит:
  * - generateId() — генерация уникальных идентификаторов
  * - calculateConsumedIngredients() — расчёт потреблённых ингредиентов при выполнении заказа
+ * - playDefrostBeep() — звуковой сигнал готовности разморозки (Web Audio)
  */
 
 import { Dish, OrderHistoryEntry, IngredientBase } from './types';
@@ -78,4 +79,40 @@ export const calculateConsumedIngredients = (
             weightGrams
         };
     }).filter(Boolean) as OrderHistoryEntry['consumedIngredients'];
+};
+
+/**
+ * Проигрывает короткий 3-тональный beep через Web Audio API — сигнал
+ * «разморозка готова». Отдельной зависимости не добавляем — API нативный.
+ *
+ * Вызывается из SlicerStation при живом переходе таймера разморозки из
+ * состояния «идёт» в «истёк» (см. эффект defrostSoundStateRef). Раньше жил
+ * в DefrostRow, но туда попадали только АКТИВНЫЕ разморозки — истёкшие
+ * исчезали из списка тем же тиком, и сигнал не срабатывал никогда.
+ */
+export const playDefrostBeep = (): void => {
+    try {
+        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        const t0 = ctx.currentTime;
+        // Три коротких тона нарастающей частоты — характерный «готовность» паттерн.
+        const tones = [660, 880, 1100];
+        tones.forEach((freq: number, i: number) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.0001, t0 + i * 0.18);
+            gain.gain.exponentialRampToValueAtTime(0.25, t0 + i * 0.18 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.18 + 0.15);
+            osc.connect(gain).connect(ctx.destination);
+            osc.start(t0 + i * 0.18);
+            osc.stop(t0 + i * 0.18 + 0.18);
+        });
+        // Закрываем контекст через секунду, чтобы не копить ресурсы.
+        setTimeout(() => { try { ctx.close(); } catch { /* контекст уже закрыт */ } }, 1000);
+    } catch (err) {
+        console.warn('[utils] Ошибка воспроизведения звука разморозки:', err);
+    }
 };

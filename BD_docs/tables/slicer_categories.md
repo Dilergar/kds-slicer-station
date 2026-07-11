@@ -24,7 +24,7 @@
 
 ## Связанные таблицы
 - Используется фронтендом для сортировки заказов (COURSE_FIFO алгоритм в `smartQueue.ts`)
-- Привязка к блюдам через `ctlg15_dishes.ctlg15_ctlg38_uuid__goodcategory` → маппинг на стороне backend
+- Привязка к блюдам — через таблицу [slicer_dish_categories](slicer_dish_categories.md) (миграция 004): нарезчик назначает категории вручную в UI «Рецепты». Чужая `ctlg15_dishes.ctlg15_ctlg38_uuid__goodcategory` **не используется**
 
 ## TypeScript маппинг
 ```typescript

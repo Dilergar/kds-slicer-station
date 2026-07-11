@@ -26,6 +26,7 @@
 | `defrost_duration_seconds` | INT | ❌ | `NULL` | 016 | Snapshot `defrost_duration_minutes*60` на момент клика |
 | `effective_created_at` | TIMESTAMPTZ | ❌ | `NULL` | 018 | Переопределение точки отсчёта таймера/сортировки. NULL → fallback на `docm2tabl1_ordertime` |
 | `parked_by_auto` | BOOLEAN | ✅ | `FALSE` | 018 | Текущая парковка автоматическая (правило автопарковки десертов, миграция 017) |
+| `merge_ack` | BOOLEAN | ✅ | `FALSE` | 022 | Merge-подтверждение виртуальной карточки Smart Wave: TRUE = позиция входит в объединённый блок стека. Сбрасывается при `/restore` |
 | `created_at` | TIMESTAMPTZ | ✅ | `NOW()` | 001 | Дата создания записи в state (не путать с `effective_created_at`) |
 | `updated_at` | TIMESTAMPTZ | ✅ | `NOW()` | 001 | Дата последнего обновления |
 
@@ -113,6 +114,7 @@ interface Order {
   parked_by_auto?: boolean;        // → parked_by_auto (018)
   defrost_started_at?: number | null;     // → defrost_started_at (016)
   defrost_duration_seconds?: number | null; // → defrost_duration_seconds (016)
+  merge_ack?: boolean;             // → merge_ack (022)
 }
 ```
 
@@ -121,8 +123,9 @@ interface Order {
 - `POST /api/orders/:id/unpark` — ручной unpark (разветвляется по `parked_by_auto`)
 - `POST /api/orders/:id/complete` — завершить
 - `POST /api/orders/:id/cancel` — отменить
-- `POST /api/orders/:id/merge` — объединить стеки
-- `POST /api/orders/:id/restore` — вернуть из истории (чистит `effective_created_at` / `accumulated_time_ms` / `parked_by_auto`)
+- `POST /api/orders/:id/merge` — объединить стеки (реальный заказ, стандартный режим)
+- `POST /api/orders/merge-ack` — подтвердить объединение виртуальной карточки Smart Wave: `merge_ack=TRUE` всем переданным `orderItemIds` (022)
+- `POST /api/orders/:id/restore` — вернуть из истории (чистит `effective_created_at` / `accumulated_time_ms` / `parked_by_auto` / `merge_ack`)
 - `POST /api/orders/:id/defrost-start` — запустить таймер разморозки
 - `POST /api/orders/:id/defrost-cancel` — отменить активную разморозку
 - `POST /api/orders/:id/defrost-complete` — ручное подтверждение «Разморозилась»

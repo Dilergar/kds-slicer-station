@@ -7,6 +7,30 @@ import { pool } from '../config/db';
 
 const router = Router();
 
+/**
+ * Валидация числовой настройки в диапазоне [min..max].
+ * Возвращает текст ошибки, либо null если значение не прислано (не трогаем
+ * поле) или валидно. Единая точка для числовых границ — раньше каждый
+ * параметр копировал одинаковый блок проверки, рискуя опечаткой в границах.
+ *
+ * @param value Присланное значение (undefined/null = поле не меняется)
+ * @param name Имя поля для текста ошибки
+ * @param min Нижняя граница (включительно)
+ * @param max Верхняя граница (включительно)
+ */
+const validateIntRange = (
+  value: unknown,
+  name: string,
+  min: number,
+  max: number
+): string | null => {
+  if (value == null) return null;
+  if (typeof value !== 'number' || value < min || value > max) {
+    return `${name} должен быть числом ${min}..${max}`;
+  }
+  return null;
+};
+
 /** GET /api/settings — Получить все настройки */
 router.get('/', async (_req: Request, res: Response) => {
   try {
@@ -22,6 +46,8 @@ router.get('/', async (_req: Request, res: Response) => {
       historyRetentionMinutes: row.history_retention_minutes,
       activePriorityRules: row.active_priority_rules,
       courseWindowSeconds: row.course_window_seconds,
+      // Шаг курса умной очереди v2 (миграция 023)
+      coursePaceSeconds: row.course_pace_seconds,
       restaurantOpenTime: row.restaurant_open_time,
       restaurantCloseTime: row.restaurant_close_time,
       excludedDates: row.excluded_dates,
@@ -51,6 +77,7 @@ router.put('/', async (req: Request, res: Response) => {
       historyRetentionMinutes,
       activePriorityRules,
       courseWindowSeconds,
+      coursePaceSeconds,
       restaurantOpenTime,
       restaurantCloseTime,
       excludedDates,
@@ -64,14 +91,15 @@ router.put('/', async (req: Request, res: Response) => {
       dessertTriggerModifierPatterns
     } = req.body;
 
-    // Валидация dessertAutoParkMinutes (симметрично — CHECK БД 1..240).
-    if (
-      dessertAutoParkMinutes != null &&
-      (typeof dessertAutoParkMinutes !== 'number' ||
-        dessertAutoParkMinutes < 1 ||
-        dessertAutoParkMinutes > 240)
-    ) {
-      res.status(400).json({ error: 'dessertAutoParkMinutes должен быть целым числом 1..240' });
+    // Валидация числовых диапазонов. Границы дублируют CHECK'и БД:
+    // course_pace_seconds 10..3600 (миграция 025), dessert_auto_park_minutes
+    // 1..240 (миграция 017) — API отвечает понятной 400-кой вместо 500-ки
+    // от нарушенного constraint'а.
+    const rangeError =
+      validateIntRange(coursePaceSeconds, 'coursePaceSeconds', 10, 3600) ??
+      validateIntRange(dessertAutoParkMinutes, 'dessertAutoParkMinutes', 1, 240);
+    if (rangeError) {
+      res.status(400).json({ error: rangeError });
       return;
     }
 
@@ -104,6 +132,7 @@ router.put('/', async (req: Request, res: Response) => {
         dessert_auto_park_enabled = COALESCE($13, dessert_auto_park_enabled),
         dessert_auto_park_minutes = COALESCE($14, dessert_auto_park_minutes),
         dessert_trigger_modifier_patterns = COALESCE($16::text[], dessert_trigger_modifier_patterns),
+        course_pace_seconds = COALESCE($17, course_pace_seconds),
         updated_at = NOW()
        WHERE id = 1
        RETURNING *`,
@@ -125,7 +154,8 @@ router.put('/', async (req: Request, res: Response) => {
         // Флаг: клиент явно прислал поле dessertCategoryId (в т.ч. null) —
         // значит хочет его изменить. Отсутствие ключа в body → не трогаем.
         Object.prototype.hasOwnProperty.call(req.body, 'dessertCategoryId'),
-        dessertTriggerModifierPatterns ?? null
+        dessertTriggerModifierPatterns ?? null,
+        coursePaceSeconds ?? null
       ]
     );
 
@@ -139,6 +169,7 @@ router.put('/', async (req: Request, res: Response) => {
       historyRetentionMinutes: row.history_retention_minutes,
       activePriorityRules: row.active_priority_rules,
       courseWindowSeconds: row.course_window_seconds,
+      coursePaceSeconds: row.course_pace_seconds,
       restaurantOpenTime: row.restaurant_open_time,
       restaurantCloseTime: row.restaurant_close_time,
       excludedDates: row.excluded_dates,

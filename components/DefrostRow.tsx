@@ -12,12 +12,13 @@
  * карточкой блюда и кнопкой «Разморозилась». Крестик [×] сразу отменяет
  * разморозку без модалки.
  *
- * Звук: если settings.enableDefrostSound=true и таймер одной из карточек
- * только что истёк — играем короткий Web Audio beep. Отслеживаем уже
- * отыгранные id через Set, чтобы не играть повторно каждую секунду.
+ * Звук готовности живёт НЕ здесь, а в SlicerStation (playDefrostBeep из
+ * utils.ts): сюда попадают только АКТИВНЫЕ разморозки, истёкшая исчезает из
+ * списка тем же тиком — компонент физически не может увидеть переход
+ * «идёт → истёк», из-за чего старый эффект не срабатывал никогда.
  */
-import React, { useEffect, useRef } from 'react';
-import { Order, Dish, SystemSettings } from '../types';
+import React from 'react';
+import { Order, Dish } from '../types';
 import { Snowflake, X, Check } from 'lucide-react';
 import { isDefrostActive } from '../smartQueue';
 
@@ -25,7 +26,6 @@ interface DefrostRowProps {
   orders: Order[];
   dishes: Dish[];
   now: number;
-  settings?: SystemSettings;
   /** Клик по телу мини-карточки → открыть модалку */
   onOpenModal: (orderId: string) => void;
   /** Клик по красному крестику → отменить разморозку (вернуть в очередь с ULTRA) */
@@ -46,84 +46,18 @@ const formatCountdown = (secondsRemaining: number): string => {
   return `${m.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`;
 };
 
-/**
- * Проигрывает короткий 3-битный beep через Web Audio API.
- * Отдельной зависимости не добавляем — нативно в браузере.
- * Вызывается при истечении таймера первого раза для каждой карточки.
- */
-const playDefrostBeep = () => {
-  try {
-    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
-    const t0 = ctx.currentTime;
-    // Три коротких тона нарастающей частоты — характерный «готовность» паттерн.
-    const tones = [660, 880, 1100];
-    tones.forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, t0 + i * 0.18);
-      gain.gain.exponentialRampToValueAtTime(0.25, t0 + i * 0.18 + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.18 + 0.15);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(t0 + i * 0.18);
-      osc.stop(t0 + i * 0.18 + 0.18);
-    });
-    // Закрываем контекст через секунду, чтобы не копить ресурсы.
-    setTimeout(() => { try { ctx.close(); } catch {} }, 1000);
-  } catch (err) {
-    console.warn('[DefrostRow] Ошибка воспроизведения звука:', err);
-  }
-};
-
 export const DefrostRow: React.FC<DefrostRowProps> = ({
   orders,
   dishes,
   now,
-  settings,
   onOpenModal,
   onCancelDefrost,
   onCompleteDefrost,
 }) => {
-  // Набор order.id для которых beep уже проигрывался — чтобы не повторять
-  // каждую секунду после истечения таймера. Живёт в ref, не в стейте, чтобы
-  // не триггерить перерендер при обновлении.
-  const playedBeepRef = useRef<Set<string>>(new Set());
-
-  // Собираем все активно размораживающиеся заказы. Уникализируем по суррогатному
-  // ключу (dish_id + started_at) — в Smart Wave несколько реальных order_item_id
-  // с одним блюдом и одним started_at стекаются в одну мини-карточку. Но в
-  // SlicerStation мы работаем с уже готовыми Order[] (реальные + виртуальные
-  // из Smart Wave), поэтому здесь просто фильтруем по isDefrostActive.
+  // Собираем все активно размораживающиеся заказы. В SlicerStation мы
+  // работаем с уже готовыми Order[] (виртуальные группы Smart Wave),
+  // поэтому здесь просто фильтруем по isDefrostActive.
   const defrostingOrders = orders.filter(o => isDefrostActive(o, now));
-
-  // Следим за истёкшими таймерами для звукового уведомления. Используем
-  // эффект вместо вычисления в рендере, чтобы не играть при каждом ре-рендере.
-  useEffect(() => {
-    if (settings?.enableDefrostSound === false) return;
-    const played = playedBeepRef.current;
-    for (const order of orders) {
-      if (!order.defrost_started_at) continue;
-      const endsAt = order.defrost_started_at + (order.defrost_duration_seconds ?? 0) * 1000;
-      // Истёк И ещё не отыгрывали на эту позицию
-      if (now >= endsAt && !played.has(order.id)) {
-        played.add(order.id);
-        playDefrostBeep();
-      }
-      // Если разморозка перезапустилась (новый started_at) — чистим флаг,
-      // чтобы beep отыграл снова при следующем истечении.
-      if (now < endsAt && played.has(order.id)) {
-        played.delete(order.id);
-      }
-    }
-    // Чистим флаги для заказов, которых больше нет (завершены / отменены).
-    const currentIds = new Set(orders.map(o => o.id));
-    for (const id of played) {
-      if (!currentIds.has(id)) played.delete(id);
-    }
-  }, [orders, now, settings?.enableDefrostSound]);
 
   if (defrostingOrders.length === 0) return null;
 

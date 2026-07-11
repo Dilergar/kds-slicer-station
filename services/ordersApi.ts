@@ -60,6 +60,21 @@ export const mergeOrder = (id: string, data: {
 }): Promise<{ merged: boolean }> =>
   apiFetch(`/orders/${id}/merge`, { method: 'POST', body: JSON.stringify(data) });
 
+/**
+ * Подтвердить объединение виртуальной карточки Smart Wave (миграция 022).
+ * Всем переданным реальным source-заказам проставляется merge_ack=TRUE в
+ * slicer_order_state — подтверждение переживает F5 и синхронно между
+ * планшетами. Новые source-ы того же блюда приходят с merge_ack=FALSE и
+ * рисуются отдельным блоком до следующего Merge.
+ */
+export const mergeAckOrders = (
+  orderItemIds: string[]
+): Promise<{ acked: boolean; items: number }> =>
+  apiFetch('/orders/merge-ack', {
+    method: 'POST',
+    body: JSON.stringify({ orderItemIds })
+  });
+
 /** Получить историю заказов */
 export const fetchOrderHistory = (from?: string, to?: string): Promise<OrderHistoryEntry[]> => {
   const params = new URLSearchParams();
