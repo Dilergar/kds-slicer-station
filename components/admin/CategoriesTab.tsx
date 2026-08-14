@@ -10,6 +10,7 @@ import {
   reorderCategories
 } from '../../services/categoriesApi';
 import { updateSettings } from '../../services/settingsApi';
+import { blurOnWheel } from '../../utils';
 
 interface CategoriesTabProps {
   categories: Category[];
@@ -265,6 +266,10 @@ export const CategoriesTab: React.FC<CategoriesTabProps> = ({ categories, setCat
                       max={240}
                       value={dessertMinutesDraft !== '' ? dessertMinutesDraft : autoParkMinutes}
                       onChange={(e) => setDessertMinutesDraft(e.target.value)}
+                      // Колесо мыши не крутит значение, а снимает фокус (см. blurOnWheel).
+                      // Побочно срабатывает onBlur ниже — введённое значение просто
+                      // коммитится, как при клике мимо поля.
+                      onWheel={blurOnWheel}
                       onBlur={() => {
                         if (dessertMinutesDraft !== '') {
                           commitDessertMinutes(dessertMinutesDraft);

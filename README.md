@@ -118,19 +118,29 @@ cd server && npm install
 cp server/.env.example server/.env
 # Отредактировать server/.env — укажите пароль PostgreSQL и (если нужно) другое имя БД
 ```
+> `DB_PASSWORD` обязателен: без него backend не стартует и пишет, что делать.
+> Прежнего запасного значения в коде больше нет — при пустом `.env` приложение
+> раньше молча пробовало стендовый пароль, и это выглядело как «БД не отвечает».
+>
+> Там же задаются `DB_TIMEZONE` (часовой пояс ресторана — обязателен, если Node и
+> PostgreSQL могут оказаться в разных поясах), `SERVER_HOST` (по умолчанию
+> `127.0.0.1`; наружу API отдаёт nginx) и `CORS_ORIGINS`.
 
 ### 3. Развернуть таблицы модуля в существующую БД `arclient`
 ```bash
 # Создать все 15 slicer-таблиц + начальные данные (категории, настройки):
 cd server && npm run migrate
 ```
+> Каждый файл выполняется в своей транзакции (`--single-transaction`): падение
+> любой миграции откатывается целиком, частично применённого состояния не бывает.
+>
 > ⚠️ Скрипт `migrate` хардкодит `-U postgres -d arclient` и не читает `server/.env`.
 > При других реквизитах запускайте миграции вручную (задав `PGPASSWORD`):
 ```bash
 psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/001_create_slicer_tables.sql
 psql -U postgres -d arclient -v ON_ERROR_STOP=1 -f server/migrations/002_seed_defaults.sql
-# ... и далее строго по номерам до 026_new_order_sound.sql
-# (все 26 команд по порядку — в Инструкция.md, раздел 4.2)
+# ... и далее строго по номерам до 028_archive_trigger_never_blocks.sql
+# (все 28 команд по порядку — в Инструкция.md, раздел 4.2)
 ```
 
 > **Внимание:** перед первым запуском на новом ресторане обновите константу
@@ -164,7 +174,8 @@ npm install       # Установка зависимостей
 npm run dev       # Dev-сервер (порт 3000)
 npm run build     # Production сборка
 npm run typecheck # Проверка типов (tsc --noEmit)
-# npm run lint    # Сейчас нерабочий: eslint не установлен в devDependencies
+# lint-скрипта нет: eslint не установлен, команда падала. Конфиг eslint.config.js оставлен
+#                  на случай, если решите добавить пакет.
 
 # Backend
 cd server

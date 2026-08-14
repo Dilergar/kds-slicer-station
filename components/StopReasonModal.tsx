@@ -6,8 +6,18 @@
  * Используется в StopListManager и AdminPanel.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AlertOctagon } from 'lucide-react';
+
+/**
+ * Готовые причины стопа. Значение «Другое» вынесено в константу намеренно:
+ * раньше кнопка отдавала русское 'Другое', а проверка в handleConfirm
+ * сравнивала с английским 'Other' (остаток прежней версии). Условие не
+ * срабатывало никогда — введённый текст молча терялся, в отчёт уходило просто
+ * «Другое», а обязательность поля не проверялась.
+ */
+const REASON_OTHER = 'Другое';
+const REASON_PRESETS = ['Закончилось', 'Списание', 'Не доставили', REASON_OTHER];
 
 interface StopReasonModalProps {
     isOpen: boolean;
@@ -22,15 +32,25 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
     onClose,
     onConfirm,
 }) => {
-    const [reason, setReason] = useState('Закончилось');
+    const [reason, setReason] = useState(REASON_PRESETS[0]);
     const [customReason, setCustomReason] = useState('');
     const [validationError, setValidationError] = useState('');
+
+    // Сброс при открытии. Компонент не размонтируется (возвращает null), поэтому
+    // без этого следующий стоп открывался с прошлой причиной и прошлым текстом.
+    useEffect(() => {
+        if (isOpen) {
+            setReason(REASON_PRESETS[0]);
+            setCustomReason('');
+            setValidationError('');
+        }
+    }, [isOpen]);
 
     if (!isOpen) return null;
 
     const handleConfirm = () => {
         let finalReason = reason;
-        if (reason === 'Other') {
+        if (reason === REASON_OTHER) {
             if (!customReason.trim()) {
                 setValidationError('Пожалуйста, введите причину');
                 return;
@@ -51,7 +71,7 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
                 <p className="text-gray-300 mb-4">Почему вы останавливаете <span className="text-white font-bold">{itemName}</span>?</p>
 
                 <div className="grid grid-cols-2 gap-3 mb-4">
-                    {['Закончилось', 'Списание', 'Не доставили', 'Другое'].map((r) => (
+                    {REASON_PRESETS.map((r) => (
                         <button
                             key={r}
                             onClick={() => {
@@ -71,7 +91,7 @@ export const StopReasonModal: React.FC<StopReasonModalProps> = ({
                     ))}
                 </div>
 
-                {reason === 'Другое' && (
+                {reason === REASON_OTHER && (
                     <div className="mb-4">
                         <input
                             type="text"

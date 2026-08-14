@@ -25,8 +25,23 @@ const validateIntRange = (
   max: number
 ): string | null => {
   if (value == null) return null;
-  if (typeof value !== 'number' || value < min || value > max) {
-    return `${name} должен быть числом ${min}..${max}`;
+  // Number.isInteger обязателен: без него 10.5 проходил проверку и уезжал
+  // в INT-колонку, где Postgres отвечал 500 вместо понятной 400.
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    return `${name} должен быть целым числом ${min}..${max}`;
+  }
+  return null;
+};
+
+/**
+ * Проверяет строку времени формата HH:MM.
+ * @param value Присланное значение (undefined/null = поле не меняется)
+ * @param name Имя поля для текста ошибки
+ */
+const validateTimeString = (value: unknown, name: string): string | null => {
+  if (value == null) return null;
+  if (typeof value !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+    return `${name} должен быть временем в формате ЧЧ:ММ`;
   }
   return null;
 };
@@ -100,10 +115,49 @@ router.put('/', async (req: Request, res: Response) => {
     // от нарушенного constraint'а.
     const rangeError =
       validateIntRange(coursePaceSeconds, 'coursePaceSeconds', 10, 3600) ??
-      validateIntRange(dessertAutoParkMinutes, 'dessertAutoParkMinutes', 1, 240);
+      validateIntRange(dessertAutoParkMinutes, 'dessertAutoParkMinutes', 1, 240) ??
+      // Раньше эти три не проверялись НИГДЕ — ни здесь, ни CHECK'ом в БД:
+      // единственной защитой был кламп в админке. Прямой запрос записывал что
+      // угодно, включая 0 для courseWindowSeconds — а на нём в стандартном
+      // режиме строится bucket сортировки (деление на ноль → Infinity в ключе).
+      validateIntRange(courseWindowSeconds, 'courseWindowSeconds', 10, 3600) ??
+      validateIntRange(historyRetentionMinutes, 'historyRetentionMinutes', 1, 120) ??
+      validateIntRange(aggregationWindowMinutes, 'aggregationWindowMinutes', 1, 240);
     if (rangeError) {
       res.status(400).json({ error: rangeError });
       return;
+    }
+
+    // Часы работы ресторана — строго HH:MM, иначе расчёт рабочего времени
+    // в отчётах молча получит NaN и проценты простоя станут бессмысленными.
+    const timeError =
+      validateTimeString(restaurantOpenTime, 'restaurantOpenTime') ??
+      validateTimeString(restaurantCloseTime, 'restaurantCloseTime');
+    if (timeError) {
+      res.status(400).json({ error: timeError });
+      return;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Килсвитч записи в чужую таблицу через этот эндпоинт НЕ переключается.
+    //
+    // enable_kds_stoplist_sync — единственное, что отделяет модуль от записи
+    // в боевую rgst3_dishstoplist заказчика (правило 3 в CLAUDE.md). Раньше он
+    // лежал в общем словаре настроек и менялся тем же запросом, что и громкость
+    // звука: любой, кто дотянулся до порта 3001, мог включить его одним PUT,
+    // а следующим запросом снять со стопа блюдо — pushDishUnstopAll удаляет ВСЕ
+    // строки блюда в текущей смене, включая поставленные кассиром.
+    //
+    // Теперь флаг меняется только при развёртывании — SQL-ом по инструкции
+    // (Инструкция.md → «Двусторонняя синхронизация стоп-листа»):
+    //   UPDATE slicer_settings SET enable_kds_stoplist_sync = true WHERE id = 1;
+    // Присланное в теле значение молча игнорируем, но пишем предупреждение
+    // в лог — чтобы попытка была видна при разборе.
+    if (enableKdsStoplistSync !== undefined) {
+      console.warn(
+        '[Settings] Попытка изменить enable_kds_stoplist_sync через API отклонена. ' +
+        'Флаг записи в чужую таблицу меняется только SQL-ом при развёртывании.'
+      );
     }
 
     // Валидация dessertTriggerModifierPatterns: массив непустых строк.
@@ -127,7 +181,9 @@ router.put('/', async (req: Request, res: Response) => {
         excluded_dates = COALESCE($7, excluded_dates),
         enable_aggregation = COALESCE($8, enable_aggregation),
         enable_smart_aggregation = COALESCE($9, enable_smart_aggregation),
-        enable_kds_stoplist_sync = COALESCE($10, enable_kds_stoplist_sync),
+        -- enable_kds_stoplist_sync НАМЕРЕННО не меняется через этот эндпоинт
+        -- (см. блок про килсвитч выше). $10 больше не участвует.
+        enable_kds_stoplist_sync = enable_kds_stoplist_sync,
         enable_defrost_sound = COALESCE($11, enable_defrost_sound),
         enable_new_order_sound = COALESCE($18, enable_new_order_sound),
         -- Десерты: dessert_category_id может прийти явным null (отвязать),
@@ -150,7 +206,9 @@ router.put('/', async (req: Request, res: Response) => {
         excludedDates ? JSON.stringify(excludedDates) : null,
         enableAggregation,
         enableSmartAggregation,
-        enableKdsStoplistSync,
+        // $10 сохранён как placeholder, чтобы не перенумеровывать остальные
+        // параметры: сам флаг синхронизации этим запросом не меняется (см. выше)
+        null,
         enableDefrostSound,
         dessertCategoryId ?? null,
         dessertAutoParkEnabled,

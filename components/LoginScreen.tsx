@@ -9,7 +9,7 @@
  * всё проверяется через POST /api/auth/login.
  */
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Lock, Delete, X } from 'lucide-react';
 import { AuthUser } from '../types';
 
@@ -20,33 +20,76 @@ interface LoginScreenProps {
 
 const PIN_LENGTH = 4;
 
+/**
+ * Человеческий текст ошибки входа. Для нарезчика «неверный PIN» и «сервер лежит» —
+ * это два разных действия (позвать коллегу против позвать айтишника), поэтому
+ * сетевой сбой нельзя показывать тем же текстом, что и опечатку.
+ * @param err — то, что бросил onLogin (apiFetch кидает Error с текстом от сервера,
+ *              сам fetch при обрыве сети кидает TypeError)
+ * @returns строка для показа под точками PIN
+ */
+function describeLoginError(err: unknown): string {
+  if (err instanceof TypeError) return 'Нет связи с сервером';
+  if (err instanceof Error) {
+    // fetch в разных браузерах формулирует обрыв по-разному, ловим по подстроке
+    if (/failed to fetch|networkerror|load failed/i.test(err.message)) {
+      return 'Нет связи с сервером';
+    }
+    // Backend лежит: прокси отдаёт свой 5xx с англоязычным телом
+    // («Internal Server Error», «Bad Gateway»). Нарезчику это ни о чём не
+    // говорит — переводим в понятное «сервер недоступен».
+    if (/internal server error|bad gateway|service unavailable|gateway time-?out|HTTP 5\d\d/i.test(err.message)) {
+      return 'Сервер недоступен — позовите техподдержку';
+    }
+    if (/too many|слишком много/i.test(err.message)) {
+      return 'Слишком много попыток. Подождите минуту.';
+    }
+    return err.message;
+  }
+  return 'Ошибка входа';
+}
+
 export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
   const [pin, setPin] = useState('');
   const [error, setError] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [shake, setShake] = useState(false);
 
+  // Сторож повторного запуска. Именно ref, а НЕ стейт isSubmitting в зависимостях:
+  // раньше эффект зависел от isSubmitting и сам же его взводил первой строкой —
+  // React из-за смены зависимости вызывал cleanup предыдущего запуска и ставил
+  // cancelled=true ещё до ответа сервера. В результате при любой ошибке обе ветки
+  // (показ сообщения и сброс флага) пропускались по этому признаку, isSubmitting
+  // залипал в true навсегда, а на нём висит disabled всего нумпада — планшет
+  // блокировался до F5 после первой же опечатки в PIN.
+  const submittingRef = useRef(false);
+
   // Авто-submit когда набрали 4 цифры. Вынесено в useEffect чтобы не зависеть
   // от порядка: setPin сначала ставит стейт, потом этот эффект срабатывает
   // на следующий рендер — гарантируем актуальное значение pin.
   useEffect(() => {
-    if (pin.length !== PIN_LENGTH || isSubmitting) return;
+    if (pin.length !== PIN_LENGTH || submittingRef.current) return;
+
+    submittingRef.current = true;
+    setIsSubmitting(true);
+    setError('');
 
     let cancelled = false;
     (async () => {
-      setIsSubmitting(true);
-      setError('');
       try {
         await onLogin(parseInt(pin, 10));
         // При успехе App разрендерит LoginScreen — setState тут уже некому принять
       } catch (err) {
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Ошибка входа');
+        setError(describeLoginError(err));
         setShake(true);
         setPin('');
         // Сброс shake через 500мс, чтобы анимация могла повториться при следующей ошибке
         setTimeout(() => setShake(false), 500);
       } finally {
+        // Флаг снимаем всегда, даже если эффект успели отменить — иначе следующий
+        // ввод PIN не пройдёт сторож и экран снова окажется мёртвым.
+        submittingRef.current = false;
         if (!cancelled) setIsSubmitting(false);
       }
     })();
@@ -54,7 +97,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
     return () => {
       cancelled = true;
     };
-  }, [pin, onLogin, isSubmitting]);
+  }, [pin, onLogin]);
 
   const handleDigit = useCallback((digit: string) => {
     if (isSubmitting) return;

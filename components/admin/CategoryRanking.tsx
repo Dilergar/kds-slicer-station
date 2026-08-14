@@ -1,5 +1,6 @@
 import React from 'react';
 import { SystemSettings } from '../../types';
+import { ClampedNumberInput } from '../ui/ClampedNumberInput';
 
 interface CategoryRankingProps {
   settings: SystemSettings;
@@ -111,16 +112,14 @@ export const CategoryRanking: React.FC<CategoryRankingProps> = ({ settings, setS
             <div className="mt-4 p-4 bg-gray-900/50 rounded-lg border border-amber-600/30">
               <label className="block text-amber-300 font-bold mb-2">⏱️ Окно COURSE_FIFO (секунды)</label>
               <div className="flex items-center gap-3">
-                <input
-                  type="number"
-                  min="10"
-                  max="3600"
-                  step="10"
+                <ClampedNumberInput
                   value={settings.courseWindowSeconds || 300}
-                  onChange={(e) => {
-                    const val = Math.max(10, Math.min(3600, parseInt(e.target.value) || 300));
-                    setSettings({ ...settings, courseWindowSeconds: val });
-                  }}
+                  min={10}
+                  max={3600}
+                  step={10}
+                  fallback={300}
+                  aria-label="Окно COURSE_FIFO в секундах"
+                  onCommit={(val) => setSettings({ ...settings, courseWindowSeconds: val })}
                   className="w-24 bg-gray-800 text-white border border-gray-600 rounded px-3 py-2 text-center font-mono"
                 />
                 <span className="text-gray-400 text-sm">

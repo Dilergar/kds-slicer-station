@@ -4,11 +4,87 @@
  * Содержит:
  * - generateId() — генерация уникальных идентификаторов
  * - calculateConsumedIngredients() — расчёт потреблённых ингредиентов при выполнении заказа
+ * - withParentPrefix() / withoutParentPrefix() — приставка сырья в названии разновидности
+ * - blurOnWheel() — защита числовых полей от прокрутки колесом мыши
  * - playDefrostBeep() — звуковой сигнал готовности разморозки (Web Audio)
  * - playNewOrderBeep() — звуковой сигнал поступления нового заказа (Web Audio)
  */
 
+import type { WheelEvent as ReactWheelEvent } from 'react';
 import { Dish, OrderHistoryEntry, IngredientBase } from './types';
+
+/**
+ * Защита <input type="number"> от случайного изменения значения колесом мыши.
+ *
+ * Проблема: браузер крутит значение сфокусированного числового поля колесом.
+ * Нарезчик вбивает граммовку, ведёт колесом вниз чтобы прокрутить список
+ * ингредиентов — и вместо прокрутки молча получает 45 г вместо 35 г. Ошибка
+ * незаметная: поле выглядит нормально, а рецепт уже испорчен.
+ *
+ * Решение: на колесо снимаем фокус — браузер применяет прокрутку только к
+ * СФОКУСИРОВАННОМУ полю, поэтому значение остаётся прежним, а страница/список
+ * прокручиваются как обычно. Значение меняется только клавишами и стрелками
+ * спиннера.
+ *
+ * Почему не preventDefault(): React вешает wheel на корень как passive-слушатель,
+ * preventDefault() внутри onWheel игнорируется (и заодно заблокировал бы саму
+ * прокрутку, которая нарезчику как раз и нужна).
+ *
+ * @param e — событие колеса на числовом поле
+ */
+export const blurOnWheel = (e: ReactWheelEvent<HTMLInputElement>) => {
+  e.currentTarget.blur();
+};
+
+/** Разделитель между сырьём и его нарезкой: «Вешенки · Крупная соломка». */
+export const VARIETY_SEPARATOR = ' · ';
+
+/**
+ * Добавляет приставку сырья к названию разновидности.
+ *
+ * Зачем приставка вообще: на карточке заказа и в рецептах видно только имя
+ * разновидности, а «Кубик» сам по себе бесполезен — кубиком режут морковь,
+ * огурцы, репчатый лук, перец, говядину и судака. Без приставки нарезчику
+ * пришлось бы открывать фото, чтобы понять, что резать.
+ *
+ * Почему приставка лежит в САМОМ названии, а не собирается при отрисовке:
+ * имя ингредиента выводится в семи местах, включая SQL на бэкенде (причина
+ * стопа «Missing: X» в stoplist.ts, выдача рецептов в recipes.ts) и снимок
+ * расхода в slicer_ingredient_consumption. Денормализация закрывает все
+ * сразу и не даёт пропустить точку вывода.
+ *
+ * Идемпотентна: если приставка уже стоит, второй раз не добавится.
+ *
+ * @param childName — название разновидности («Крупная соломка»)
+ * @param parentName — название сырья («Вешенки»); пустое — вернёт имя как есть
+ * @returns «Вешенки · Крупная соломка»
+ */
+export const withParentPrefix = (childName: string, parentName?: string): string => {
+    const clean = childName.trim();
+    const parent = (parentName || '').trim();
+    if (!parent) return clean;
+    const prefix = parent + VARIETY_SEPARATOR;
+    return clean.startsWith(prefix) ? clean : prefix + clean;
+};
+
+/**
+ * Убирает приставку сырья из названия разновидности.
+ *
+ * Нужна там, где название сырья и так перед глазами: внутри модалки этого же
+ * сырья (оно в заголовке) и в поле редактирования — иначе нарезчик правит
+ * строку «Вешенки · Крупная соломка» и рискует затереть приставку руками.
+ * За пределами модалки имя всегда показывается целиком.
+ *
+ * @param childName — полное название («Вешенки · Крупная соломка»)
+ * @param parentName — название сырья; пустое или не совпало — вернёт как есть
+ * @returns «Крупная соломка»
+ */
+export const withoutParentPrefix = (childName: string, parentName?: string): string => {
+    const parent = (parentName || '').trim();
+    if (!parent) return childName;
+    const prefix = parent + VARIETY_SEPARATOR;
+    return childName.startsWith(prefix) ? childName.slice(prefix.length) : childName;
+};
 
 /**
  * Генерация уникального идентификатора с произвольным префиксом
@@ -83,6 +159,57 @@ export const calculateConsumedIngredients = (
 };
 
 /**
+ * Единый AudioContext приложения.
+ *
+ * Зачем один на всех, а не по контексту на сигнал (как было раньше): браузер
+ * создаёт AudioContext в состоянии suspended, пока по странице не было ни одного
+ * жеста пользователя. Сигналы же инициируются таймером и поллингом, а не кликом.
+ * Поэтому утром, когда планшет обновили и оставили, первый заказ приходил молча —
+ * и так до тех пор, пока кто-нибудь не тапнет по экрану. Общий контекст можно
+ * один раз «разбудить» на первом же касании (см. installAudioUnlock).
+ */
+let sharedAudioCtx: AudioContext | null = null;
+
+/**
+ * Возвращает общий AudioContext, создавая его при первом обращении
+ * и пытаясь вывести из состояния suspended.
+ * @returns контекст либо null, если Web Audio недоступен
+ */
+function getAudioContext(): AudioContext | null {
+    try {
+        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+        if (!AudioCtx) return null;
+        if (!sharedAudioCtx) sharedAudioCtx = new AudioCtx();
+        if (sharedAudioCtx!.state === 'suspended') {
+            // resume() до жеста отклонится — это нормально, ловим и идём дальше
+            void sharedAudioCtx!.resume().catch(() => { /* ждём жеста */ });
+        }
+        return sharedAudioCtx;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Вешает одноразовые слушатели на первое касание/нажатие клавиши, чтобы
+ * разбудить звук. Вызывается один раз при старте приложения; гарантированный
+ * жест на кухне — ввод PIN в начале смены.
+ * @returns функция снятия слушателей (для cleanup в useEffect)
+ */
+export const installAudioUnlock = (): (() => void) => {
+    const unlock = () => {
+        const ctx = getAudioContext();
+        if (ctx && ctx.state === 'suspended') void ctx.resume().catch(() => { /* не вышло — попробуем на следующем жесте */ });
+    };
+    window.addEventListener('pointerdown', unlock);
+    window.addEventListener('keydown', unlock);
+    return () => {
+        window.removeEventListener('pointerdown', unlock);
+        window.removeEventListener('keydown', unlock);
+    };
+};
+
+/**
  * Проигрывает короткий 3-тональный beep через Web Audio API — сигнал
  * «разморозка готова». Отдельной зависимости не добавляем — API нативный.
  *
@@ -93,9 +220,8 @@ export const calculateConsumedIngredients = (
  */
 export const playDefrostBeep = (): void => {
     try {
-        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-        if (!AudioCtx) return;
-        const ctx = new AudioCtx();
+        const ctx = getAudioContext();
+        if (!ctx) return;
         const t0 = ctx.currentTime;
         // Три коротких тона нарастающей частоты — характерный «готовность» паттерн.
         const tones = [660, 880, 1100];
@@ -111,8 +237,8 @@ export const playDefrostBeep = (): void => {
             osc.start(t0 + i * 0.18);
             osc.stop(t0 + i * 0.18 + 0.18);
         });
-        // Закрываем контекст через секунду, чтобы не копить ресурсы.
-        setTimeout(() => { try { ctx.close(); } catch { /* контекст уже закрыт */ } }, 1000);
+        // Контекст НЕ закрываем — он общий и переиспользуется следующими сигналами.
+        // Осцилляторы освобождаются сами после stop().
     } catch (err) {
         console.warn('[utils] Ошибка воспроизведения звука разморозки:', err);
     }
@@ -130,9 +256,8 @@ export const playDefrostBeep = (): void => {
  */
 export const playNewOrderBeep = (): void => {
     try {
-        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-        if (!AudioCtx) return;
-        const ctx = new AudioCtx();
+        const ctx = getAudioContext();
+        if (!ctx) return;
         const t0 = ctx.currentTime;
         // Два одинаковых высоких тона — короче и «легче» сигнала разморозки.
         const tones = [1040, 1040];
@@ -148,8 +273,7 @@ export const playNewOrderBeep = (): void => {
             osc.start(t0 + i * 0.16);
             osc.stop(t0 + i * 0.16 + 0.14);
         });
-        // Закрываем контекст, чтобы не копить ресурсы (как в playDefrostBeep).
-        setTimeout(() => { try { ctx.close(); } catch { /* контекст уже закрыт */ } }, 800);
+        // Контекст общий и не закрывается (как в playDefrostBeep).
     } catch (err) {
         console.warn('[utils] Ошибка воспроизведения звука нового заказа:', err);
     }

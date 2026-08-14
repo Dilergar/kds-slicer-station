@@ -18,3 +18,13 @@ export async function loginByPin(pin: number): Promise<AuthUser> {
     body: JSON.stringify({ pin })
   });
 }
+
+/**
+ * Перепроверить сохранённую сессию: жив ли ещё пользователь и не изменились
+ * ли его роли. Бросает при 401 (уволен/заблокирован) — вызывающий разлогинивает.
+ * @param uuid — идентификатор пользователя из сохранённой сессии
+ * @returns актуальные данные пользователя
+ */
+export async function revalidateSession(uuid: string): Promise<AuthUser> {
+  return apiFetch<AuthUser>(`/auth/me?uuid=${encodeURIComponent(uuid)}`);
+}

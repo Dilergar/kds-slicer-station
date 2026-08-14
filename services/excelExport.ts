@@ -39,6 +39,92 @@ import {
 } from '../types';
 
 // ───────────────────────────────────────────────────────────────────────────
+// Расчёт простоя — ОДИН на всю книгу
+//
+// Раньше строки групп на листе «История стопов» считали процент правильно
+// (через бизнес-часы и с обрезкой по периоду), а лист «Сводка» и разрез
+// «по датам» — по-своему: делили СЫРОЕ календарное время стопов на рабочие
+// часы, без обрезки по периоду и без верхнего предела. В одном файле выходило
+// «118% и 14 ч 10 мин» в «Сводке» против «4% и 6%» по тем же двум продуктам
+// строкой ниже; стоп, тянущийся с прошлой недели, давал 793%. Владелец смотрит
+// на первый лист и делает выводы по нему.
+//
+// Теперь все три места зовут эти две функции.
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Рабочее время (в мс) внутри периода — знаменатель процента простоя.
+ * @param rangeStart — начало периода
+ * @param rangeEnd — конец периода (уже обрезанный по «сейчас»)
+ * @param settings — часы работы и исключённые даты
+ */
+function businessMsInRange(rangeStart: number, rangeEnd: number, settings: SystemSettings): number {
+  return Math.max(1, calculateBusinessOverlap(
+    rangeStart,
+    rangeEnd,
+    settings.restaurantOpenTime || '12:00',
+    settings.restaurantCloseTime || '23:59',
+    settings.excludedDates || []
+  ));
+}
+
+/**
+ * Фактический простой (в мс) — числитель процента.
+ *
+ * Интервалы объединяются (пересекающиеся стопы не считаются дважды), обрезаются
+ * по границам периода и переводятся в рабочее время: ночь с 00:00 до 12:00
+ * простоем не считается.
+ *
+ * @param entries — записи истории стопов
+ * @param rangeStart — начало периода
+ * @param rangeEnd — конец периода (уже обрезанный по «сейчас»)
+ * @param settings — часы работы и исключённые даты
+ */
+function businessDowntimeMs(
+  entries: DashboardHistoryEntry[],
+  rangeStart: number,
+  rangeEnd: number,
+  settings: SystemSettings
+): number {
+  return mergeIntervals(
+    entries.map(e => ({
+      stoppedAt: e.stoppedAt,
+      resumedAt: e.isActive ? rangeEnd : e.resumedAt,
+    }))
+  ).reduce((sum, [start, end]) => {
+    const clippedStart = Math.max(rangeStart, start);
+    const clippedEnd = Math.min(rangeEnd, end);
+    if (clippedEnd > clippedStart) {
+      return sum + calculateBusinessOverlap(
+        clippedStart, clippedEnd,
+        settings.restaurantOpenTime || '12:00',
+        settings.restaurantCloseTime || '23:59',
+        settings.excludedDates || []
+      );
+    }
+    return sum;
+  }, 0);
+}
+
+/**
+ * Процент простоя от рабочего времени периода, 0..100.
+ * @param entries — записи истории стопов
+ * @param rangeStart — начало периода
+ * @param rangeEnd — конец периода (уже обрезанный по «сейчас»)
+ * @param settings — часы работы и исключённые даты
+ */
+function downtimePercent(
+  entries: DashboardHistoryEntry[],
+  rangeStart: number,
+  rangeEnd: number,
+  settings: SystemSettings
+): number {
+  const actual = businessDowntimeMs(entries, rangeStart, rangeEnd, settings);
+  const total = businessMsInRange(rangeStart, rangeEnd, settings);
+  return Math.min(100, Math.round((actual / total) * 100));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Типы payload-а (data feeds от секций Dashboard)
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -96,6 +182,17 @@ export interface ExportPayload {
   speedParked?: AggregatedSpeedReport;
   chefSpeed?: AggregatedChefReport;
   history?: HistoryReport;
+  /**
+   * Строка поиска, применённая в секции «Скорость нарезчика» на момент экспорта.
+   *
+   * Экспорт берёт УЖЕ ОТФИЛЬТРОВАННЫЕ агрегаты секций. Раньше это нигде не
+   * отражалось: заведующая искала «салат», жала «Excel» и получала книгу, где
+   * «Всего заказов 12» и топ-10 — только по салатам, а в шапке стоял лишь
+   * период. Через день такой файл не отличить от полного отчёта за смену.
+   */
+  speedSearchQuery?: string;
+  /** То же для секции «Скорость готовки повара». */
+  chefSearchQuery?: string;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -259,6 +356,19 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
   ws.addRow(['Ср. время отдачи (парковка)', formatDuration(avgPark)]);
   ws.addRow([]);
 
+  // Предупреждение о применённых фильтрах: цифры «Сводки» посчитаны по тем же
+  // отфильтрованным агрегатам, что показаны на экране.
+  const activeSearches = [
+    payload.speedSearchQuery?.trim() ? `скорость нарезчика: «${payload.speedSearchQuery.trim()}»` : null,
+    payload.chefSearchQuery?.trim() ? `готовка повара: «${payload.chefSearchQuery.trim()}»` : null,
+    payload.history?.searchQuery?.trim() ? `стопы: «${payload.history.searchQuery.trim()}»` : null,
+  ].filter(Boolean);
+  if (activeSearches.length > 0) {
+    const warn = ws.addRow(['⚠ ОТЧЁТ ОТФИЛЬТРОВАН', activeSearches.join('; ')]);
+    warn.font = { bold: true, color: { argb: 'FFB45309' } };
+    ws.addRow([]);
+  }
+
   // === ПОВАР ===
   ws.addRow(['ГОТОВКА ПОВАРА']);
   styleSummarySectionRow(ws, 'FF7E22CE', 'FFF3E8FF'); // purple-700 на purple-100
@@ -284,23 +394,26 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
     const dishStops = h.entries.filter(e => e.ingredientName.startsWith('[DISH]'));
     const ingStops = h.entries.filter(e => !e.ingredientName.startsWith('[DISH]'));
 
-    const totalDowntimeMs = sumMergedMs(h.entries);
-    const businessMs = calculateBusinessOverlap(
-      h.rangeStart,
-      h.rangeEnd,
-      payload.settings.restaurantOpenTime || '12:00',
-      payload.settings.restaurantCloseTime || '23:59',
-      payload.settings.excludedDates || []
-    );
-    const downtimePercent = businessMs > 0 ? Math.round((totalDowntimeMs / businessMs) * 100) : 0;
+    // Обрезаем конец периода по «сейчас»: активные стопы не должны уходить
+    // в будущее — иначе простой считался бы вперёд по времени.
+    const effectiveEnd = Math.min(h.rangeEnd, Date.now());
+
+    // Простой В ПЕРИОДЕ и В РАБОЧЕЕ ВРЕМЯ — тот же расчёт, что в строках групп
+    // на листе «История стопов». Календарная длительность стопов рядом,
+    // отдельной строкой и с честным названием: у стопа, начавшегося накануне,
+    // она законно больше периода, и делить её на рабочие часы нельзя.
+    const inPeriodDowntimeMs = businessDowntimeMs(h.entries, h.rangeStart, effectiveEnd, payload.settings);
+    const calendarDowntimeMs = sumMergedMs(h.entries);
+    const percent = downtimePercent(h.entries, h.rangeStart, effectiveEnd, payload.settings);
 
     ws.addRow(['Всего стопов (в периоде)', h.entries.length]);
     ws.addRow(['Активных сейчас', active.length]);
     ws.addRow(['Завершённых', completed.length]);
     ws.addRow(['Из них блюд', dishStops.length]);
     ws.addRow(['Из них ингредиентов', ingStops.length]);
-    ws.addRow(['Суммарное время downtime', formatDuration(totalDowntimeMs)]);
-    ws.addRow(['% downtime от рабочего времени', `${downtimePercent}%`]);
+    ws.addRow(['Простой в рабочее время (в периоде)', formatDuration(inPeriodDowntimeMs)]);
+    ws.addRow(['Календарное время стопов (включая нерабочие часы)', formatDuration(calendarDowntimeMs)]);
+    ws.addRow(['% простоя от рабочего времени', `${percent}%`]);
   } else {
     ws.addRow(['Данные истории стопов не доступны', '']);
   }
@@ -411,45 +524,12 @@ function buildHistorySheet(
     ws.getColumn(c).numFmt = 'dd.mm.yyyy hh:mm:ss';
   }
 
-  // % downtime считаем ТОЧНО так же как UI (HistoryGroupRow в StopListHistorySection):
-  //  1. effectiveRangeEnd = min(rangeEnd, Date.now()) — обрезаем «активные»
-  //     стопы по текущему моменту, чтобы не уходить в будущее.
-  //  2. totalPossibleDuration = бизнес-часы за [rangeStart; effectiveRangeEnd].
-  //  3. actualStoppedMs = для каждого union-интервала entries (после mergeIntervals)
-  //     считаем бизнес-overlap, клипуя по [rangeStart; effectiveRangeEnd].
-  //  4. percent = min(100, round(actual / total * 100)).
-  // Без этого % мог превышать 100 и расходиться с UI.
   const effectiveRangeEnd = Math.min(history.rangeEnd, Date.now());
-  const totalPossibleDuration = Math.max(1, calculateBusinessOverlap(
-    history.rangeStart,
-    effectiveRangeEnd,
-    settings.restaurantOpenTime || '12:00',
-    settings.restaurantCloseTime || '23:59',
-    settings.excludedDates || []
-  ));
+  const totalPossibleDuration = businessMsInRange(history.rangeStart, effectiveRangeEnd, settings);
 
-  /** Считает % downtime по entries — копия логики HistoryGroupRow в UI. */
-  const calcPercent = (entries: DashboardHistoryEntry[]): number => {
-    const actualStoppedMs = mergeIntervals(
-      entries.map(e => ({
-        stoppedAt: e.stoppedAt,
-        resumedAt: e.isActive ? effectiveRangeEnd : e.resumedAt,
-      }))
-    ).reduce((sum, [start, end]) => {
-      const clippedStart = Math.max(history.rangeStart, start);
-      const clippedEnd = Math.min(effectiveRangeEnd, end);
-      if (clippedEnd > clippedStart) {
-        return sum + calculateBusinessOverlap(
-          clippedStart, clippedEnd,
-          settings.restaurantOpenTime || '12:00',
-          settings.restaurantCloseTime || '23:59',
-          settings.excludedDates || []
-        );
-      }
-      return sum;
-    }, 0);
-    return Math.min(100, Math.round((actualStoppedMs / totalPossibleDuration) * 100));
-  };
+  /** Считает % downtime по entries — общая логика с UI и листом «Сводка». */
+  const calcPercent = (entries: DashboardHistoryEntry[]): number =>
+    downtimePercent(entries, history.rangeStart, effectiveRangeEnd, settings);
 
   const sourceLabel = (s: string | null | undefined): string => {
     if (s === 'kds') return 'KDS';
@@ -558,8 +638,12 @@ function buildHistorySheet(
 
       const isDish = g.name.startsWith('[DISH]');
       const cleanName = isDish ? g.name.replace(/^\[DISH\]\s*/, '') : g.name;
-      const groupDowntimeMs = sumMergedMs(g.entries);
-      // % считаем ТОЧНО как UI — через calcPercent (см. helper выше).
+      // Длительность и процент — из одного расчёта, обрезанного по периоду и
+      // рабочему времени. Раньше в колонке «Длительность» стояло сырое
+      // календарное время: в отчёте за один день строка «200 Судак — 13 ч 30 мин»
+      // при фактических 30 рабочих минутах простоя в этот день (стоп начался
+      // накануне в 23:00) — числа в соседних колонках не сходились между собой.
+      const groupDowntimeMs = businessDowntimeMs(g.entries, history.rangeStart, effectiveRangeEnd, settings);
       const downtimePercent = calcPercent(g.entries);
 
       const groupRow = ws.addRow([
@@ -629,20 +713,21 @@ function buildHistorySheet(
     });
 
     for (const g of sortedDays) {
-      const dayMs = sumMergedMs(g.entries);
-      // % за день: dayMs / один рабочий день
+      // Границы суток этой строки
       const dayStartMs = (() => {
         const [d, m, y] = g.dateStr.split('.').map(Number);
         return new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
       })();
-      const dayEndMs = dayStartMs + 86400000;
-      const dayBusinessMs = calculateBusinessOverlap(
-        dayStartMs, dayEndMs,
-        settings.restaurantOpenTime || '12:00',
-        settings.restaurantCloseTime || '23:59',
-        settings.excludedDates || []
-      );
-      const downtimePercent = dayBusinessMs > 0 ? Math.round((dayMs / dayBusinessMs) * 100) : 0;
+      // Конец дня обрезаем и по «сейчас» (сегодняшний день ещё не закончился),
+      // и по концу выбранного периода.
+      const dayEndMs = Math.min(dayStartMs + 86400000, effectiveRangeEnd);
+
+      // Длительность и процент считаются ТЕМ ЖЕ способом, что и строки групп:
+      // с обрезкой по границам дня и переводом в рабочее время. Раньше здесь
+      // делилось сырое календарное время стопов на рабочие часы дня, и строка
+      // за вчерашний день внутри однодневного отчёта показывала, например, 113%.
+      const dayMs = businessDowntimeMs(g.entries, dayStartMs, dayEndMs, settings);
+      const dayPercent = downtimePercent(g.entries, dayStartMs, dayEndMs, settings);
 
       const dateRow = ws.addRow([
         'Дата', '',
@@ -650,7 +735,7 @@ function buildHistorySheet(
         null, null,
         Math.round(dayMs / 1000),
         formatDuration(dayMs),
-        `${downtimePercent}%`,
+        `${dayPercent}%`,
         g.entries.length,
         '', '', '', '',
         g.isActive ? 'ДА' : 'НЕТ',
@@ -680,7 +765,8 @@ function buildHistorySheet(
 function buildSpeedSheet(
   wb: ExcelJS.Workbook,
   sheetName: string,
-  data: AggregatedSpeedReport
+  data: AggregatedSpeedReport,
+  searchQuery?: string
 ): void {
   // summaryBelow=false — итоговая строка (Категория/Блюдо) над группой,
   // кнопки «+/−» на ней (см. лист «История стопов»).
@@ -689,6 +775,12 @@ function buildSpeedSheet(
   });
 
   ws.addRow([sheetName]).font = { bold: true, size: 14 };
+  // Применённый поиск печатаем явно: цифры на листе посчитаны ТОЛЬКО по
+  // отфильтрованным блюдам, и без этой строки книгу не отличить от полной.
+  if (searchQuery && searchQuery.trim()) {
+    const warn = ws.addRow(['⚠ Показаны только блюда по запросу:', searchQuery.trim()]);
+    warn.font = { bold: true, color: { argb: 'FFB45309' } };
+  }
   ws.addRow([]);
 
   const headers = [
@@ -766,13 +858,18 @@ function buildSpeedSheet(
 // Лист 5: Скорость готовки повара
 // ───────────────────────────────────────────────────────────────────────────
 
-function buildChefSpeedSheet(wb: ExcelJS.Workbook, data: AggregatedChefReport): void {
+function buildChefSpeedSheet(wb: ExcelJS.Workbook, data: AggregatedChefReport, searchQuery?: string): void {
   // summaryBelow=false — как на остальных иерархических листах.
   const ws = wb.addWorksheet('Скорость готовки повара', {
     properties: { outlineProperties: { summaryBelow: false, summaryRight: false } },
   });
 
   ws.addRow(['Скорость готовки повара']).font = { bold: true, size: 14 };
+  // Применённый поиск — см. комментарий в buildSpeedSheet
+  if (searchQuery && searchQuery.trim()) {
+    const warn = ws.addRow(['⚠ Показаны только блюда по запросу:', searchQuery.trim()]);
+    warn.font = { bold: true, color: { argb: 'FFB45309' } };
+  }
   ws.addRow([]);
 
   const headers = [
@@ -861,9 +958,9 @@ export async function exportDashboardToExcel(payload: ExportPayload): Promise<vo
 
   buildSummarySheet(wb, payload);
   if (payload.history) buildHistorySheet(wb, payload.history, payload.settings);
-  if (payload.speedStandard) buildSpeedSheet(wb, 'Скорость отдачи (Обычные)', payload.speedStandard);
-  if (payload.speedParked) buildSpeedSheet(wb, 'Скорость отдачи (Парковка)', payload.speedParked);
-  if (payload.chefSpeed) buildChefSpeedSheet(wb, payload.chefSpeed);
+  if (payload.speedStandard) buildSpeedSheet(wb, 'Скорость отдачи (Обычные)', payload.speedStandard, payload.speedSearchQuery);
+  if (payload.speedParked) buildSpeedSheet(wb, 'Скорость отдачи (Парковка)', payload.speedParked, payload.speedSearchQuery);
+  if (payload.chefSpeed) buildChefSpeedSheet(wb, payload.chefSpeed, payload.chefSearchQuery);
 
   const buffer = await wb.xlsx.writeBuffer();
   const blob = new Blob([buffer], {

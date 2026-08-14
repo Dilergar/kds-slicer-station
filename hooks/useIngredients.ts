@@ -1,6 +1,12 @@
 import { useState, useMemo, useEffect, useCallback } from 'react';
 import { IngredientBase } from '../types';
-import { fetchIngredients, createIngredient, updateIngredient, deleteIngredient } from '../services/ingredientsApi';
+import {
+  fetchIngredients,
+  createIngredient,
+  updateIngredient,
+  deleteIngredient,
+  renameParentIngredient
+} from '../services/ingredientsApi';
 
 /**
  * Хук для управления справочником Ингредиентов.
@@ -56,6 +62,28 @@ export const useIngredients = () => {
   }, [loadIngredients]);
 
   /**
+   * Переименовывает сырьё вместе с приставками во всех разновидностях.
+   * Один транзакционный запрос вместо цикла из N независимых — иначе обрыв
+   * связи посреди цикла оставлял часть разновидностей со старой приставкой,
+   * а ошибка уходила только в консоль.
+   *
+   * @param id — id сырья
+   * @param name — новое название
+   * @returns текст ошибки для показа пользователю либо null при успехе
+   */
+  const handleRenameParent = useCallback(async (id: string, name: string): Promise<string | null> => {
+    try {
+      await renameParentIngredient(id, name);
+      await loadIngredients();
+      return null;
+    } catch (err) {
+      console.error('[useIngredients] Ошибка переименования сырья:', err);
+      await loadIngredients();
+      return err instanceof Error ? err.message : 'Не удалось переименовать сырьё';
+    }
+  }, [loadIngredients]);
+
+  /**
    * Удаляет ингредиент через API (каскадно удаляет children через FK).
    */
   const handleDeleteIngredient = useCallback(async (id: string) => {
@@ -74,6 +102,7 @@ export const useIngredients = () => {
     loading,
     handleAddIngredient,
     handleUpdateIngredient,
+    handleRenameParent,
     handleDeleteIngredient,
     reloadIngredients: loadIngredients
   };

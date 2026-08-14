@@ -20,6 +20,40 @@ import { pushDishStop, pushDishUnstop, pushDishUnstopAll } from '../services/kds
 const router = Router();
 
 /**
+ * SQL-фрагмент: отображаемое имя блюда «<код> <название>» из чужой
+ * ctlg15_dishes (требует в запросе алиас `d` = ctlg15_dishes).
+ *
+ * ⚠️ ЕДИНЫЙ ФОРМАТ для ВСЕХ точек записи в slicer_stop_history. Точек три:
+ * каскадное снятие и ручное снятие в этом файле и триггер-архиватор в миграции
+ * 021. Раньше каждая писала по-своему — каскад без кода, ручная брала строку с
+ * фронта (и подставляла её всем блюдам alias-группы, включая те, у которых код
+ * другой), триггер склеивал код с именем. Группировка в отчёте идёт по строке
+ * имени, поэтому одно блюдо разваливалось на две-три записи, у каждой свой
+ * процент простоя и свой счётчик «N раз».
+ */
+const DISH_DISPLAY_NAME_SQL = `
+  CASE
+    WHEN d.code IS NOT NULL AND d.code <> ''
+      THEN d.code || ' ' || COALESCE(d.name, 'Unknown dish')
+    ELSE COALESCE(d.name, 'Unknown dish')
+  END`;
+
+/**
+ * Ключ advisory-блокировки стоп-листа.
+ *
+ * Пересчёт каскада по своей природе глобальный: он строит целевой набор по
+ * ВСЕМ стопнутым ингредиентам сразу. Под READ COMMITTED два параллельных
+ * toggle видят каждый свой снимок — транзакция «сняли морковь» видит огурцы
+ * ещё стопнутыми, транзакция «сняли огурцы» видит стопнутой морковь, и обе
+ * оставляют каскадную строку. Блюдо застревало на стопе с неверной причиной,
+ * и само уже не чинилось. Утром при разборе поставки такие два тапа подряд —
+ * штатная ситуация, а не гонка-экзотика.
+ *
+ * Число произвольное, важна лишь его уникальность в пределах базы.
+ */
+const STOPLIST_LOCK_KEY = 815_240_001;
+
+/**
  * Пересчёт каскадных стопов блюд после изменения состояния ингредиентов.
  *
  * Работает строго внутри переданного клиента/транзакции. Приводит таблицу
@@ -150,14 +184,24 @@ async function recalculateCascadeStops(
   //    выглядело как ингредиент, не как блюдо). Для alias-блюд берём имя alias-а:
   //    то, что видит нарезчик на доске (primary-имя уже резолвится отдельно через
   //    /api/orders; в истории логичнее хранить фактический dish_id и его имя).
+  //    Забираем строки ВСЕХ типов, а не только CASCADE: набор всех занятых
+  //    dish_id нужен шагу 4, чтобы не вызывать pushDishStop для блюда, которое
+  //    уже стоит на ручном стопе (см. комментарий там).
+  //    Имя блюда собирается как «код + название» — единый формат для всех трёх
+  //    точек записи в историю (каскад здесь, ручное снятие ниже, триггер-архиватор
+  //    в миграции 021). Раньше каскад писал имя без кода, ручная ветка — с кодом
+  //    от клиента, триггер — «код + имя»: в отчёте одно блюдо разваливалось на
+  //    две-три строки, каждая со своим процентом простоя, потому что группировка
+  //    в UI идёт по строке имени.
   const existingRes = await client.query(
-    `SELECT s.dish_id, s.stopped_at, s.reason, s.cascade_ingredient_id, s.rgst3_row_suuid,
+    `SELECT s.dish_id, s.stop_type, s.stopped_at, s.reason, s.cascade_ingredient_id, s.rgst3_row_suuid,
             s.stopped_by_uuid, s.stopped_by_name, s.actor_source,
-            COALESCE(d.name, 'Unknown dish') AS dish_name
+            ${DISH_DISPLAY_NAME_SQL} AS dish_name
        FROM slicer_dish_stoplist s
-       LEFT JOIN ctlg15_dishes d ON d.suuid::text = s.dish_id
-       WHERE s.stop_type = 'CASCADE'`
+       LEFT JOIN ctlg15_dishes d ON d.suuid::text = s.dish_id`
   );
+  /** Все блюда, у которых уже есть строка стопа любого типа */
+  const occupiedDishIds = new Set<string>(existingRes.rows.map(r => r.dish_id));
   const existingCascade = new Map<
     string,
     {
@@ -172,6 +216,7 @@ async function recalculateCascadeStops(
     }
   >();
   for (const row of existingRes.rows) {
+    if (row.stop_type !== 'CASCADE') continue;
     existingCascade.set(row.dish_id, {
       stoppedAt: row.stopped_at,
       reason: row.reason,
@@ -224,11 +269,42 @@ async function recalculateCascadeStops(
     }
   }
 
+  // 3b. Обновляем причину у каскадных строк, которые остаются на стопе, но
+  //     заблокированы уже ДРУГИМ ингредиентом.
+  //     Раньше ветки обновления не было вовсе: причина и ссылка на блокирующий
+  //     ингредиент писались один раз при вставке и больше не менялись. В рецепте
+  //     салата на стопе морковь и огурцы, на блюде висит «Missing: Морковь · Кубик»;
+  //     привезли морковь, сняли её со стопа — блюдо справедливо остаётся на стопе
+  //     из-за огурцов, но причина по-прежнему указывает на морковь. Заведующая шла
+  //     искать то, что уже стоит на столе.
+  for (const [dishId, target] of targetMap) {
+    const existing = existingCascade.get(dishId);
+    if (!existing) continue;
+    if (existing.blockingId === target.blockingId) continue;
+
+    const freshReason = `Missing: ${target.blockingName}`;
+    await client.query(
+      `UPDATE slicer_dish_stoplist
+          SET reason = $2, cascade_ingredient_id = $3
+        WHERE dish_id = $1 AND stop_type = 'CASCADE'`,
+      [dishId, freshReason, target.blockingId]
+    );
+  }
+
   // 4. Добавляем новые каскадные стопы. ON CONFLICT DO NOTHING — защита от
   //    перезаписи MANUAL-строки: если блюдо уже остановлено вручную, каскад
   //    молча не трогает его. Sync с rgst3 — только для реально вставленных строк.
   for (const [dishId, target] of targetMap) {
     if (!existingCascade.has(dishId)) {
+      // Блюдо уже занято строкой другого типа (MANUAL) — каскаду здесь делать
+      // нечего. Проверка ДО pushDishStop принципиальна: раньше её не было, и при
+      // каждом переключении любого ингредиента в чужую rgst3_dishstoplist
+      // вставлялась и тут же удалялась строка по такому блюду, а в «Историю
+      // стоп-листов» падала запись длительностью около нуля с меткой [KDS]
+      // (её создавал триггер-архиватор, для которого этот DELETE выглядел чужим).
+      // За смену таких фантомов набегали десятки.
+      if (occupiedDishIds.has(dishId)) continue;
+
       const reason = `Missing: ${target.blockingName}`;
       // Sync ДО вставки в slicer_dish_stoplist — если rgst3 INSERT упадёт,
       // транзакция откатит всё. Если sync выключен — pushDishStop вернёт null.
@@ -282,11 +358,19 @@ router.post('/toggle', async (req: Request, res: Response) => {
     try {
       await client.query('BEGIN');
 
+      // Сериализуем весь toggle целиком (см. STOPLIST_LOCK_KEY): пересчёт каскада
+      // глобальный, и два параллельных снятия под READ COMMITTED оставляли блюдо
+      // на стопе с чужой причиной. Блокировка транзакционная — снимается сама
+      // на COMMIT/ROLLBACK, отдельного unlock не нужно. Заодно исключает
+      // недетерминированный порядок блокировки строк (потенциальный дедлок).
+      await client.query('SELECT pg_advisory_xact_lock($1)', [STOPLIST_LOCK_KEY]);
+
       if (targetType === 'ingredient') {
         const current = await client.query(
           `SELECT is_stopped, stop_reason, stop_timestamp, name,
                   stopped_by_uuid, stopped_by_name
-             FROM slicer_ingredients WHERE id = $1`,
+             FROM slicer_ingredients WHERE id = $1
+             FOR UPDATE`,
           [targetId]
         );
         if (current.rows.length === 0) {
@@ -385,7 +469,20 @@ router.post('/toggle', async (req: Request, res: Response) => {
         );
         const isCurrentlyStopped = sliceRes.rows.length > 0 || rgstRes.rows.length > 0;
         const isStopping = !isCurrentlyStopped;
-        const dishName: string = req.body.dishName || 'Unknown';
+
+        // Отображаемые имена блюд группы берём ИЗ БД, а не из req.body.dishName.
+        // Клиент присылал одну строку и она подставлялась ВСЕМ блюдам группы,
+        // включая варианты с другим кодом (163 и Д163) — в отчёте это давало
+        // расхождение имён и разбиение одного блюда на несколько строк.
+        const namesRes = await client.query(
+          `SELECT d.suuid::text AS dish_id, ${DISH_DISPLAY_NAME_SQL} AS display_name
+             FROM ctlg15_dishes d
+            WHERE d.suuid::text = ANY($1::text[])`,
+          [aliasGroup]
+        );
+        const displayNameById = new Map<string, string>(
+          namesRes.rows.map(r => [r.dish_id, r.display_name])
+        );
 
         if (isStopping) {
           // STOP всей alias-группы. Для каждого блюда:
@@ -429,6 +526,39 @@ router.post('/toggle', async (req: Request, res: Response) => {
         //      - линкованные (наши) — триггер пропускает, история уже есть
         //      - нелинкованные (кассирские) — триггер архивирует с actor_source='kds'
         //   3. DELETE из slicer_dish_stoplist (после rgst3, чтобы линковка жила).
+        // Каскадный стоп руками не снимается.
+        //
+        // Раньше ветка снятия не смотрела на stop_type: писала историю, удаляла
+        // строку (любую, включая CASCADE), а следом recalculateCascadeStops
+        // вставлял её обратно — уже со свежим stopped_at. Внешне «ничего не
+        // произошло» (тумблер зеленел и возвращался в красное, ингредиента-то
+        // нет), но в отчёте появлялся закрытый стоп на 40 минут, а фактический
+        // простой начинал отсчёт заново. Пять таких тапов за смену — пять кусков
+        // вместо одного непрерывного стопа.
+        const cascadeOnlyRes = await client.query(
+          `SELECT reason FROM slicer_dish_stoplist
+            WHERE dish_id = ANY($1::text[])
+              AND stop_type = 'CASCADE'
+            LIMIT 1`,
+          [aliasGroup]
+        );
+        const manualExistsRes = await client.query(
+          `SELECT 1 FROM slicer_dish_stoplist
+            WHERE dish_id = ANY($1::text[])
+              AND stop_type <> 'CASCADE'
+            LIMIT 1`,
+          [aliasGroup]
+        );
+        if (cascadeOnlyRes.rows.length > 0 && manualExistsRes.rows.length === 0) {
+          await client.query('ROLLBACK');
+          const why = cascadeOnlyRes.rows[0].reason || 'нет ингредиента';
+          res.status(409).json({
+            error: `Блюдо на стопе из-за ингредиента (${why}). Снимите стоп с ингредиента в разделе «Стоп-лист».`,
+            reason: 'CASCADE_STOP'
+          });
+          return;
+        }
+
         for (const id of aliasGroup) {
           const idSliceRes = await client.query(
             `SELECT stop_type, reason, stopped_at, rgst3_row_suuid,
@@ -452,13 +582,23 @@ router.post('/toggle', async (req: Request, res: Response) => {
                  actor_source)
                VALUES ('dish', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
               [
-                id, dishName, stoppedAt, now,
+                id, displayNameById.get(id) || 'Unknown dish', stoppedAt, now,
                 row.reason || 'Manual', durationMs,
                 row.stopped_by_uuid, row.stopped_by_name,
                 actor.uuid, actor.name,
                 row.actor_source || 'slicer',
               ]
             );
+
+            // Сначала — НАША строка по сохранённому suuid, без фильтра по смене.
+            // pushDishUnstopAll ниже ограничен текущей открытой сменой, поэтому
+            // если стоп пережил закрытие смены (поставили в 22:00, сняли утром),
+            // наша строка из вчерашней смены оставалась в базе заказчика навсегда
+            // и вечно приходила в отчёт вторым источником как «KDS-стоп»,
+            // дублируя нашу же запись и завышая счётчик «N раз».
+            if (row.rgst3_row_suuid) {
+              await pushDishUnstop(client, row.rgst3_row_suuid);
+            }
           }
 
           // Удаляем все rgst3 строки для этого блюда (наши + чужие).
@@ -516,7 +656,26 @@ router.post('/toggle', async (req: Request, res: Response) => {
  *   - slicer_stop_history = уже удалённые из rgst3 строки;
  *   - rgst3 архив = живые строки в закрытых сменах.
  * Дедупликация лишняя, UNION ALL безопасен.
+ *
+ * Если ни from, ни to не переданы — подставляется окно последних
+ * STOP_HISTORY_DEFAULT_DAYS суток. Каждый источник ограничен
+ * STOP_HISTORY_MAX_ROWS строками.
  */
+
+/** Предел строк на каждый источник истории стопов — страховка от годового архива */
+const STOP_HISTORY_MAX_ROWS = 5000;
+
+/** Окно по умолчанию, если период не передан (суток) */
+const STOP_HISTORY_DEFAULT_DAYS = 1;
+
+/**
+ * Нижняя граница периода по умолчанию.
+ * @returns ISO-строка «сейчас минус STOP_HISTORY_DEFAULT_DAYS суток»
+ */
+function defaultFromIso(): string {
+  return new Date(Date.now() - STOP_HISTORY_DEFAULT_DAYS * 24 * 60 * 60 * 1000).toISOString();
+}
+
 router.get('/history', async (req: Request, res: Response) => {
   try {
     const { from, to } = req.query;
@@ -539,19 +698,26 @@ router.get('/history', async (req: Request, res: Response) => {
     }
 
     // === Источник 1: slicer_stop_history (наш модуль + триггер) ===
+    //
+    // ⚠️ Период обязателен по смыслу. Раньше ветка «ни from, ни to» не добавляла
+    // WHERE вообще: выбиралась вся наша история плюс (ниже) весь чужой архив по
+    // всем закрытым сменам за годы работы ресторана. Теперь при отсутствии обеих
+    // границ подставляется окно по умолчанию, и на обоих источниках стоит LIMIT.
     let sliceQuery = 'SELECT * FROM slicer_stop_history';
     const sliceParams: any[] = [];
-    if (from && to) {
+    const effectiveFrom = from || (to ? null : defaultFromIso());
+
+    if (effectiveFrom && to) {
       sliceQuery += ' WHERE (resumed_at IS NULL OR resumed_at >= $1) AND stopped_at <= $2';
-      sliceParams.push(from, to);
-    } else if (from) {
+      sliceParams.push(effectiveFrom, to);
+    } else if (effectiveFrom) {
       sliceQuery += ' WHERE (resumed_at IS NULL OR resumed_at >= $1)';
-      sliceParams.push(from);
+      sliceParams.push(effectiveFrom);
     } else if (to) {
       sliceQuery += ' WHERE stopped_at <= $1';
       sliceParams.push(to);
     }
-    sliceQuery += ' ORDER BY stopped_at DESC';
+    sliceQuery += ` ORDER BY stopped_at DESC LIMIT ${STOP_HISTORY_MAX_ROWS}`;
     const sliceResult = await pool.query(sliceQuery, sliceParams);
 
     // === Источник 2: rgst3 архив закрытых смен ===
@@ -588,17 +754,25 @@ router.get('/history', async (req: Request, res: Response) => {
       WHERE s.ctlg14_closed = true
         AND s.ctlg14_closetime IS NOT NULL
     `;
+    // ⚠️ Границы периода приходят с фронта в UTC (toISOString), а insert_date и
+    // ctlg14_closetime — TIMESTAMP БЕЗ часового пояса (локальное время KDS).
+    // При прямом сравнении PostgreSQL молча отбрасывал признак зоны, и окно для
+    // стопов кассира уезжало на разницу поясов: в отчёте за 13-е пропадали
+    // вечерние стопы этого дня и появлялись вчерашние. Приводим параметр к
+    // локальному времени сессии явно: $n::timestamptz AT TIME ZONE current_setting('TimeZone').
+    const TZ_CAST = `::timestamptz AT TIME ZONE current_setting('TimeZone')`;
     const rgstParams: any[] = [];
-    if (from && to) {
-      rgstQuery += ' AND s.ctlg14_closetime >= $1 AND r.insert_date <= $2';
-      rgstParams.push(from, to);
-    } else if (from) {
-      rgstQuery += ' AND s.ctlg14_closetime >= $1';
-      rgstParams.push(from);
+    if (effectiveFrom && to) {
+      rgstQuery += ` AND s.ctlg14_closetime >= $1${TZ_CAST} AND r.insert_date <= $2${TZ_CAST}`;
+      rgstParams.push(effectiveFrom, to);
+    } else if (effectiveFrom) {
+      rgstQuery += ` AND s.ctlg14_closetime >= $1${TZ_CAST}`;
+      rgstParams.push(effectiveFrom);
     } else if (to) {
-      rgstQuery += ' AND r.insert_date <= $1';
+      rgstQuery += ` AND r.insert_date <= $1${TZ_CAST}`;
       rgstParams.push(to);
     }
+    rgstQuery += ` ORDER BY r.insert_date DESC LIMIT ${STOP_HISTORY_MAX_ROWS}`;
     const rgstResult = await pool.query(rgstQuery, rgstParams);
 
     // === Резолв складов для dish-записей ===
@@ -607,12 +781,18 @@ router.get('/history', async (req: Request, res: Response) => {
     // и одним запросом достаём все привязки. На фронте это даст возможность
     // фильтровать историю по складу. Ингредиентам storages не нужен (они
     // живут в slicer_ingredients и не привязаны к складам в чужой схеме).
+    // target_id — VARCHAR, поэтому перед приведением массива к uuid[] в запросе
+    // ниже отсеиваем всё, что не похоже на uuid: одна испорченная строка иначе
+    // уронила бы весь отчёт с 22P02.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const dishTargetIds = new Set<string>();
     for (const row of sliceResult.rows) {
-      if (row.target_type === 'dish' && row.target_id) dishTargetIds.add(row.target_id);
+      if (row.target_type === 'dish' && row.target_id && UUID_RE.test(row.target_id)) {
+        dishTargetIds.add(row.target_id);
+      }
     }
     for (const row of rgstResult.rows) {
-      if (row.target_id) dishTargetIds.add(row.target_id);
+      if (row.target_id && UUID_RE.test(row.target_id)) dishTargetIds.add(row.target_id);
     }
     const storageMap = new Map<string, { id: string; name: string }[]>();
     if (dishTargetIds.size > 0) {
@@ -623,7 +803,11 @@ router.get('/history', async (req: Request, res: Response) => {
            stor.name AS storage_name
          FROM ctlg18_menuitems mi
          JOIN ctlg17_storages stor ON stor.suuid = mi.ctlg18_ctlg17_uuid__storage
-         WHERE mi.ctlg18_ctlg15_uuid__dish::text = ANY($1::text[])`,
+         -- Каст на параметре, а не на колонке: uuid→text делает индекс по
+         -- ctlg18_ctlg15_uuid__dish непригодным и превращает выборку складов
+         -- в полный перебор меню. target_id мы формируем сами из uuid-колонок,
+         -- поэтому приведение массива к uuid[] безопасно.
+         WHERE mi.ctlg18_ctlg15_uuid__dish = ANY($1::uuid[])`,
         [Array.from(dishTargetIds)]
       );
       for (const r of storagesRes.rows) {
@@ -685,9 +869,44 @@ router.get('/history', async (req: Request, res: Response) => {
     });
 
     // Объединяем и сортируем по stoppedAt DESC — как и раньше для single source.
-    const history = [...sliceEntries, ...rgstEntries].sort(
+    const merged = [...sliceEntries, ...rgstEntries].sort(
       (a, b) => b.stoppedAt - a.stoppedAt
     );
+
+    // === Схлопывание alias-групп ===
+    //
+    // Один стоп блюда с вариантом доставки — это ОДНО событие для владельца,
+    // но в БД две строки: модуль корректно стопит всю alias-группу (163 + Д163),
+    // и при снятии история пишется на каждое блюдо группы. При чтении обе
+    // резолвятся в одно отображаемое имя, и в отчёте выходило «163 Баклажаны —
+    // 2 раза» при суммарной длительности одного стопа: цифры не сходились между
+    // собой. Время считается объединением интервалов и было верным, врал только
+    // счётчик событий. В базе сейчас 116 таких пар, то есть затронуто почти
+    // каждое блюдо доставки.
+    //
+    // Ключ схлопывания: имя (уже резолвнутое на primary) + момент начала с
+    // точностью до 2 секунд — записи группы создаются в одной транзакции,
+    // но stopped_at у них берётся из разных строк и может отличаться на миллисекунды.
+    const DEDUP_WINDOW_MS = 2000;
+    const seen = new Map<string, typeof merged[number]>();
+    const history: typeof merged = [];
+    for (const entry of merged) {
+      const bucket = Math.round(entry.stoppedAt / DEDUP_WINDOW_MS);
+      // Проверяем текущее и соседнее окно — событие могло лечь на границу
+      const key = `${entry.ingredientName}|${bucket}`;
+      const keyPrev = `${entry.ingredientName}|${bucket - 1}`;
+      const twin = seen.get(key) || seen.get(keyPrev);
+      if (twin) {
+        // Оставляем более информативную запись: ту, где есть кто снял
+        if (!twin.resumedByName && entry.resumedByName) {
+          twin.resumedByUuid = entry.resumedByUuid;
+          twin.resumedByName = entry.resumedByName;
+        }
+        continue;
+      }
+      seen.set(key, entry);
+      history.push(entry);
+    }
 
     res.json(history);
   } catch (err) {

@@ -15,7 +15,7 @@
 | `dish_id` | VARCHAR(255) | ✅ | — | ID блюда (ctlg15_dishes.suuid) |
 | `dish_name` | VARCHAR(255) | ✅ | — | Название блюда на момент завершения |
 | `completed_at` | TIMESTAMPTZ | ✅ | `NOW()` | Время завершения |
-| `total_quantity` | INT | ✅ | — | Количество порций |
+| `total_quantity` | NUMERIC(21,3) | ✅ | — | Количество порций. С миграции 027 — не INT: у заказчика `docm2tabl1_quantity` тоже `NUMERIC(21,3)`, и весовая позиция (0.35 порции) роняла INSERT с 22P02, из-за чего карточку нельзя было отдать вообще. ⚠️ node-postgres отдаёт NUMERIC строкой — маппер в `history.ts` приводит через `Number()` |
 | `prep_time_ms` | BIGINT | ✅ | — | Время приготовления в миллисекундах |
 | `was_parked` | BOOLEAN | ❌ | `FALSE` | Был ли заказ паркован (для разделения KPI) |
 | `snapshot` | JSONB | ❌ | `NULL` | Полный объект Order (для восстановления) |

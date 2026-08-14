@@ -42,8 +42,18 @@ export const useOrders = ({
   const [orderHistory, setOrderHistory] = useState<OrderHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // Момент последнего УСПЕШНОГО ответа сервера и число подряд идущих неудач.
+  // Нужны для видимой плашки «нет связи»: без неё доска при обрыве Wi-Fi просто
+  // замирает с последним снимком, таймеры на карточках продолжают тикать
+  // (они считаются локально), и нарезчик уверен, что заказов нет.
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [failedPolls, setFailedPolls] = useState(0);
+
   // Ref для предотвращения одновременных polling-запросов
   const pollingRef = useRef(false);
+  // Такой же сторож для истории: без него зависшие запросы копились каждые 4 сек
+  // и занимали все слоты соединений браузера
+  const historyPollingRef = useRef(false);
 
   // Id заказов, которым merge_ack проставлен оптимистично и ещё НЕ
   // подтверждён данными с сервера. Пока id здесь — polling не может откатить
@@ -77,34 +87,52 @@ export const useOrders = ({
       setOrders(pending.size === 0
         ? data
         : data.map(o => pending.has(o.id) ? { ...o, merge_ack: true } : o));
+      setLastSyncAt(Date.now());
+      setFailedPolls(0);
     } catch (err) {
       console.error('[useOrders] Ошибка загрузки заказов:', err);
+      setFailedPolls(prev => prev + 1);
     } finally {
       pollingRef.current = false;
       setLoading(false);
     }
   }, []);
 
-  /** Загрузка истории заказов из БД */
+  /**
+   * Загрузка истории заказов из БД.
+   *
+   * Окно запрашивается по настройке «Хранение истории»: сервер отдаёт только те
+   * записи, которые модалка истории и так покажет. Раньше запрос уходил без
+   * параметров и тянул ВСЮ накопленную историю вместе с JSON-снимками заказов —
+   * каждые 4 секунды на каждый планшет, с ростом без предела.
+   */
   const loadHistory = useCallback(async () => {
+    if (historyPollingRef.current) return;
+    historyPollingRef.current = true;
     try {
-      const data = await fetchOrderHistory();
+      const data = await fetchOrderHistory({ retentionMinutes: settings.historyRetentionMinutes });
       setOrderHistory(data);
     } catch (err) {
       console.error('[useOrders] Ошибка загрузки истории:', err);
+    } finally {
+      historyPollingRef.current = false;
     }
-  }, []);
+  }, [settings.historyRetentionMinutes]);
 
-  // Polling заказов каждые 4 секунды
+  // Polling заказов каждые 4 секунды. История — реже (раз в 30 сек): она нужна
+  // только когда нарезчик откроет модалку «История», и её объём несопоставим
+  // с доской. Точечно она перечитывается после каждой отдачи заказа.
   useEffect(() => {
     loadOrders();
-    loadHistory();
-    const interval = setInterval(() => {
-      loadOrders();
-      loadHistory();
-    }, 4000);
+    const interval = setInterval(loadOrders, 4000);
     return () => clearInterval(interval);
-  }, [loadOrders, loadHistory]);
+  }, [loadOrders]);
+
+  useEffect(() => {
+    loadHistory();
+    const interval = setInterval(loadHistory, 30000);
+    return () => clearInterval(interval);
+  }, [loadHistory]);
 
   /**
    * Объединение стеков (Merge). Отправляет на backend.
@@ -231,12 +259,19 @@ export const useOrders = ({
       }
     }
     const cleanedStack = newStack.filter(q => q > 0);
-    let currentTables = order.table_stack.flat();
-    currentTables = currentTables.length > quantityToComplete
-      ? currentTables.slice(quantityToComplete)
-      : [];
 
+    // Столы остатка. Усекаем ТОЛЬКО если столов больше, чем осталось блоков
+    // стека — то есть когда карточка склеена из нескольких одно-порционных
+    // позиций. Для обычной позиции чека (3 порции стола 50) стол один на все
+    // порции: старая формула `length > quantityToComplete ? slice : []` при
+    // отдаче 1 из 3 давала `1 > 1 = false` и обнуляла столы — у остатка на
+    // доске пропадала строка «столы: 50». Сервер считает то же самое и он
+    // авторитетен; здесь только оптимистичное отображение до ответа.
     const allOriginalTables = order.table_stack.flat();
+    const currentTables = allOriginalTables.length > cleanedStack.length && cleanedStack.length > 0
+      ? allOriginalTables.slice(allOriginalTables.length - cleanedStack.length)
+      : allOriginalTables;
+
     const completedTables = allOriginalTables.slice(0, quantityToComplete);
 
     // Оптимистичное обновление UI
@@ -253,9 +288,7 @@ export const useOrders = ({
         prepTimeMs,
         wasParked: order.was_parked,
         snapshot: { ...order, quantity_stack: [quantityToComplete], table_stack: [completedTables] },
-        consumedIngredients,
-        remainingQuantityStack: cleanedStack,
-        remainingTableStack: [currentTables]
+        consumedIngredients
       });
       await loadHistory();
     } catch (err) {
@@ -605,6 +638,10 @@ export const useOrders = ({
     orderHistory,
     setOrderHistory,
     loading,
+    /** Время последнего успешного ответа сервера (null — ещё ни одного) */
+    lastSyncAt,
+    /** Сколько опросов подряд не прошло — доска показывает плашку начиная с 3 */
+    failedPolls,
     handleStackMerge,
     handleMergeAck,
     handleCompleteOrder,

@@ -137,12 +137,38 @@ router.delete('/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    // Непустую категорию удалять запрещаем.
+    //
+    // slicer_dish_categories.category_id объявлен с ON DELETE CASCADE, поэтому
+    // удаление категории молча сносило ВСЕ привязки её блюд. А «нет категории =
+    // блюдо идёт мимо нарезчика» — жёсткий фильтр в GET /api/orders: блюда
+    // мгновенно переставали приезжать на доску, заказы уходили на кухню мимо
+    // станции нарезки. В базе у всех настроенных блюд ровно одна категория,
+    // то есть терялась единственная привязка, и восстанавливать её пришлось бы
+    // руками по одному блюду. Диалог в UI при этом говорил лишь расплывчатое
+    // «может сбить фильтры и сортировку».
+    //
+    // ?force=true — осознанное подтверждение из UI после показа числа блюд.
+    const force = req.query.force === 'true';
+    const usageRes = await pool.query(
+      'SELECT COUNT(*)::int AS cnt FROM slicer_dish_categories WHERE category_id = $1',
+      [id]
+    );
+    const dishCount: number = usageRes.rows[0]?.cnt ?? 0;
+    if (dishCount > 0 && !force) {
+      res.status(409).json({
+        error: `К категории привязано блюд: ${dishCount}. После удаления они пропадут с доски нарезчика — заказы на них пойдут мимо станции. Сначала перенесите блюда в другую категорию.`,
+        dishCount
+      });
+      return;
+    }
+
     const result = await pool.query('DELETE FROM slicer_categories WHERE id = $1 RETURNING id', [id]);
     if (result.rows.length === 0) {
       res.status(404).json({ error: 'Категория не найдена' });
       return;
     }
-    res.json({ deleted: true });
+    res.json({ deleted: true, unlinkedDishes: dishCount });
   } catch (err) {
     console.error('[Categories] Ошибка DELETE:', err);
     res.status(500).json({ error: 'Ошибка удаления категории' });

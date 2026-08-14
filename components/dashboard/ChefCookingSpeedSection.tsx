@@ -29,7 +29,7 @@ interface ChefCookingSpeedSectionProps {
   dishes: Dish[];
   categories: Category[];
   /** Подписка на агрегаты для Excel-экспорта (см. SpeedKpiSection). */
-  onDataReady?: (data: AggregatedChefReport) => void;
+  onDataReady?: (data: { report: AggregatedChefReport; searchQuery: string }) => void;
 }
 
 export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = ({
@@ -229,9 +229,11 @@ export const ChefCookingSpeedSection: React.FC<ChefCookingSpeedSectionProps> = (
   }, [entries, appliedFilter, dishes, categories, searchQuery, sortConfig]);
 
   // Подписка для Excel-экспорта — агрегаты с portions[] на каждом блюде.
+  // Строку поиска отдаём вместе с ними: экспорт печатает её в шапке листа,
+  // иначе отфильтрованная книга неотличима от полного отчёта.
   useEffect(() => {
-    onDataReady?.(cookingStats as AggregatedChefReport);
-  }, [cookingStats, onDataReady]);
+    onDataReady?.({ report: cookingStats as AggregatedChefReport, searchQuery });
+  }, [cookingStats, searchQuery, onDataReady]);
 
   return (
     <>

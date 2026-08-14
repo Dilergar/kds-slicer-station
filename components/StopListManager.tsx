@@ -16,12 +16,39 @@ import { Ban, Check, AlertOctagon, Edit2, Plus, Trash2, X, Save, AlertTriangle, 
 import { StopReasonModal } from './StopReasonModal';
 import { ConfirmModal } from './ui/ConfirmModal';
 import { uploadIngredientImage } from '../services/ingredientImagesApi';
+import { fetchIngredientUsage } from '../services/ingredientsApi';
+import { withParentPrefix, withoutParentPrefix, blurOnWheel } from '../utils';
+
+/**
+ * Собирает текст подтверждения удаления с реальными последствиями.
+ * @param isParent — удаляем сырьё (а не отдельную разновидность)
+ * @param usage — что заденет удаление; null пока данные не пришли
+ */
+function buildDeleteDescription(
+  isParent: boolean,
+  usage: { children: number; recipes: number; activeStops: number } | null
+): string {
+  const base = isParent
+    ? 'Вы уверены, что хотите удалить этот Ингредиент? Все его разновидности также будут удалены.'
+    : 'Вы уверены, что хотите удалить эту разновидность?';
+
+  if (!usage) return base;
+
+  const parts: string[] = [];
+  if (isParent && usage.children > 0) parts.push(`разновидностей: ${usage.children}`);
+  if (usage.recipes > 0) parts.push(`блюд потеряют этот компонент: ${usage.recipes}`);
+  if (usage.activeStops > 0) parts.push(`активных стопов: ${usage.activeStops}`);
+
+  return parts.length > 0 ? `${base}\n\nБудет затронуто — ${parts.join(', ')}.` : base;
+}
 
 interface StopListManagerProps {
   ingredients: IngredientBase[];
   onToggleStop: (id: string, reason?: string) => void;
   onAddIngredient: (name: string, parentId?: string, unitType?: 'kg' | 'piece', pieceWeightGrams?: number) => void;
   onUpdateIngredient: (id: string, updates: Partial<IngredientBase>) => void;
+  /** Транзакционное переименование сырья вместе с приставками разновидностей */
+  onRenameParent: (id: string, name: string) => Promise<string | null>;
   onDeleteIngredient: (id: string) => void;
   onPreviewImage: (url: string) => void;
 }
@@ -31,6 +58,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
   onToggleStop,
   onAddIngredient,
   onUpdateIngredient,
+  onRenameParent,
   onDeleteIngredient,
   onPreviewImage
 }) => {
@@ -64,6 +92,14 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
   // Parent Editing State (Inside Modal)
   const [isEditingParent, setIsEditingParent] = useState(false);
   const [tempParentName, setTempParentName] = useState('');
+  /** Ошибка переименования сырья — раньше уходила только в консоль */
+  const [parentRenameError, setParentRenameError] = useState('');
+
+  /**
+   * Что заденет удаление: сколько разновидностей, рецептов и активных стопов.
+   * Подгружается при открытии диалога подтверждения. null — ещё не пришло.
+   */
+  const [deleteUsage, setDeleteUsage] = useState<{ children: number; recipes: number; activeStops: number } | null>(null);
 
 
 
@@ -73,6 +109,18 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
   // Confirm Delete Modal State
   const [confirmModalData, setConfirmModalData] = useState<{ id: string, type: 'main' | 'variety' } | null>(null);
+
+  // Подтягиваем последствия удаления, как только открылся диалог подтверждения.
+  // Диалог показывается сразу, а строка «будет затронуто…» дорисовывается —
+  // ждать ответа сервера перед показом окна незачем.
+  useEffect(() => {
+    if (!confirmModalData) return;
+    let alive = true;
+    fetchIngredientUsage(confirmModalData.id)
+      .then(u => { if (alive) setDeleteUsage(u); })
+      .catch(err => console.warn('[StopListManager] Не удалось узнать последствия удаления:', err));
+    return () => { alive = false; };
+  }, [confirmModalData]);
 
   // Строка поиска — фильтрует карточки родительских ингредиентов по названию
   // самого родителя и по названиям его разновидностей (чтобы найти «Запеченный
@@ -165,6 +213,13 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
     setIsEditingParent(false); // Explicitly View Mode
   };
 
+  /**
+   * Сырьё, чья модалка разновидностей сейчас открыта.
+   * Нужно, чтобы снимать/ставить приставку в названиях его разновидностей
+   * (см. withParentPrefix в utils.ts).
+   */
+  const parentModalIng = ingredients.find(i => i.id === parentModalId);
+
   const handleEditMainItemClick = (e: React.MouseEvent, ing: IngredientBase) => {
     e.stopPropagation();
     setParentModalId(ing.id);
@@ -179,7 +234,9 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
   const handleUpdateVariety = (id: string) => {
     if (editingName.trim()) {
       onUpdateIngredient(id, {
-        name: editingName.trim(),
+        // В поле ввода нарезчик правит только саму нарезку («Крупная соломка»),
+        // приставку сырья возвращаем обратно при сохранении.
+        name: withParentPrefix(editingName.trim(), parentModalIng?.name),
         unitType: editingUnit,
         pieceWeightGrams: editingUnit === 'piece' ? editingWeight : undefined
       });
@@ -189,7 +246,9 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
   const handleSaveNewVariety = () => {
     if (newVarietyName.trim() && parentModalId) {
-      onAddIngredient(newVarietyName.trim(), parentModalId, newVarietyUnit, newVarietyWeight);
+      // Новая нарезка сразу получает приставку сырья — иначе на карточке
+      // заказа она выпадет из общего правила и станет непонятной.
+      onAddIngredient(withParentPrefix(newVarietyName.trim(), parentModalIng?.name), parentModalId, newVarietyUnit, newVarietyWeight);
       setIsAddingVariety(false);
       setNewVarietyName('');
       setNewVarietyUnit('kg');
@@ -210,11 +269,22 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
   };
 
   // Parent Actions (Inside Modal)
-  const handleSaveParentName = () => {
-    if (parentModalId && tempParentName.trim()) {
-      onUpdateIngredient(parentModalId, { name: tempParentName.trim() });
-      setIsEditingParent(false);
+  /**
+   * Переименование сырья. Приставка хранится в самом названии разновидности,
+   * поэтому её нужно переписать во всех разновидностях — но ОДНОЙ транзакцией
+   * на сервере, а не циклом независимых запросов с клиента: обрыв связи посреди
+   * цикла оставлял родителя переименованным, а половину разновидностей — нет,
+   * и ошибка при этом уходила только в консоль.
+   */
+  const handleSaveParentName = async () => {
+    if (!parentModalId || !tempParentName.trim()) return;
+    setParentRenameError('');
+    const err = await onRenameParent(parentModalId, tempParentName.trim());
+    if (err) {
+      setParentRenameError(err);
+      return;
     }
+    setIsEditingParent(false);
   };
 
   const handleDeleteParent = () => {
@@ -486,6 +556,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                     type="number"
                     value={newMainWeight || ''}
                     onChange={(e) => setNewMainWeight(parseInt(e.target.value))}
+                    onWheel={blurOnWheel}
                     placeholder="e.g. 150"
                     className="w-full bg-gray-900 text-white p-3 rounded border border-gray-700 focus:border-blue-500 outline-none"
                   />
@@ -581,6 +652,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                               placeholder="Weight (g)"
                               value={newVarietyWeight || ''}
                               onChange={(e) => setNewVarietyWeight(parseInt(e.target.value))}
+                              onWheel={blurOnWheel}
                               className="bg-slate-900 text-white p-1 rounded border border-blue-400 text-xs w-20"
                             />
                           )}
@@ -620,6 +692,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                                 placeholder="Вес (гр)"
                                 value={editingWeight || ''}
                                 onChange={(e) => setEditingWeight(parseInt(e.target.value))}
+                                onWheel={blurOnWheel}
                                 className="bg-slate-900 text-white p-1 rounded border border-blue-400 text-xs w-20"
                               />
                             )}
@@ -647,7 +720,8 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                         </div>
 
                         <span className={`font-medium text-lg ${child.is_stopped ? 'text-gray-500 line-through' : 'text-white'}`}>
-                          {child.name}
+                          {/* Приставку сырья здесь прячем — оно уже в заголовке модалки */}
+                          {withoutParentPrefix(child.name, parentModalIng?.name)}
                           {child.unitType === 'piece' && <span className="text-xs text-blue-400 ml-2 font-normal">(1шт ≈ {child.pieceWeightGrams}г)</span>}
                         </span>
                         {child.is_stopped && <span className="text-xs text-red-500 font-bold bg-red-900/20 px-2 py-0.5 rounded">СТОП-ЛИСТ</span>}
@@ -681,7 +755,9 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
                       <button
                         onClick={() => {
                           setEditingVarietyId(child.id);
-                          setEditingName(child.name);
+                          // Правим только нарезку, без приставки сырья —
+                          // handleUpdateVariety вернёт её при сохранении.
+                          setEditingName(withoutParentPrefix(child.name, parentModalIng?.name));
                           setEditingUnit(child.unitType || 'kg');
                           setEditingWeight(child.pieceWeightGrams || 0);
                         }}
@@ -737,15 +813,16 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
 
 
       {/* -------------------- CONFIRM DELETE MODAL -------------------- */}
+      {/* Текст подтверждения теперь называет ЧИСЛО затронутых рецептов.
+          Удаление сырья каскадит на разновидности, а каждая разновидность —
+          на slicer_recipes: вместе с ингредиентом из всех рецептов молча
+          исчезали строки, и блюда теряли компонент — на карточке заказа его
+          больше не было. Прежний текст предупреждал только про разновидности. */}
       <ConfirmModal
         isOpen={!!confirmModalData}
-        onClose={() => setConfirmModalData(null)}
+        onClose={() => { setConfirmModalData(null); setDeleteUsage(null); }}
         title={confirmModalData?.type === 'main' ? "Удалить Ингредиент?" : "Удалить Разновидность?"}
-        description={
-          confirmModalData?.type === 'main' 
-            ? "Вы уверены, что хотите удалить этот Ингредиент? Все его разновидности также будут удалены."
-            : "Вы уверены, что хотите удалить эту разновидность?"
-        }
+        description={buildDeleteDescription(confirmModalData?.type === 'main', deleteUsage)}
         onConfirm={() => {
           if (confirmModalData) {
             if (confirmModalData.type === 'main' && parentModalId === confirmModalData.id) {
@@ -753,6 +830,7 @@ export const StopListManager: React.FC<StopListManagerProps> = ({
             }
             onDeleteIngredient(confirmModalData.id);
             setConfirmModalData(null);
+            setDeleteUsage(null);
           }
         }}
       />

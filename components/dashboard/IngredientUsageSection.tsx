@@ -336,6 +336,14 @@ export const IngredientUsageSection: React.FC<IngredientUsageSectionProps> = ({ 
                           </td>
                           <td className="p-3 text-right whitespace-nowrap">
                             {formatWeight(item.totalWeightGrams)}
+                            {/* Для штучных ингредиентов вес — не то, чем закупают.
+                                «Роллы · С Сыром» видны как «3.36 kg», хотя нужно
+                                «70 шт»: количество считалось, но нигде не выводилось. */}
+                            {item.unitType === 'piece' && item.totalQuantity > 0 && (
+                              <span className="block text-xs text-blue-300 font-mono">
+                                {Math.round(item.totalQuantity)} шт
+                              </span>
+                            )}
                           </td>
 
                           <td className="p-3 w-full"></td>

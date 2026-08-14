@@ -50,6 +50,31 @@ router.post('/', async (req: Request, res: Response) => {
       return;
     }
 
+    // Цепочки запрещены. Резолв алиасов везде однохоповый: GET /api/dishes даёт
+    // recipe_source_id одним шагом, RecipeEditor пишет рецепт в
+    // `aliasMap.get(dishId) ?? dishId` — тоже одним. При связке X → Д163 → 163
+    // рецепт X читался бы у Д163, у которого своего рецепта нет: заказы на X
+    // приезжали бы карточкой без ингредиентов, а правка его рецепта проходила
+    // «успешно» и не меняла ничего. Проверяем обе стороны.
+    const chainRes = await pool.query(
+      `SELECT
+         EXISTS (SELECT 1 FROM slicer_dish_aliases WHERE alias_dish_id = $1) AS primary_is_alias,
+         EXISTS (SELECT 1 FROM slicer_dish_aliases WHERE primary_dish_id = $2) AS alias_is_primary`,
+      [primary_dish_id, alias_dish_id]
+    );
+    if (chainRes.rows[0]?.primary_is_alias) {
+      res.status(409).json({
+        error: 'Выбранное основное блюдо само является вариантом другого. Свяжите вариант напрямую с основным блюдом.'
+      });
+      return;
+    }
+    if (chainRes.rows[0]?.alias_is_primary) {
+      res.status(409).json({
+        error: 'У этого блюда уже есть свои связанные варианты — оно не может стать вариантом другого блюда.'
+      });
+      return;
+    }
+
     // Создаём алиас и синхронизируем категории алиаса с primary в одной
     // транзакции. Зачем: при связывании alias-блюдо должно получить те же
     // slicer-категории, что и primary — иначе alias продолжает болтаться

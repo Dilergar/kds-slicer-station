@@ -44,10 +44,32 @@ COMMENT ON COLUMN slicer_dish_defrost.defrost_duration_minutes IS
 -- Обновляем только существующие строки — ON CONFLICT при создании новых
 -- записей в RecipeEditor всё равно будет писать переданное пользователем число.
 -- ----------------------------------------------------------------------------
-UPDATE slicer_dish_defrost dd
-SET defrost_duration_minutes = s.defrost_duration_minutes
-FROM slicer_settings s
-WHERE s.id = 1;
+-- ⚠️ Условие «колонка ещё существует» обязательно.
+--
+-- Пара 016 → 020 при повторном прогоне `npm run migrate` вела себя разрушительно:
+-- 016 заново создавала slicer_settings.defrost_duration_minutes с DEFAULT 15,
+-- а этот UPDATE затирал этой пятнадцаткой ВСЕ настроенные per-dish времена
+-- (в текущих данных это 7 блюд со значениями 1, 2, 4, 4, 5, 5 и 7 минут),
+-- после чего колонка снова удалялась — и следов не оставалось.
+-- Перенос имеет смысл ровно один раз, при первом применении миграции.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'slicer_settings'
+       AND column_name = 'defrost_duration_minutes'
+  ) THEN
+    EXECUTE '
+      UPDATE slicer_dish_defrost dd
+         SET defrost_duration_minutes = s.defrost_duration_minutes
+        FROM slicer_settings s
+       WHERE s.id = 1
+         AND s.defrost_duration_minutes IS NOT NULL';
+    RAISE NOTICE 'Глобальное время разморозки перенесено в per-dish записи';
+  ELSE
+    RAISE NOTICE 'slicer_settings.defrost_duration_minutes уже удалена — перенос пропущен';
+  END IF;
+END $$;
 
 -- ----------------------------------------------------------------------------
 -- 3. Удаление глобальной настройки defrost_duration_minutes

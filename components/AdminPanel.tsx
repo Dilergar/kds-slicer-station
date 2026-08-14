@@ -24,7 +24,8 @@ interface AdminPanelProps {
   setDishes: (dishes: Dish[]) => void;
   settings: SystemSettings;
   setSettings: (settings: SystemSettings) => void;
-  onToggleDishStop: (dishId: string, reason?: string) => void;
+  /** Возвращает текст ошибки для показа пользователю либо null при успехе */
+  onToggleDishStop: (dishId: string, reason?: string) => Promise<string | null>;
   onRefreshDishes?: () => Promise<void> | void;
 }
 
@@ -44,11 +45,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   // Stop Logic State (kept global for AdminPanel modal)
   const [stopModalId, setStopModalId] = useState<string | null>(null);
 
-  const handleStopClick = (e: React.MouseEvent, dish: Dish) => {
+  // Ошибка переключения стоп-листа. Нужна прежде всего для попытки снять
+  // каскадный стоп: backend отвечает 409 и подсказывает, что снимать надо
+  // стоп с ингредиента. Раньше тумблер молча возвращался в красное, а в отчёт
+  // при этом падала фиктивная запись о снятии.
+  const [stopError, setStopError] = useState('');
+
+  const handleStopClick = async (e: React.MouseEvent, dish: Dish) => {
     e.stopPropagation();
+    setStopError('');
     if (dish.is_stopped) {
       // Resume immediately
-      onToggleDishStop(dish.id);
+      const err = await onToggleDishStop(dish.id);
+      if (err) setStopError(err);
     } else {
       // Open modal to stop
       setStopModalId(dish.id);
@@ -58,6 +67,18 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   return (
     <div className="flex-1 bg-kds-bg p-8 overflow-y-auto">
       <h1 className="text-3xl font-bold text-white mb-6">Системные Настройки</h1>
+
+      {stopError && (
+        <div className="mb-6 px-4 py-3 bg-red-900/40 border border-red-600 rounded flex items-start gap-3">
+          <span className="text-red-200 text-sm flex-1">{stopError}</span>
+          <button
+            onClick={() => setStopError('')}
+            className="text-red-300 hover:text-white text-sm font-bold shrink-0"
+          >
+            Понятно
+          </button>
+        </div>
+      )}
 
       <div className="flex space-x-4 mb-8 border-b border-gray-700 overflow-x-auto shrink-0">
         <button
@@ -116,10 +137,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         isOpen={!!stopModalId}
         itemName={dishes.find(i => i.id === stopModalId)?.name || ''}
         onClose={() => setStopModalId(null)}
-        onConfirm={(reason) => {
+        onConfirm={async (reason) => {
           if (stopModalId) {
-            onToggleDishStop(stopModalId, reason);
+            const id = stopModalId;
             setStopModalId(null);
+            const err = await onToggleDishStop(id, reason);
+            if (err) setStopError(err);
           }
         }}
       />

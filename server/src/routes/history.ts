@@ -7,20 +7,52 @@ import { pool } from '../config/db';
 const router = Router();
 
 /**
+ * Жёсткий предел числа строк в одной выдаче истории.
+ *
+ * Страховка от «модуль работает год, таблица не чистится»: даже если клиент
+ * попросит период в год, планшет не получит десятки тысяч строк с JSON-снимками.
+ * Доска показывает последние минуты, отчётам хватает этого с большим запасом.
+ */
+const HISTORY_MAX_ROWS = 2000;
+
+/** Окно по умолчанию, если клиент не передал ни период, ни retentionMinutes (минуты) */
+const HISTORY_DEFAULT_WINDOW_MINUTES = 120;
+
+/**
  * GET /api/history/orders — История завершённых заказов.
- * Query params: from, to (ISO date) — фильтрация по дате.
+ *
+ * Query params:
+ *  - from, to (ISO date) — явный период (используют отчёты);
+ *  - retentionMinutes — окно «последние N минут» (использует доска, значение из
+ *    настройки «Хранение истории»).
+ *
+ * Без параметров отдаётся окно HISTORY_DEFAULT_WINDOW_MINUTES. Раньше запрос без
+ * параметров означал `SELECT * FROM slicer_order_history` целиком — и именно он
+ * стоял в четырёхсекундном поллинге доски: каждый планшет качал всю накопленную
+ * историю вместе с JSONB-снимками. Настройка ретенции при этом применялась
+ * только при отрисовке на клиенте, то есть сервер о ней не знал.
  */
 router.get('/orders', async (req: Request, res: Response) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, retentionMinutes } = req.query;
     let query = 'SELECT * FROM slicer_order_history';
     const params: any[] = [];
 
     if (from && to) {
       query += ' WHERE completed_at >= $1 AND completed_at <= $2';
       params.push(from, to);
+    } else {
+      // Окно в минутах: доверяем только целому положительному числу,
+      // всё остальное (мусор, отрицательное, дробное) → значение по умолчанию.
+      const parsedWindow = Number(retentionMinutes);
+      const windowMinutes = Number.isInteger(parsedWindow) && parsedWindow > 0
+        ? parsedWindow
+        : HISTORY_DEFAULT_WINDOW_MINUTES;
+      query += ` WHERE completed_at >= NOW() - ($1 || ' minutes')::interval`;
+      params.push(String(windowMinutes));
     }
-    query += ' ORDER BY completed_at DESC';
+
+    query += ` ORDER BY completed_at DESC LIMIT ${HISTORY_MAX_ROWS}`;
 
     const result = await pool.query(query, params);
 
@@ -29,7 +61,9 @@ router.get('/orders', async (req: Request, res: Response) => {
       dishId: row.dish_id,
       dishName: row.dish_name,
       completedAt: new Date(row.completed_at).getTime(),
-      totalQuantity: row.total_quantity,
+      // NUMERIC (миграция 027) приходит из node-postgres строкой —
+      // без Number() на клиенте вместо сложения вышла бы конкатенация
+      totalQuantity: Number(row.total_quantity),
       prepTimeMs: Number(row.prep_time_ms),
       was_parked: row.was_parked,
       snapshot: row.snapshot,
@@ -165,7 +199,20 @@ router.get('/dashboard/chef-cooking-speed', async (req: Request, res: Response) 
         items.docm2tabl1_cooktime AS cooktime,
         EXTRACT(EPOCH FROM items.docm2tabl1_cooktime - state.finished_at) * 1000 AS cook_time_ms
       FROM slicer_order_state state
-      JOIN docm2tabl1_items items ON items.suuid::text = state.order_item_id
+      -- Приведение на НАШЕЙ стороне, чтобы первичный ключ docm2tabl1_items остался
+      -- пригоден для nested loop: раньше было items.suuid::text = state.order_item_id,
+      -- и uuid→text (не binary-coercible) делал индекс недоступным — на 87 тыс.
+      -- заказов это полный перебор таблицы позиций.
+      -- CASE обязателен: order_item_id — VARCHAR, там могут лежать не-uuid строки
+      -- (синтетические id разморозки от старых версий), и голый ::uuid уронил бы
+      -- весь отчёт с 22P02. У CASE порядок вычисления гарантирован, поэтому
+      -- приведение выполняется только для строк, прошедших проверку формата.
+      JOIN docm2tabl1_items items
+        ON items.suuid = CASE
+             WHEN state.order_item_id ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+               THEN state.order_item_id::uuid
+             ELSE NULL
+           END
       JOIN ctlg15_dishes dishes ON dishes.suuid = items.docm2tabl1_ctlg15_uuid__dish
       LEFT JOIN slicer_dish_aliases alias
         ON alias.alias_dish_id = items.docm2tabl1_ctlg15_uuid__dish::text

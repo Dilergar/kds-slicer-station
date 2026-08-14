@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { IngredientBase, Dish, StopHistoryEntry, AuthUser } from '../types';
-import { toggleStop, fetchStopHistory } from '../services/stoplistApi';
+import React, { useCallback } from 'react';
+import { IngredientBase, Dish, AuthUser } from '../types';
+import { toggleStop } from '../services/stoplistApi';
 
 interface UseStopListProps {
   ingredients: IngredientBase[];
@@ -44,21 +44,15 @@ export const useStopList = ({
   reloadDishes,
   user,
 }: UseStopListProps) => {
-  const [stopHistory, setStopHistory] = useState<StopHistoryEntry[]>([]);
-
-  /** Загрузка истории стопов из БД */
-  const loadStopHistory = useCallback(async () => {
-    try {
-      const data = await fetchStopHistory();
-      setStopHistory(data);
-    } catch (err) {
-      console.error('[useStopList] Ошибка загрузки истории:', err);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadStopHistory();
-  }, [loadStopHistory]);
+  // ВНИМАНИЕ: загрузка истории стопов отсюда УБРАНА (ревью 2026-08-14).
+  //
+  // Хук вызывал fetchStopHistory() без периода — при монтировании и после
+  // КАЖДОГО нажатия тумблера. На сервере это означало выборку всей нашей
+  // истории без ограничений плюс полный перебор чужого архива стопов по всем
+  // закрытым сменам за годы работы ресторана — ровно в тот момент, когда
+  // нарезчик ждёт отклика тумблера. При этом результат никому не был нужен:
+  // Dashboard грузит историю сам и с диапазоном (components/Dashboard.tsx),
+  // а stopHistory из этого хука в App.tsx только деструктурировался.
 
   /**
    * Переключить стоп-лист ингредиента.
@@ -70,7 +64,7 @@ export const useStopList = ({
    *     recalculateCascadeStops() — каскадные стопы блюд обновляются в БД.
    *  3. reloadIngredients + reloadDishes — подтягиваем свежее состояние
    *     (включая каскадные изменения блюд) из БД.
-   *  4. loadStopHistory — обновляем Dashboard.
+   *  4. Историю стопов здесь НЕ перечитываем — её грузит Dashboard за свой период.
    */
   const handleToggleStop = useCallback(async (ingredientId: string, reason?: string) => {
     const targetIng = ingMap.get(ingredientId);
@@ -101,13 +95,12 @@ export const useStopList = ({
       });
       // Каскадные стопы блюд обновились на backend — подтягиваем оба списка
       await Promise.all([reloadIngredients(), reloadDishes()]);
-      await loadStopHistory();
     } catch (err) {
       console.error('[useStopList] Ошибка toggle ингредиента:', err);
       // Откатываемся к реальному состоянию БД
       await Promise.all([reloadIngredients(), reloadDishes()]);
     }
-  }, [ingMap, setIngredients, reloadIngredients, reloadDishes, loadStopHistory, user]);
+  }, [ingMap, setIngredients, reloadIngredients, reloadDishes, user]);
 
   /**
    * Переключить стоп-лист блюда (ручной стоп).
@@ -117,10 +110,16 @@ export const useStopList = ({
    *  - при снятии пишет историю и вызывает recalculateCascadeStops
    *    (если ингредиент всё ещё стопнут, блюдо автоматически останется
    *    на каскадном стопе)
+   *  - снятие ЧИСТО каскадного стопа отклоняется с 409: снимать нужно
+   *    стоп с ингредиента, иначе в отчёт попадала фиктивная запись
+   *
+   * @param dishId — блюдо (или любой его вариант доставки)
+   * @param reason — причина при постановке на стоп
+   * @returns текст ошибки для показа пользователю либо null при успехе
    */
-  const handleToggleDishStop = useCallback(async (dishId: string, reason?: string) => {
+  const handleToggleDishStop = useCallback(async (dishId: string, reason?: string): Promise<string | null> => {
     const targetDish = dishMap.get(dishId);
-    if (!targetDish) return;
+    if (!targetDish) return null;
 
     const isStopping = !targetDish.is_stopped;
 
@@ -149,16 +148,15 @@ export const useStopList = ({
       });
       // Подтягиваем персистентное состояние — оно теперь в slicer_dish_stoplist
       await reloadDishes();
-      await loadStopHistory();
+      return null;
     } catch (err) {
       console.error('[useStopList] Ошибка toggle блюда:', err);
       await reloadDishes();
+      return err instanceof Error ? err.message : 'Не удалось изменить стоп-лист блюда';
     }
-  }, [dishMap, setDishes, reloadDishes, loadStopHistory, user]);
+  }, [dishMap, setDishes, reloadDishes, user]);
 
   return {
-    stopHistory,
-    setStopHistory,
     handleToggleStop,
     handleToggleDishStop
   };

@@ -45,3 +45,7 @@ server/public/images/ingredients/*
 *.njsproj
 *.sln
 *.sw?
+
+# Локальные настройки Claude Code — содержат пути и параметры машины
+# разработчика (в т.ч. в правилах разрешений мог оказаться пароль БД).
+.claude/settings.local.json

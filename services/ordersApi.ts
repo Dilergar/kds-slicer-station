@@ -21,7 +21,14 @@ export const completeOrder = (id: string, data: {
 }): Promise<{ completed: boolean; historyId: string }> =>
   apiFetch(`/orders/${id}/complete`, { method: 'POST', body: JSON.stringify(data) });
 
-/** Частичное завершение заказа */
+/**
+ * Частичное завершение заказа.
+ *
+ * Остаток НЕ передаётся: сервер считает его сам от актуального состояния в БД
+ * под блокировкой строки и отвечает 409, если запрошено больше, чем осталось.
+ * Раньше остаток присылал клиент, и два планшета с устаревшей доской могли
+ * суммарно отдать больше, чем есть в заказе.
+ */
 export const partialCompleteOrder = (id: string, data: {
   dishId: string;
   dishName: string;
@@ -30,8 +37,6 @@ export const partialCompleteOrder = (id: string, data: {
   wasParked?: boolean;
   snapshot: Order;
   consumedIngredients: any[];
-  remainingQuantityStack: number[];
-  remainingTableStack: number[][];
 }): Promise<{ completed: boolean; historyId: string }> =>
   apiFetch(`/orders/${id}/partial-complete`, { method: 'POST', body: JSON.stringify(data) });
 
@@ -75,11 +80,23 @@ export const mergeAckOrders = (
     body: JSON.stringify({ orderItemIds })
   });
 
-/** Получить историю заказов */
-export const fetchOrderHistory = (from?: string, to?: string): Promise<OrderHistoryEntry[]> => {
+/**
+ * Получить историю заказов.
+ *
+ * Всегда передавайте либо период (from/to), либо retentionMinutes — сервер без
+ * них отдаст только жёстко ограниченный «хвост». Раньше вызов без параметров
+ * тянул всю накопленную историю целиком, вместе с JSON-снимками заказов.
+ *
+ * @param opts.from / opts.to — явный период в ISO (используется отчётами)
+ * @param opts.retentionMinutes — окно «последние N минут» (используется доской)
+ */
+export const fetchOrderHistory = (
+  opts?: { from?: string; to?: string; retentionMinutes?: number }
+): Promise<OrderHistoryEntry[]> => {
   const params = new URLSearchParams();
-  if (from) params.set('from', from);
-  if (to) params.set('to', to);
+  if (opts?.from) params.set('from', opts.from);
+  if (opts?.to) params.set('to', opts.to);
+  if (opts?.retentionMinutes != null) params.set('retentionMinutes', String(opts.retentionMinutes));
   const qs = params.toString();
   return apiFetch(`/history/orders${qs ? `?${qs}` : ''}`);
 };

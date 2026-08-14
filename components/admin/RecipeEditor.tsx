@@ -1,11 +1,32 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Category, Dish, IngredientBase, PriorityLevel } from '../../types';
-import { Plus, X, ArrowDown, AlertOctagon, Ban, Check, Edit2, Trash2, Camera, Save, Link2, Link2Off, Snowflake } from 'lucide-react';
+import { Plus, X, ArrowDown, AlertOctagon, Ban, Check, Edit2, Trash2, Camera, Save, Link2, Link2Off, Snowflake, Search } from 'lucide-react';
 import { ConfirmModal } from '../ui/ConfirmModal';
 import { fetchDishAliases, linkDishToAlias, unlinkDishAlias, DishAlias } from '../../services/dishAliasesApi';
 import { updateRecipe } from '../../services/recipesApi';
 import { updateDishCategories, updateDishPriority, clearDishSlicerData, updateDishDefrost } from '../../services/dishesApi';
 import { uploadDishImage, deleteDishImage } from '../../services/dishImagesApi';
+import { blurOnWheel } from '../../utils';
+import { ClampedNumberInput } from '../ui/ClampedNumberInput';
+
+/**
+ * Локальная заглушка для блюд без фото.
+ *
+ * Раньше здесь стоял внешний via.placeholder.com. В базе всего 2 фото на 299
+ * настроенных блюд, то есть почти каждая карточка тянула запрос в интернет:
+ * на кухонном планшете без внешней сети это сотни «битых картинок» и подвисание
+ * при открытии категории. Inline-SVG в data URI не требует ни сети, ни файла на
+ * диске и рисуется мгновенно.
+ */
+const NO_PHOTO_PLACEHOLDER =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+       <rect width="80" height="80" fill="#1f2937"/>
+       <circle cx="40" cy="32" r="13" fill="none" stroke="#4b5563" stroke-width="3"/>
+       <path d="M18 66c4-13 12-19 22-19s18 6 22 19" fill="none" stroke="#4b5563" stroke-width="3"/>
+     </svg>`
+  );
 
 interface RecipeEditorProps {
   categories: Category[];
@@ -28,6 +49,14 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
   const [isEditingDish, setIsEditingDish] = useState(false);
   const [currentDish, setCurrentDish] = useState<Partial<Dish>>({});
   const [formError, setFormError] = useState<string | null>(null);
+  // Идёт сохранение — кнопка заблокирована. Без этого сохранение с фото (1–2 сек
+  // на планшете) выглядело как «не отреагировало», человек жал второй раз, и
+  // уходила вторая серия запросов: два аплоада гонялись, один файл оставался
+  // на диске без ссылки.
+  const [isSaving, setIsSaving] = useState(false);
+  // Ингредиент, только что добавленный кликом по справочнику — только его полю
+  // граммовки отдаём фокус (см. autoFocus ниже).
+  const [justAddedIngredientId, setJustAddedIngredientId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Pending-состояние фото блюда:
@@ -42,6 +71,11 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
   const [imageMarkedForRemoval, setImageMarkedForRemoval] = useState(false);
   const [expandedCategoryIds, setExpandedCategoryIds] = useState<string[]>([]);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  // Поиск в панели «Все Ингредиенты» внутри модалки рецепта.
+  // Справочник разросся до сотен позиций (сырьё + нарезки), глазами искать нереально.
+  // Сбрасывается при каждом открытии/закрытии модалки — иначе список откроется
+  // отфильтрованным по прошлому запросу, и покажется что ингредиенты пропали.
+  const [ingredientSearchTerm, setIngredientSearchTerm] = useState('');
 
   // === Состояние для алиасов ===
   const [showAliases, setShowAliases] = useState(false); // Показывать alias-блюда в основном списке
@@ -82,6 +116,82 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
   // Проверка: является ли блюдо алиасом (имеет primary)
   const isAlias = (dishId: string) => aliasMap.has(dishId);
 
+  /**
+   * Нормализация строки для поиска ингредиентов: регистр не важен,
+   * «ё» приравнивается к «е» (в справочнике встречается и «Свёкла», и «Свекла»,
+   * нарезчик набирает как придётся — оба варианта должны находиться).
+   */
+  const normalizeSearch = (s: string) => s.toLowerCase().replace(/ё/g, 'е');
+
+  /**
+   * Совпадение по всем словам запроса (порядок не важен).
+   * Поиск пословный, а не по подстроке целиком, чтобы работали запросы
+   * «морковь кубик» и «кубик морковь» одинаково — имя разновидности хранится
+   * как «Морковь · Кубик», и цельная подстрока «морковь кубик» не совпала бы
+   * из-за разделителя.
+   *
+   * @param haystack — где ищем (имя сырья или «сырьё + нарезка»)
+   * @param tokens — уже нормализованные слова запроса
+   */
+  const matchesSearchTokens = (haystack: string, tokens: string[]) => {
+    const normalized = normalizeSearch(haystack);
+    return tokens.every(t => normalized.includes(t));
+  };
+
+  /**
+   * Группы «сырьё → его нарезки» для панели «Все Ингредиенты» с учётом поиска.
+   *
+   * Правила фильтрации:
+   * - пустой запрос — весь справочник как раньше;
+   * - совпало имя сырья («ананас») — показываем сырьё и ВСЕ его нарезки,
+   *   чтобы можно было сразу выбрать нужный подвид;
+   * - совпали только нарезки («кубик») — показываем сырьё как заголовок
+   *   (оно остаётся кликабельным) и только подходящие нарезки;
+   * - ничего не совпало — группа скрыта целиком.
+   *
+   * Нарезка ищется по паре «сырьё + собственное имя», а не только по имени:
+   * приставка сырья в названии хранится денормализованно (паттерн 3 в CLAUDE.md),
+   * но у старых записей её может не быть — склейка страхует запрос «морковь кубик».
+   */
+  const visibleIngredientGroups = useMemo(() => {
+    const tokens = normalizeSearch(ingredientSearchTerm).trim().split(/\s+/).filter(Boolean);
+
+    return ingredients
+      .filter(i => !i.parentId)
+      .reduce<{ parent: IngredientBase; variations: IngredientBase[]; parentMatched: boolean }[]>((acc, parent) => {
+        const variations = ingredients.filter(i => i.parentId === parent.id);
+
+        if (tokens.length === 0) {
+          acc.push({ parent, variations, parentMatched: true });
+          return acc;
+        }
+
+        const parentMatched = matchesSearchTokens(parent.name, tokens);
+        const matchedVariations = variations.filter(v =>
+          matchesSearchTokens(`${parent.name} ${v.name}`, tokens)
+        );
+
+        if (!parentMatched && matchedVariations.length === 0) return acc;
+
+        acc.push({
+          parent,
+          variations: parentMatched ? variations : matchedVariations,
+          parentMatched
+        });
+        return acc;
+      }, []);
+  }, [ingredients, ingredientSearchTerm]);
+
+  // Счётчик найденного (показывается только при активном запросе):
+  // сырьё считается позицией, только если совпало само, плюс все показанные нарезки.
+  const foundIngredientCount = useMemo(
+    () => visibleIngredientGroups.reduce(
+      (sum, g) => sum + (g.parentMatched ? 1 : 0) + g.variations.length,
+      0
+    ),
+    [visibleIngredientGroups]
+  );
+
   /** Связать блюдо с primary (сделать его алиасом) */
   const handleLinkDish = async (aliasDishId: string, primaryDishId: string) => {
     try {
@@ -115,26 +225,13 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
     setFormError(null);
     setPendingImageFile(null);
     setImageMarkedForRemoval(false);
+    setIngredientSearchTerm('');
     setIsEditingDish(true);
   };
 
-  const handleAddDish = () => {
-    setCurrentDish({
-      id: `d${Date.now()}`,
-      name: '',
-      category_ids: [],
-      priority_flag: PriorityLevel.NORMAL,
-      grams_per_portion: 0,
-      ingredients: [],
-      image_url: '',
-      is_stopped: false,
-      stop_reason: ''
-    });
-    setFormError(null);
-    setPendingImageFile(null);
-    setImageMarkedForRemoval(false);
-    setIsEditingDish(true);
-  };
+  // handleAddDish удалён вместе с кнопкой «Создать Рецепт» (ревью 2026-08-14) —
+  // см. комментарий в разметке. Создавать блюда модуль не может и не должен:
+  // они живут в чужой ctlg15_dishes.
 
   const handleDeleteDish = (id: string) => {
     setConfirmDeleteId(id);
@@ -147,14 +244,25 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
    * После успеха перезагружает блюда из БД (источник правды).
    */
   const saveDishForm = async () => {
+    if (isSaving) return; // защита от второго нажатия, пока идёт сохранение
+
     if (!currentDish.name || !currentDish.category_ids?.length) {
-      setFormError("Name and at least one Category are required!");
+      setFormError('Укажите название и хотя бы одну категорию');
       return;
     }
 
-    const isVip = currentDish.category_ids.includes('c_vip');
-    if (isVip && currentDish.category_ids.length === 1) {
-      setFormError("Error: 'Vip' category cannot be selected alone. You must select at least one other category.");
+    // Граммовка обязана быть положительным числом.
+    // Раньше пустое поле давало NaN → JSON.stringify превращал его в null →
+    // NOT NULL в slicer_recipes → 500 с общим текстом «Ошибка обновления
+    // рецепта» без указания, какое поле виновато. При этом категории и
+    // приоритет к тому моменту уже сохранялись (шли раньше по коду), и «Отмена»
+    // их не откатывала. Теперь проверяем ДО любых запросов и называем ингредиент.
+    const invalid = (currentDish.ingredients || []).find(
+      i => !Number.isFinite(i.quantity) || i.quantity <= 0
+    );
+    if (invalid) {
+      const name = ingredients.find(i => i.id === invalid.id)?.name ?? 'ингредиент';
+      setFormError(`Укажите количество больше нуля: ${name}`);
       return;
     }
 
@@ -169,11 +277,15 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
       quantity: i.quantity,
     }));
 
+    setIsSaving(true);
     try {
-      // Сохраняем назначение категорий, приоритет и рецепт последовательно.
-      // Если рецепт упадёт — категории/приоритет уже записаны, это ок (они независимы).
+      // Порядок: СНАЧАЛА рецепт, потом категории и остальное.
+      // Рецепт — самая «отказоспособная» часть (валидация количеств, чужие
+      // ограничения), и если он падал последним, категории с приоритетом уже
+      // лежали в БД, а пользователь видел только ошибку и жал «Отмена».
       // Приоритет сохраняется на оригинальный dishId (не на primary), т.к. у alias
       // и primary в UI отдельные карточки и могут иметь разный priority_flag.
+      await updateRecipe(recipeDishId, ingredientsPayload);
       await updateDishCategories(dishId, currentDish.category_ids);
       await updateDishPriority(dishId, currentDish.priority_flag ?? 1);
       // Флаг и per-dish время разморозки (миграции 016, 020) пишем на primary —
@@ -184,7 +296,6 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
         currentDish.requires_defrost ?? false,
         currentDish.defrost_duration_minutes
       );
-      await updateRecipe(recipeDishId, ingredientsPayload);
 
       // Фото: upload или delete в самом конце, чтобы не блокировать
       // сохранение рецепта если upload вдруг упадёт (например, слишком
@@ -207,10 +318,13 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
       setCurrentDish({});
       setPendingImageFile(null);
       setImageMarkedForRemoval(false);
+      setIngredientSearchTerm('');
       setFormError(null);
     } catch (err) {
       console.error('[RecipeEditor] Ошибка сохранения рецепта:', err);
       setFormError(err instanceof Error ? err.message : 'Ошибка сохранения рецепта');
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -220,12 +334,30 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
 
     if (exists) {
       setCurrentDish({ ...currentDish, ingredients: currentIngs.filter(i => i.id !== ingId) });
+      if (justAddedIngredientId === ingId) setJustAddedIngredientId(null);
     } else {
       setCurrentDish({ ...currentDish, ingredients: [...currentIngs, { id: ingId, quantity: 0 }] });
+      // Фокус в граммовку отдаём ТОЛЬКО этой строке. Раньше autoFocus стоял на
+      // каждой строке выбранных ингредиентов, и любая перерисовка списка уводила
+      // фокус из поля поиска: набрали «кубик» → выбрали → продолжаете набирать
+      // «лук», а буквы уходят в граммовку только что добавленного ингредиента
+      // (там они не видны, но значение становится нечисловым).
+      setJustAddedIngredientId(ingId);
     }
   };
 
-  const updateIngredientQuantity = (ingId: string, qty: number) => {
+  /**
+   * Обновляет граммовку ингредиента в рецепте.
+   * @param ingId — id ингредиента
+   * @param raw — сырое значение из поля ввода (может быть пустым или «1,5»)
+   */
+  const updateIngredientQuantity = (ingId: string, raw: string) => {
+    // Запятая как десятичный разделитель — привычка русской раскладки;
+    // number-input отдаёт при ней пустую строку, поэтому подстраховываемся.
+    const parsed = parseFloat(raw.replace(',', '.'));
+    // NaN в стейт не пускаем: он рисуется как пустое поле, а на сохранении
+    // превращался в null и ронял запрос (см. проверку в saveDishForm).
+    const qty = Number.isFinite(parsed) ? parsed : 0;
     const currentIngs = currentDish.ingredients || [];
     setCurrentDish({
       ...currentDish,
@@ -325,12 +457,18 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
           Показать связанные варианты
         </label>
 
-        <button
-          onClick={handleAddDish}
-          className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-500 flex items-center gap-2 font-bold ml-4"
-        >
-          <Plus size={20} /> Создать Рецепт
-        </button>
+        {/* Кнопки «Создать Рецепт» здесь больше нет (ревью 2026-08-14).
+            Блюда живут в чужой ctlg15_dishes и заводятся в кассе заказчика —
+            эндпоинта на создание блюда нет и по правилу 3 быть не может.
+            Кнопка выдавала выдуманный id вида d1723... и «сохраняла» рецепт,
+            категории, приоритет и разморозку на несуществующее блюдо: поля
+            dish_id в наших таблицах — обычный текст без внешнего ключа, поэтому
+            все четыре запроса проходили успешно. Дальше справочник перечитывался
+            из чужой таблицы, карточка исчезала, а мусор оставался навсегда.
+            Новые блюда появляются сами — в секции «Без категории» ниже. */}
+        <span className="ml-4 text-xs text-gray-500 max-w-xs">
+          Новые блюда заводятся в кассе и появляются здесь в секции «Без категории».
+        </span>
       </div>
 
       <div className="space-y-4">
@@ -402,7 +540,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                                 {dish.is_stopped ? <Ban size={10} className="text-white" /> : <Check size={10} className="text-white" />}
                               </div>
                             </button>
-                            <img src={dish.image_url || "https://via.placeholder.com/150"} className="w-16 h-16 rounded object-cover bg-gray-800" alt="" />
+                            <img src={dish.image_url || NO_PHOTO_PLACEHOLDER} className="w-16 h-16 rounded object-cover bg-gray-800" alt="" />
                             <div>
                               <h3 className="font-bold text-white text-lg leading-tight flex items-center gap-2 flex-wrap">
                                 {dish.name}
@@ -440,13 +578,21 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                             </div>
                           </div>
                           <div className="flex gap-1">
-                            <button
-                              onClick={() => setLinkModalForDish(dish)}
-                              title="Связать другое блюдо (алиас)"
-                              className="p-2 hover:bg-gray-700 rounded text-gray-400 hover:text-blue-400"
-                            >
-                              <Link2 size={18} />
-                            </button>
+                            {/* Кнопку «Связать» показываем только у основных блюд.
+                                На карточке варианта она позволяла собрать цепочку
+                                X → Д163 → 163, а резолв везде однохоповый: третье
+                                блюдо приезжало нарезчику без ингредиентов, и его
+                                рецепт нельзя было отредактировать. Сервер такую
+                                связь теперь тоже отклоняет (409). */}
+                            {!isAlias(dish.id) && (
+                              <button
+                                onClick={() => setLinkModalForDish(dish)}
+                                title="Связать другое блюдо (алиас)"
+                                className="p-2 hover:bg-gray-700 rounded text-gray-400 hover:text-blue-400"
+                              >
+                                <Link2 size={18} />
+                              </button>
+                            )}
                             <button
                               onClick={() => handleEditDish(dish)}
                               className="p-2 hover:bg-gray-700 rounded text-gray-400 hover:text-white"
@@ -606,6 +752,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                   setIsEditingDish(false);
                   setPendingImageFile(null);
                   setImageMarkedForRemoval(false);
+                  setIngredientSearchTerm('');
                 }}
                 className="text-gray-400 hover:text-white"
               >
@@ -716,19 +863,16 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                     </div>
                     {currentDish.requires_defrost && (
                       <div className="flex items-center gap-2">
-                        <input
-                          type="number"
+                        {/* Ограничение 1..60 как в CHECK БД, но применяется при
+                            уходе из поля: иначе «5» на пути к «50» превращалось
+                            бы в значение прямо под пальцем (см. ClampedNumberInput). */}
+                        <ClampedNumberInput
+                          value={currentDish.defrost_duration_minutes ?? 15}
                           min={1}
                           max={60}
-                          value={currentDish.defrost_duration_minutes ?? 15}
-                          onChange={(e) => {
-                            // Clamp 1..60 как в CHECK БД. Пустая строка / NaN → 15.
-                            let val = parseInt(e.target.value);
-                            if (!Number.isFinite(val)) val = 15;
-                            if (val < 1) val = 1;
-                            if (val > 60) val = 60;
-                            setCurrentDish({ ...currentDish, defrost_duration_minutes: val });
-                          }}
+                          fallback={15}
+                          aria-label="Время разморозки в минутах"
+                          onCommit={(val) => setCurrentDish({ ...currentDish, defrost_duration_minutes: val })}
                           className="w-20 bg-gray-900 border border-gray-700 rounded p-2 text-white text-center font-mono focus:border-blue-500 outline-none"
                         />
                         <span className="text-xs text-gray-400">минут</span>
@@ -808,11 +952,12 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                           <div className="flex items-center gap-2">
                             <input
                               type="number"
-                              placeholder="Qty"
+                              placeholder="Кол-во"
                               value={dishIng.quantity || ''}
-                              onChange={(e) => updateIngredientQuantity(dishIng.id, parseFloat(e.target.value))}
+                              onChange={(e) => updateIngredientQuantity(dishIng.id, e.target.value)}
+                              onWheel={blurOnWheel}
                               className="w-20 bg-gray-900 border border-blue-500 text-white p-1 rounded text-right font-mono font-bold outline-none focus:ring-1 ring-blue-500"
-                              autoFocus
+                              autoFocus={justAddedIngredientId === dishIng.id}
                             />
                             <span className="text-xs text-gray-400 w-8">{ing.unitType === 'piece' ? 'pcs' : 'g'}</span>
                             <button onClick={() => toggleIngredientSelection(ing.id)} className="p-1 hover:bg-red-900/50 rounded text-red-400">
@@ -825,11 +970,53 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto pt-2">
-                  <label className="block text-gray-400 text-sm font-bold mb-3 uppercase tracking-wider">Все Ингредиенты</label>
-                  <div className="space-y-1">
-                    {ingredients.filter(i => !i.parentId).map(parent => {
-                      const variations = ingredients.filter(i => i.parentId === parent.id);
+                <div className="flex-1 flex flex-col min-h-0 pt-2">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <label className="block text-gray-400 text-sm font-bold uppercase tracking-wider">Все Ингредиенты</label>
+                    {ingredientSearchTerm.trim() && (
+                      <span className="text-xs font-mono text-blue-300 bg-blue-900/30 border border-blue-800/50 px-2 py-0.5 rounded-full whitespace-nowrap">
+                        найдено: {foundIngredientCount}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Поиск по справочнику: ищет и сырьё, и его нарезки.
+                      Escape очищает запрос — быстрее чем целиться в крестик
+                      пальцем на планшете. */}
+                  <div className="relative mb-3 shrink-0">
+                    <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={ingredientSearchTerm}
+                      onChange={(e) => setIngredientSearchTerm(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          e.preventDefault();
+                          setIngredientSearchTerm('');
+                        }
+                      }}
+                      placeholder="Поиск: «морковь», «кубик», «морковь кубик»…"
+                      className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-9 pr-9 py-2 text-white text-sm outline-none focus:border-blue-500"
+                    />
+                    {ingredientSearchTerm && (
+                      <button
+                        type="button"
+                        onClick={() => setIngredientSearchTerm('')}
+                        title="Очистить поиск"
+                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-gray-500 hover:text-white"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex-1 overflow-y-auto space-y-1">
+                    {visibleIngredientGroups.length === 0 && (
+                      <p className="text-gray-500 italic text-sm text-center py-6">
+                        Ничего не найдено по запросу «{ingredientSearchTerm.trim()}».
+                      </p>
+                    )}
+                    {visibleIngredientGroups.map(({ parent, variations }) => {
                       const isSelected = currentDish.ingredients?.some(i => i.id === parent.id);
 
                       return (
@@ -892,6 +1079,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                   setFormError(null);
                   setPendingImageFile(null);
                   setImageMarkedForRemoval(false);
+                  setIngredientSearchTerm('');
                 }}
                 className="px-6 py-2 text-gray-400 font-bold hover:text-white transition-colors"
               >
@@ -899,10 +1087,11 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
               </button>
               <button
                 onClick={saveDishForm}
-                className="px-8 py-3 rounded bg-green-600 hover:bg-green-500 text-white font-bold shadow-lg transform active:scale-95 transition-all flex items-center gap-2"
+                disabled={isSaving}
+                className="px-8 py-3 rounded bg-green-600 hover:bg-green-500 disabled:bg-slate-600 disabled:opacity-70 disabled:cursor-not-allowed text-white font-bold shadow-lg transform active:scale-95 disabled:active:scale-100 transition-all flex items-center gap-2"
               >
                 <Save size={20} />
-                Сохранить Рецепт
+                {isSaving ? 'Сохраняю…' : 'Сохранить Рецепт'}
               </button>
             </div>
           </div>
@@ -959,7 +1148,7 @@ export const RecipeEditor: React.FC<RecipeEditorProps> = ({
                     className="w-full text-left p-3 rounded bg-gray-900 border border-gray-700 hover:border-blue-500 hover:bg-gray-700 transition-colors flex items-center justify-between"
                   >
                     <div className="flex items-center gap-3">
-                      <img src={candidate.image_url || "https://via.placeholder.com/150"} className="w-10 h-10 rounded object-cover bg-gray-800" alt="" />
+                      <img src={candidate.image_url || NO_PHOTO_PLACEHOLDER} className="w-10 h-10 rounded object-cover bg-gray-800" alt="" />
                       <div>
                         <div className="text-white font-medium">{candidate.name}</div>
                         {candidate.code && <div className="text-xs text-gray-500 font-mono">code: {candidate.code}</div>}

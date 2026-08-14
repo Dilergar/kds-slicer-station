@@ -28,10 +28,16 @@ import { fetchCategories } from './services/categoriesApi';
 import { fetchSettings, updateSettings } from './services/settingsApi';
 import { fetchDishes } from './services/dishesApi';
 import { getAllowedViews } from './constants';
+import { installAudioUnlock } from './utils';
 
 function App() {
   // === Авторизация — PIN из чужой таблицы `users` (см. hooks/useAuth.ts) ===
   const { user, login, logout } = useAuth();
+
+  // Разблокировка звука на первом касании экрана. Браузер не даёт играть звук
+  // до жеста пользователя, а сигналы у нас инициирует поллинг — без этого
+  // первый заказ утром приходил бы молча (см. installAudioUnlock в utils.ts).
+  useEffect(() => installAudioUnlock(), []);
 
   // Список разрешённых вкладок для залогиненного юзера.
   // Считается даже когда user=null (даст []), чтобы не ломать мемо-цепочку,
@@ -89,22 +95,57 @@ function App() {
   // улетит 5-10 запросов на один ввод значения.
   const settingsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  /** Сообщение о неудачном сохранении настроек ('' — всё в порядке) */
+  const [settingsError, setSettingsError] = useState('');
+
+  // Зеркало текущих настроек для расчёта патча без лишних зависимостей эффекта
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  // Накопленные изменённые поля между вызовами дебаунса.
+  // Отправляем ТОЛЬКО их, а не весь объект настроек.
+  const pendingPatchRef = useRef<Partial<SystemSettings>>({});
+
   /**
    * Обёртка над setSettings: мгновенно обновляет локальный стейт (оптимистично)
    * и с дебаунсом 500 мс отправляет PUT /api/settings для персиста в БД.
    * При ошибке сети откатывает стейт на свежее значение из БД через fetchSettings.
+   *
+   * ⚠️ Отправляется ПАТЧ, а не весь объект. Раньше при изменении одного тумблера
+   * на сервер уходили все настройки целиком, а сервер применяет каждое непустое
+   * поле через COALESCE. Локальная копия настроек при этом обновлялась только
+   * при открытии страницы — то есть кухонный планшет, открытый с утра, вечером
+   * записывал обратно свой утренний снимок и молча откатывал всё, что за день
+   * поменяли с другого устройства (шаг курса, режим очереди, часы работы).
+   *
+   * @param next — полный объект настроек с уже применённым изменением
    */
   const handleSettingsChange = useCallback((next: SystemSettings) => {
+    const prev = settingsRef.current;
+
+    // Сравнение через JSON: в настройках есть массивы (activePriorityRules,
+    // excludedDates, dessertTriggerModifierPatterns), для них === не работает.
+    for (const key of Object.keys(next) as (keyof SystemSettings)[]) {
+      if (JSON.stringify(prev[key]) !== JSON.stringify(next[key])) {
+        (pendingPatchRef.current as Record<string, unknown>)[key as string] = next[key];
+      }
+    }
+
     setSettings(next);
 
     if (settingsSaveTimer.current) {
       clearTimeout(settingsSaveTimer.current);
     }
     settingsSaveTimer.current = setTimeout(async () => {
+      const patch = pendingPatchRef.current;
+      pendingPatchRef.current = {};
+      if (Object.keys(patch).length === 0) return;
+
       try {
-        await updateSettings(next);
+        await updateSettings(patch);
       } catch (err) {
         console.error('[App] Ошибка сохранения настроек:', err);
+        setSettingsError('Не удалось сохранить настройки — проверьте связь с сервером');
         try {
           const fresh = await fetchSettings();
           setSettings(fresh);
@@ -169,12 +210,12 @@ function App() {
     ingMap,
     handleAddIngredient,
     handleUpdateIngredient,
+    handleRenameParent,
     handleDeleteIngredient,
     reloadIngredients
   } = useIngredients();
 
   const {
-    stopHistory,
     handleToggleStop,
     handleToggleDishStop
   } = useStopList({
@@ -195,6 +236,9 @@ function App() {
     // нового заказа: первый снапшот доски запоминается без сигнала.
     loading: ordersLoading,
     orderHistory,
+    // Признаки «свежести» доски для плашки «нет связи с сервером»
+    lastSyncAt,
+    failedPolls,
     handleStackMerge,
     handleMergeAck,
     handleCompleteOrder,
@@ -213,6 +257,55 @@ function App() {
     dishMap,
     ingredients
   });
+
+  // === Периодическое обновление справочников ===
+  //
+  // Заказы опрашиваются каждые 4 секунды, а блюда, категории и ингредиенты
+  // раньше грузились ровно один раз — при открытии страницы. Планшет живёт
+  // открытым сутками, поэтому «раз при открытии» на практике означало «раз в
+  // неделю». Последствия: заведующая назначила категорию новому блюду со своего
+  // планшета → заказы на него приезжают, но на планшете нарезчика молча не
+  // рисуются (обе точки отрисовки пропускают позицию, если блюда нет в локальном
+  // справочнике); поправили рецепт → режут по старому составу, и в отчёт о
+  // расходе уходит старый набор; поставили стоп с другого устройства → здесь
+  // он не подсветится.
+  //
+  // Раз в минуту: справочники маленькие (299 блюд, 260 ингредиентов), а реакция
+  // достаточно быстрая, чтобы никто не заметил задержки.
+  useEffect(() => {
+    if (!settingsLoaded) return;
+
+    const refreshCatalogs = async () => {
+      try {
+        const [cats, dsh] = await Promise.all([fetchCategories(), fetchDishes()]);
+        setCategories(cats);
+        setDishes(dsh);
+      } catch (err) {
+        // Сеть моргнула — не страшно, попробуем на следующем круге.
+        // Плашку «нет связи» рисует доска по данным поллинга заказов.
+        console.warn('[App] Не удалось обновить справочники:', err);
+      }
+      try {
+        await reloadIngredients();
+      } catch (err) {
+        console.warn('[App] Не удалось обновить ингредиенты:', err);
+      }
+    };
+
+    const interval = setInterval(refreshCatalogs, 60000);
+    return () => clearInterval(interval);
+  }, [settingsLoaded, reloadIngredients]);
+
+  // Перечитываем настройки при входе в админку: там их правят, и работать
+  // нужно от свежего значения, а не от снимка, снятого при открытии страницы.
+  useEffect(() => {
+    if (currentView !== 'ADMIN' || !settingsLoaded) return;
+    let alive = true;
+    fetchSettings()
+      .then(fresh => { if (alive) setSettings(fresh); })
+      .catch(err => console.warn('[App] Не удалось перечитать настройки:', err));
+    return () => { alive = false; };
+  }, [currentView, settingsLoaded]);
 
   // === GATE: не залогинен → экран ввода PIN ===
   // Хук useAuth восстанавливает юзера из localStorage синхронно на init,
@@ -301,6 +394,8 @@ function App() {
             onRestoreOrder={handleRestoreOrder}
             settings={settings}
             ordersLoading={ordersLoading}
+            lastSyncAt={lastSyncAt}
+            failedPolls={failedPolls}
             onStartDefrost={handleStartDefrost}
             onCancelDefrost={handleCancelDefrost}
             onCompleteDefrost={handleCompleteDefrost}
@@ -312,12 +407,26 @@ function App() {
             onToggleStop={handleToggleStop}
             onAddIngredient={handleAddIngredient}
             onUpdateIngredient={handleUpdateIngredient}
+            onRenameParent={handleRenameParent}
             onDeleteIngredient={handleDeleteIngredient}
             onPreviewImage={setPreviewImage}
           />
         )}
         {/* settingsLoaded здесь проверять не нужно — глобальный гейт выше
             гарантирует, что до загрузки настроек не рендерится ничего. */}
+        {/* Ошибка сохранения настроек — раньше уходила только в консоль,
+            и заведующая была уверена, что значение сохранилось */}
+        {settingsError && currentView === 'ADMIN' && (
+          <div className="mx-8 mt-6 px-4 py-3 bg-red-900/40 border border-red-600 rounded flex items-start gap-3">
+            <span className="text-red-200 text-sm flex-1">{settingsError}</span>
+            <button
+              onClick={() => setSettingsError('')}
+              className="text-red-300 hover:text-white text-sm font-bold shrink-0"
+            >
+              Понятно
+            </button>
+          </div>
+        )}
         {currentView === 'ADMIN' && (
           <AdminPanel
             categories={categories}
@@ -336,7 +445,6 @@ function App() {
             categories={categories}
             ingredients={ingredients}
             dishes={dishes}
-            orderHistory={orderHistory}
             settings={settings}
             onUpdateIngredient={handleUpdateIngredient}
           />

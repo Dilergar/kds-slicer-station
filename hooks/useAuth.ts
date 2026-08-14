@@ -10,11 +10,21 @@
  * таймер бездействия на activity listeners здесь.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { AuthUser } from '../types';
-import { loginByPin } from '../services/authApi';
+import { loginByPin, revalidateSession } from '../services/authApi';
 
 const STORAGE_KEY = 'slicer_auth_user';
+
+/**
+ * Как часто перепроверять сессию у backend, мс.
+ *
+ * «Не разлогинивать активного пользователя» (требование заказчика) и «никогда
+ * не проверять, существует ли он ещё» — разные вещи. Планшет живёт открытым
+ * неделями, за это время сотрудника могут уволить и заблокировать или изменить
+ * ему роль. 10 минут — компромисс: запрос лёгкий, а реакция достаточно быстрая.
+ */
+const REVALIDATE_INTERVAL_MS = 10 * 60 * 1000;
 
 /**
  * Безопасно прочитать сохранённого юзера из localStorage.
@@ -68,6 +78,54 @@ export function useAuth() {
     localStorage.removeItem(STORAGE_KEY);
     setUser(null);
   }, []);
+
+  // Чтобы эффект перепроверки не перезапускался на каждое обновление user
+  // (иначе успешная перепроверка сама себя зациклит), держим uuid в ref.
+  const userUuidRef = useRef<string | null>(user?.uuid ?? null);
+  userUuidRef.current = user?.uuid ?? null;
+
+  // Перепроверка сессии: сразу при загрузке страницы и дальше по таймеру.
+  // 401 = пользователь пропал или заблокирован → разлогиниваем.
+  // Сетевая ошибка НЕ разлогинивает: обрыв Wi-Fi не повод выкидывать нарезчика
+  // с доски посреди смены — просто попробуем на следующем круге.
+  useEffect(() => {
+    let cancelled = false;
+
+    const check = async () => {
+      const uuid = userUuidRef.current;
+      if (!uuid) return;
+      try {
+        const fresh = await revalidateSession(uuid);
+        if (cancelled) return;
+        // Обновляем роли и логин, если их поменяли в системе заказчика
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(fresh));
+        setUser(prev => {
+          if (!prev) return prev;
+          const sameRoles =
+            prev.roles.length === fresh.roles.length &&
+            prev.roles.every((r, i) => r === fresh.roles[i]);
+          return sameRoles && prev.login === fresh.login ? prev : fresh;
+        });
+      } catch (err) {
+        if (cancelled) return;
+        // Отличаем «сессия недействительна» от «сети нет»: разлогиниваем только первое
+        const message = err instanceof Error ? err.message : '';
+        if (/недействительн/i.test(message)) {
+          console.warn('[useAuth] Сессия недействительна — разлогиниваем');
+          logout();
+        } else {
+          console.warn('[useAuth] Не удалось перепроверить сессию:', err);
+        }
+      }
+    };
+
+    check();
+    const interval = setInterval(check, REVALIDATE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [logout]);
 
   return { user, login, logout };
 }

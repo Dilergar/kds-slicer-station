@@ -16,7 +16,7 @@ interface SpeedKpiSectionProps {
    * Parent должен мемоизировать callback (useCallback), чтобы не было
    * лишних ре-рендеров.
    */
-  onDataReady?: (data: { standard: AggregatedSpeedReport; parked: AggregatedSpeedReport }) => void;
+  onDataReady?: (data: { standard: AggregatedSpeedReport; parked: AggregatedSpeedReport; searchQuery: string }) => void;
 }
 
 export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, appliedFilter, dishes, categories, onDataReady }) => {
@@ -226,8 +226,11 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
     onDataReady?.({
       standard: speedStats.standard as AggregatedSpeedReport,
       parked: speedStats.parked as AggregatedSpeedReport,
+      // Строку поиска отдаём вместе с агрегатами: экспорт печатает её в шапке,
+      // иначе отфильтрованная книга неотличима от полного отчёта за смену.
+      searchQuery,
     });
-  }, [speedStats.standard, speedStats.parked, onDataReady]);
+  }, [speedStats.standard, speedStats.parked, searchQuery, onDataReady]);
 
   // Границы timeline-чартов — тот же period, что и фильтр Dashboard.
   const rangeStart = new Date(appliedFilter.start).getTime();

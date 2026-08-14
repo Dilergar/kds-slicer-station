@@ -11,6 +11,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { pool } from '../config/db';
+import { extensionForMime, imageFileFilter, verifyImageSignature } from '../utils/imageUpload';
 
 const router = Router();
 
@@ -64,30 +65,34 @@ const UPLOAD_DIR = path.resolve(__dirname, '../../public/images/dishes');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /**
- * Multer-конфиг: файл кладётся с именем <dishId>.<ext>.
- * Старое фото того же блюда перезаписывается (если расширение совпало),
- * либо явно удаляется в хэндлере (если расширение сменилось — jpg→png).
+ * Multer-конфиг: файл кладётся с именем `<dishId>_<метка времени>.<ext>`.
+ *
+ * Метка времени обязательна — по той же причине, что и у ингредиентов
+ * (см. routes/ingredients.ts): при постоянном имени перезалитое фото не
+ * доезжало до планшета, потому что статика кэшируется на 7 дней
+ * (`Cache-Control: public, max-age=604800` в index.ts) и браузер не
+ * перепроверял неизменившийся URL.
+ *
+ * Старое фото не остаётся мусором: хэндлер ниже удаляет прежний файл,
+ * раз путь в БД отличается от нового.
  */
 const uploadStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const ext = (path.extname(file.originalname) || '.jpg').toLowerCase();
-    cb(null, `${req.params.dishId}${ext}`);
+    // Расширение берём ИЗ БЕЛОГО СПИСКА по проверенному типу, а не из имени файла.
+    // Раньше было path.extname(file.originalname): и имя, и Content-Type присылает
+    // клиент, поэтому файл `x.html` с заголовком `image/png` проходил фильтр,
+    // ложился в папку фото и отдавался браузером как HTML — исполняемый скрипт
+    // на том же адресе, что и приложение. Теперь имя на диске строится только из
+    // uuid блюда, метки времени и расширения из ALLOWED_IMAGE_TYPES.
+    cb(null, `${req.params.dishId}_${Date.now()}${extensionForMime(file.mimetype)}`);
   }
 });
 
 const upload = multer({
   storage: uploadStorage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 МБ жёсткий лимит
-  fileFilter: (_req, file, cb) => {
-    // Whitelist: только реальные форматы картинок. Отсекает попытки залить
-    // exe/html/svg под видом изображения.
-    if (/^image\/(jpeg|png|gif|webp)$/.test(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Неподдерживаемый формат файла (только JPEG/PNG/GIF/WEBP)'));
-    }
-  }
+  fileFilter: imageFileFilter
 });
 
 /**
@@ -157,10 +162,19 @@ router.get('/', async (_req: Request, res: Response) => {
     // Ручные назначения категорий блюдам (slicer_dish_categories).
     // Одно блюдо может иметь несколько категорий. Если строк нет —
     // блюдо попадёт в секцию «Без категории» на фронтенде.
+    // ⚠️ ORDER BY sort_index обязателен: category_ids[0] используется отчётами
+    // как «основная категория блюда», а доска считает основной ту, у которой
+    // минимальный sort_index. Без сортировки порядок в массиве определялся
+    // порядком строк в таблице (то есть порядком вставки при последней полной
+    // перезаписи в PUT /api/dishes/:id/categories), и блюдо с двумя категориями
+    // могло попасть на доску как салат, а в отчёт — как «Салаты Hot». Сейчас
+    // многокатегорийных блюд в базе нет, но UI разрешает назначить до трёх.
     const dishCatsResult = await pool.query(`
-      SELECT dish_id, array_agg(category_id::text) AS category_ids
-      FROM slicer_dish_categories
-      GROUP BY dish_id
+      SELECT dc.dish_id,
+             array_agg(dc.category_id::text ORDER BY c.sort_index ASC, c.id ASC) AS category_ids
+      FROM slicer_dish_categories dc
+      JOIN slicer_categories c ON c.id = dc.category_id
+      GROUP BY dc.dish_id
     `);
     const categoriesByDish = new Map<string, string[]>();
     for (const r of dishCatsResult.rows) {
@@ -183,25 +197,40 @@ router.get('/', async (_req: Request, res: Response) => {
     // сбрасывалась на 0 при каждом reload dishes. Берём:
     //   - rgst3_dishstoplist.insert_date — когда основная KDS поставила стоп
     //   - slicer_dish_stoplist.stopped_at — когда наш модуль поставил стоп
+    // stopped_by_* нужны отчёту (секция «Активные сейчас»): раньше у активного
+    // стопа блюда актора не было вовсе. Для стопов кассира из rgst3 резолвим
+    // inserter через users — как это делает история стоп-листа.
     const stoplistResult = await pool.query(`
       SELECT r.rgst3_ctlg15_uuid__dish::text AS dish_uuid,
              NULL::text AS reason,
-             r.insert_date AS stopped_at
+             r.insert_date AS stopped_at,
+             u.uuid::text AS stopped_by_uuid,
+             TRIM(u.login) AS stopped_by_name
       FROM rgst3_dishstoplist r
       JOIN ctlg14_shifts s ON s.suuid = r.rgst3_ctlg14_uuid__shift
+      LEFT JOIN users u ON u.uuid::text = r.inserter
       WHERE s.ctlg14_closed = false
       UNION ALL
-      SELECT dish_id AS dish_uuid, reason, stopped_at
+      SELECT dish_id AS dish_uuid, reason, stopped_at,
+             stopped_by_uuid::text, stopped_by_name
       FROM slicer_dish_stoplist
     `);
     const stoppedDishReasons = new Map<string, string | null>();
     const stoppedDishTimestamps = new Map<string, number>();
+    const stoppedDishActors = new Map<string, { uuid: string | null; name: string | null }>();
     for (const r of stoplistResult.rows) {
       // Если блюдо встретилось дважды — slicer_dish_stoplist (с текстом reason)
       // побеждает запись из rgst3 (где reason всегда NULL).
       const prev = stoppedDishReasons.get(r.dish_uuid);
       if (prev == null || r.reason != null) {
         stoppedDishReasons.set(r.dish_uuid, r.reason);
+      }
+      // Актор: первый непустой выигрывает (наша строка обычно информативнее)
+      if (r.stopped_by_name && !stoppedDishActors.get(r.dish_uuid)?.name) {
+        stoppedDishActors.set(r.dish_uuid, {
+          uuid: r.stopped_by_uuid ?? null,
+          name: r.stopped_by_name,
+        });
       }
       // Для timestamp берём самый ранний — показывает реальный момент когда
       // блюдо впервые стопнулось (если есть в обеих таблицах).
@@ -298,7 +327,10 @@ router.get('/', async (_req: Request, res: Response) => {
         stop_reason: stopReason,
         // Реальный момент стопа из БД (не Date.now()!) — стабильный между
         // polling'ами, благодаря чему Dashboard-таймер не сбрасывается.
-        stop_timestamp: isStopped ? stoppedDishTimestamps.get(row.id) : undefined
+        stop_timestamp: isStopped ? stoppedDishTimestamps.get(row.id) : undefined,
+        // Кто поставил текущий стоп — для секции «Активные сейчас» в отчёте
+        stopped_by_uuid: isStopped ? (stoppedDishActors.get(row.id)?.uuid ?? undefined) : undefined,
+        stopped_by_name: isStopped ? (stoppedDishActors.get(row.id)?.name ?? undefined) : undefined
       };
     });
 
@@ -308,6 +340,32 @@ router.get('/', async (_req: Request, res: Response) => {
     res.status(500).json({ error: 'Ошибка получения блюд' });
   }
 });
+
+/**
+ * Проверяет, что блюдо реально существует в справочнике заказчика.
+ *
+ * Зачем. Колонки dish_id в наших таблицах — это VARCHAR/TEXT без внешнего ключа
+ * (теневой подход, правило 3), поэтому запись на любой выдуманный id проходила
+ * успешно. Кнопка «Создать Рецепт» в админке этим и пользовалась: генерировала
+ * id вида `d1723...` и «сохраняла» рецепт, категории, приоритет и разморозку на
+ * несуществующее блюдо. Кнопку убрали, но серверная проверка нужна как гарантия:
+ * прямой запрос к API (в т.ч. при отладке у заказчика) больше не насорит.
+ *
+ * @param dishId — идентификатор блюда из URL
+ * @returns true, если блюдо есть в ctlg15_dishes
+ */
+async function dishExists(dishId: unknown): Promise<boolean> {
+  // Формат проверяем до запроса: suuid имеет тип uuid, и мусор дал бы 22P02
+  if (typeof dishId !== 'string') return false;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(dishId)) {
+    return false;
+  }
+  const res = await pool.query('SELECT 1 FROM ctlg15_dishes WHERE suuid = $1 LIMIT 1', [dishId]);
+  return (res.rowCount ?? 0) > 0;
+}
+
+/** Единый текст отказа для несуществующего блюда */
+const UNKNOWN_DISH_ERROR = 'Блюдо не найдено в справочнике заказчика';
 
 /**
  * PUT /api/dishes/:dishId/categories — Назначить блюду список slicer-категорий.
@@ -322,6 +380,11 @@ router.put('/:dishId/categories', async (req: Request, res: Response) => {
 
     if (!Array.isArray(category_ids)) {
       res.status(400).json({ error: 'category_ids должен быть массивом' });
+      return;
+    }
+
+    if (!(await dishExists(dishId))) {
+      res.status(404).json({ error: UNKNOWN_DISH_ERROR });
       return;
     }
 
@@ -378,6 +441,11 @@ router.put('/:dishId/priority', async (req: Request, res: Response) => {
       return;
     }
 
+    if (!(await dishExists(dishId))) {
+      res.status(404).json({ error: UNKNOWN_DISH_ERROR });
+      return;
+    }
+
     await pool.query(
       `INSERT INTO slicer_dish_priority (dish_id, priority_flag)
        VALUES ($1, $2)
@@ -422,6 +490,11 @@ router.put('/:dishId/defrost', async (req: Request, res: Response) => {
       return;
     }
 
+    if (!(await dishExists(dishId))) {
+      res.status(404).json({ error: UNKNOWN_DISH_ERROR });
+      return;
+    }
+
     await pool.query(
       `INSERT INTO slicer_dish_defrost (dish_id, requires_defrost, defrost_duration_minutes)
        VALUES ($1, $2, $3)
@@ -463,17 +536,76 @@ router.delete('/:dishId/slicer-data', async (req: Request, res: Response) => {
     try {
       await client.query('BEGIN');
 
+      // Варианты доставки, которые сейчас указывают на это блюдо как на primary.
+      // Их нужно узнать ДО удаления связей — после DELETE их уже не найти.
+      const linkedAliasesRes = await client.query(
+        'SELECT alias_dish_id FROM slicer_dish_aliases WHERE primary_dish_id = $1',
+        [dishId]
+      );
+      const linkedAliasIds: string[] = linkedAliasesRes.rows.map(r => r.alias_dish_id);
+
       const recipesRes = await client.query(
         'DELETE FROM slicer_recipes WHERE dish_id = $1',
         [dishId]
       );
+      // Категории чистим и у самого блюда, и у его бывших вариантов доставки.
+      //
+      // Раньше чистились только свои: у вариантов оставались скопированные при
+      // связывании категории, поэтому фильтр «есть категория» в GET /api/orders
+      // продолжал пускать их на доску — а рецепта у них своего никогда не было
+      // (читался у primary через recipe_source_id). Нарезчик получал карточки
+      // без единого ингредиента и без подсказки, откуда они взялись: секция
+      // «Связанные варианты» исчезала вместе со связями.
       const categoriesRes = await client.query(
-        'DELETE FROM slicer_dish_categories WHERE dish_id = $1',
-        [dishId]
+        'DELETE FROM slicer_dish_categories WHERE dish_id = ANY($1::text[])',
+        [[dishId, ...linkedAliasIds]]
       );
       const aliasesRes = await client.query(
         'DELETE FROM slicer_dish_aliases WHERE alias_dish_id = $1 OR primary_dish_id = $1',
         [dishId]
+      );
+      // Снимаем блюдо (и его варианты) со стоп-листа модуля.
+      //
+      // Без этого блюдо уезжало в «Без категории», где у карточки нет тумблера
+      // стопа — снять его было нечем, а в отчёте запись оставалась незакрытой и
+      // бесконечно накручивала «% времени на стопе». Пишем закрывающую запись
+      // в историю, чтобы простой не потерялся и не «тянулся» вечно.
+      const stopIds = [dishId, ...linkedAliasIds];
+      const openStopsRes = await client.query(
+        `SELECT s.dish_id, s.stopped_at, s.reason, s.rgst3_row_suuid,
+                s.stopped_by_uuid, s.stopped_by_name, s.actor_source,
+                CASE
+                  WHEN d.code IS NOT NULL AND d.code <> ''
+                    THEN d.code || ' ' || COALESCE(d.name, 'Unknown dish')
+                  ELSE COALESCE(d.name, 'Unknown dish')
+                END AS dish_name
+           FROM slicer_dish_stoplist s
+           LEFT JOIN ctlg15_dishes d ON d.suuid::text = s.dish_id
+          WHERE s.dish_id = ANY($1::text[])`,
+        [stopIds]
+      );
+      for (const row of openStopsRes.rows) {
+        const stoppedAt = new Date(row.stopped_at);
+        await client.query(
+          `INSERT INTO slicer_stop_history
+            (target_type, target_id, target_name, stopped_at, resumed_at, reason, duration_ms,
+             stopped_by_uuid, stopped_by_name, actor_source)
+           VALUES ('dish', $1, $2, $3, NOW(), $4, $5, $6, $7, $8)`,
+          [
+            row.dish_id,
+            row.dish_name,
+            stoppedAt,
+            row.reason || 'Сброс настроек блюда',
+            Date.now() - stoppedAt.getTime(),
+            row.stopped_by_uuid,
+            row.stopped_by_name,
+            row.actor_source || 'slicer',
+          ]
+        );
+      }
+      const stoplistRes = await client.query(
+        'DELETE FROM slicer_dish_stoplist WHERE dish_id = ANY($1::text[])',
+        [stopIds]
       );
       // Сбрасываем также приоритет — при повторной настройке блюда через
       // RecipeEditor он начнётся с NORMAL (дефолт при отсутствии записи).
@@ -492,12 +624,16 @@ router.delete('/:dishId/slicer-data', async (req: Request, res: Response) => {
 
       res.json({
         cleared: true,
+        // unlinkedAliases отдаём клиенту, чтобы диалог подтверждения мог заранее
+        // предупредить: «у блюда N связанных вариантов, они тоже будут сброшены»
+        unlinkedAliases: linkedAliasIds.length,
         deleted: {
           recipes: recipesRes.rowCount ?? 0,
           categories: categoriesRes.rowCount ?? 0,
           aliases: aliasesRes.rowCount ?? 0,
           priority: priorityRes.rowCount ?? 0,
-          defrost: defrostRes.rowCount ?? 0
+          defrost: defrostRes.rowCount ?? 0,
+          stoplist: stoplistRes.rowCount ?? 0
         }
       });
     } catch (e) {
@@ -516,11 +652,11 @@ router.delete('/:dishId/slicer-data', async (req: Request, res: Response) => {
  * POST /api/dishes/:dishId/image — Загрузить фото блюда.
  *
  * Принимает multipart/form-data с полем `image`. Файл физически
- * сохраняется в server/public/images/dishes/<dishId>.<ext>, в БД
- * (slicer_dish_images) пишется относительный URL `/images/dishes/...`.
+ * сохраняется в server/public/images/dishes/<dishId>_<метка времени>.<ext>,
+ * в БД (slicer_dish_images) пишется относительный URL `/images/dishes/...`.
  *
- * Если у блюда уже было фото с другим расширением (jpg → png) —
- * удаляем старый файл с диска, чтобы не оставлять мусор.
+ * Имя каждый раз новое (см. uploadStorage выше — обход кэша браузера),
+ * поэтому прежний файл всегда удаляем с диска, чтобы не копить мусор.
  *
  * multer-ошибки (слишком большой файл, неправильный mimetype) возвращаются
  * как 400 клиенту — их ловит глобальный errorHandler.
@@ -533,23 +669,41 @@ router.post('/:dishId/image', validateDishUuid, upload.single('image'), async (r
       return;
     }
 
+    const savedPath = path.join(UPLOAD_DIR, req.file.filename);
+
+    // Содержимое должно быть настоящей картинкой, а не просто заявленной
+    // таковой в заголовке (см. utils/imageUpload.ts).
+    if (!verifyImageSignature(savedPath)) {
+      try { fs.unlinkSync(savedPath); } catch { /* уже нет */ }
+      res.status(400).json({ error: 'Файл не является изображением' });
+      return;
+    }
+
+    // Блюдо должно существовать в справочнике заказчика.
+    //
+    // slicer_dish_images.dish_id — это VARCHAR PRIMARY KEY без внешнего ключа,
+    // поэтому запись проходила для ЛЮБОГО uuid. Каждый новый случайный id давал
+    // новый файл до 5 МБ, и ветка удаления старого его не задевала — она
+    // сравнивает пути только внутри одного dish_id. Диск при этом общий с
+    // продакшн-базой заказчика: заполнив его, останавливаешь ИХ систему.
+    // Симметрично тому, как это уже сделано у ингредиентов (там UPDATE просто
+    // не находил запись и файл удалялся).
+    if (!(await dishExists(dishId))) {
+      try { fs.unlinkSync(savedPath); } catch { /* уже нет */ }
+      res.status(404).json({ error: UNKNOWN_DISH_ERROR });
+      return;
+    }
+
     const relativePath = `/images/dishes/${req.file.filename}`;
 
-    // Если расширение сменилось — старый файл остаётся на диске мусором.
-    // Находим прежний image_path и удаляем если имя не совпадает с новым.
+    // Прежний путь запоминаем ДО записи — файл удалим уже после успешного UPSERT.
+    // Раньше удаление шло первым, и при падении записи в БД пользователь терял
+    // и старое фото (путь в БД остался, файла нет), и получал мусор от нового.
     const prev = await pool.query(
       'SELECT image_path FROM slicer_dish_images WHERE dish_id = $1',
       [dishId]
     );
-    if (prev.rows.length && prev.rows[0].image_path !== relativePath) {
-      const oldFile = path.resolve(__dirname, '../../public' + prev.rows[0].image_path);
-      // Defence-in-depth: даже если в БД попал traversal-путь, не unlink-аем
-      // ничего вне UPLOAD_DIR (только наша папка с фото блюд).
-      if (isPathInside(oldFile, UPLOAD_DIR) && fs.existsSync(oldFile)) {
-        try { fs.unlinkSync(oldFile); }
-        catch (e) { console.warn('[Dishes] Не удалось удалить старый файл:', oldFile, e); }
-      }
-    }
+    const oldPath: string | null = prev.rows[0]?.image_path ?? null;
 
     await pool.query(
       `INSERT INTO slicer_dish_images (dish_id, image_path, content_type, file_size, updated_at)
@@ -562,9 +716,23 @@ router.post('/:dishId/image', validateDishUuid, upload.single('image'), async (r
       [dishId, relativePath, req.file.mimetype, req.file.size]
     );
 
+    if (oldPath && oldPath !== relativePath) {
+      const oldFile = path.resolve(__dirname, '../../public' + oldPath);
+      // Defence-in-depth: даже если в БД попал traversal-путь, не unlink-аем
+      // ничего вне UPLOAD_DIR (только наша папка с фото блюд).
+      if (isPathInside(oldFile, UPLOAD_DIR) && fs.existsSync(oldFile)) {
+        try { fs.unlinkSync(oldFile); }
+        catch (e) { console.warn('[Dishes] Не удалось удалить старый файл:', oldFile, e); }
+      }
+    }
+
     res.json({ image_url: relativePath });
   } catch (err) {
     console.error('[Dishes] Ошибка upload image:', err);
+    // Запись в БД не состоялась — только что загруженный файл никому не нужен
+    if (req.file) {
+      try { fs.unlinkSync(path.join(UPLOAD_DIR, req.file.filename)); } catch { /* уже нет */ }
+    }
     res.status(500).json({ error: 'Ошибка загрузки фото блюда' });
   }
 });

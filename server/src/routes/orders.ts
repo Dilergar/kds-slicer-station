@@ -144,6 +144,18 @@ router.get('/', async (_req: Request, res: Response) => {
           INNER JOIN ctlg20_modifiers m
             ON m.suuid = dm.docm2tabl2_ctlg20_uuid__modifier
           WHERE m.name ILIKE ANY ($3::text[])
+            -- Сужение до живых позиций ОБЯЗАТЕЛЬНО внутри CTE.
+            -- Снаружи фильтр не помогает: INNER JOIN по tm.item_id планировщик
+            -- не может протолкнуть внутрь GROUP BY (справа не константа), поэтому
+            -- CTE агрегировал ВСЮ таблицу модификаторов за всю историю ресторана —
+            -- на каждый поллинг каждого планшета, 15 раз в минуту.
+            AND dm.docm2tabl2_itemrow IN (
+              SELECT i.suuid
+                FROM docm2tabl1_items i
+                INNER JOIN docm2_orders o ON o.suuid = i.owner
+               WHERE o.docm2_closed = false
+                 AND (i.docm2tabl1_cooked IS NULL OR i.docm2tabl1_cooked = false)
+            )
           GROUP BY dm.docm2tabl2_itemrow
         )
         INSERT INTO slicer_order_state
@@ -154,14 +166,30 @@ router.get('/', async (_req: Request, res: Response) => {
           ${REAL_STACKS_SQL},
           items.docm2tabl1_ordertime,
           -- unpark_at:
-          --   * minutes_of_day NOT NULL → сегодняшняя дата + это число минут от 00:00.
-          --     Если указанное время уже в прошлом — auto-unpark ниже сразу вернёт
-          --     в ACTIVE (и в этом случае KPI парковки в итоге составит <1 polling).
+          --   * minutes_of_day NOT NULL → время суток из модификатора «Готовить к HH.MM».
+          --     Время НИКОГДА не может оказаться раньше момента пробития чека:
+          --       – если сегодняшнее время уже прошло, но завтрашнее наступает в
+          --         пределах 6 часов — это ночной кейс («Готовить к 00.30» пробито
+          --         в 23:50), переносим на следующие сутки;
+          --       – если завтрашнее дальше 6 часов, значит время просто прошло
+          --         (официант ошибся, гость передумал) — приравниваем к ordertime,
+          --         то есть фактически не паркуем.
+          --     Раньше здесь было безусловное «сегодня + минуты», и при уже прошедшем
+          --     времени авто-разпарковка ставила effective_created_at в прошлое:
+          --     десерт появлялся на доске с часовым таймером и уходил в верх очереди.
           --   * minutes_of_day NULL → ordertime + dessert_auto_park_minutes минут
           --     (стандартное поведение «Готовить позже» / «Ждать разъяснений»).
           CASE
             WHEN tm.minutes_of_day IS NOT NULL THEN
-              (CURRENT_DATE + (tm.minutes_of_day || ' minutes')::interval)::timestamp
+              CASE
+                WHEN (CURRENT_DATE + (tm.minutes_of_day || ' minutes')::interval)::timestamp
+                       >= items.docm2tabl1_ordertime
+                  THEN (CURRENT_DATE + (tm.minutes_of_day || ' minutes')::interval)::timestamp
+                WHEN (CURRENT_DATE + INTERVAL '1 day' + (tm.minutes_of_day || ' minutes')::interval)::timestamp
+                       <= items.docm2tabl1_ordertime + INTERVAL '6 hours'
+                  THEN (CURRENT_DATE + INTERVAL '1 day' + (tm.minutes_of_day || ' minutes')::interval)::timestamp
+                ELSE items.docm2tabl1_ordertime
+              END
             ELSE
               items.docm2tabl1_ordertime + ($1::text || ' minutes')::interval
           END,
@@ -181,7 +209,11 @@ router.get('/', async (_req: Request, res: Response) => {
           ON tables.suuid = orders.docm2_ctlg13_uuid__halltable
         LEFT JOIN slicer_order_state state
           ON state.order_item_id = items.suuid::text
+        LEFT JOIN ctlg14_shifts shift ON shift.suuid = orders.docm2_ctlg14_uuid__shift
         WHERE orders.docm2_closed = false
+          -- Симметрично основному запросу ниже: не паркуем позиции зависших
+          -- чеков из уже закрытых смен — они и на доску не попадут.
+          AND (shift.suuid IS NULL OR shift.ctlg14_closed = false)
           AND (items.docm2tabl1_cooked IS NULL OR items.docm2tabl1_cooked = false)
           AND items.docm2tabl1_ctlg17_uuid__storage IN (${KITCHEN_STORAGE_UUIDS.map((_, i) => `$${i + 4}`).join(', ')})
           AND state.order_item_id IS NULL
@@ -224,8 +256,13 @@ router.get('/', async (_req: Request, res: Response) => {
     await pool.query(`
       UPDATE slicer_order_state
       SET status = 'ACTIVE',
+          -- GREATEST(unpark_at, NOW()) — страховка «десерт как новый, но не из
+          -- прошлого». unpark_at может оказаться в прошлом (модификатор с уже
+          -- прошедшим временем, длинный простой backend между поллингами), а
+          -- effective_created_at идёт и в таймер карточки, и в ключ сортировки:
+          -- время в прошлом давало красную «просроченную» карточку в верху очереди.
           effective_created_at = CASE
-            WHEN parked_by_auto THEN unpark_at
+            WHEN parked_by_auto THEN GREATEST(unpark_at, NOW())
             ELSE effective_created_at
           END,
           accumulated_time_ms = CASE
@@ -286,9 +323,22 @@ router.get('/', async (_req: Request, res: Response) => {
         ON primary_dish.suuid::text = alias.primary_dish_id
       LEFT JOIN ctlg13_halltables tables ON tables.suuid = orders.docm2_ctlg13_uuid__halltable
       LEFT JOIN slicer_order_state state ON state.order_item_id = items.suuid::text
+      -- Смена чека — для отсечки зависших незакрытых чеков прошлых смен
+      LEFT JOIN ctlg14_shifts shift ON shift.suuid = orders.docm2_ctlg14_uuid__shift
       WHERE orders.docm2_closed = false
         AND (items.docm2tabl1_cooked IS NULL OR items.docm2tabl1_cooked = false)
         AND COALESCE(state.status, 'ACTIVE') NOT IN ('COMPLETED', 'CANCELLED')
+        -- Только открытая смена. Докстринг эндпоинта обещал это с самого начала,
+        -- но в запросе ограничения не было: если кассир забыл закрыть чек, а
+        -- основная KDS не отметила позицию готовой, она висела на доске после
+        -- закрытия смены, назавтра и дальше — с таймером в десятки часов и
+        -- наверху очереди, потому что сортировка идёт по времени пробития.
+        -- Убрать её нарезчик мог только «Готово» или «Отмена», то есть засорив
+        -- отчёты. Остальные модули (stoplist.ts, dishes.ts, kdsStoplistSync.ts)
+        -- фильтр по смене уже применяют — здесь он единственный отсутствовал.
+        -- LEFT JOIN + IS NULL: чеки без проставленной смены не прячем, иначе
+        -- при неожиданных данных заказчика доска молча опустеет.
+        AND (shift.suuid IS NULL OR shift.ctlg14_closed = false)
         -- Whitelist цехов: показываем ТОЛЬКО позиции с кухонным складом.
         -- Всё остальное (бар, хозка, битые ссылки) — скрывается.
         AND items.docm2tabl1_ctlg17_uuid__storage IN (${KITCHEN_STORAGE_UUIDS.map((_, i) => `$${i + 1}`).join(', ')})
@@ -355,6 +405,10 @@ router.get('/', async (_req: Request, res: Response) => {
         COALESCE(alias.primary_dish_id, items.docm2tabl1_ctlg15_uuid__dish::text) AS dish_id,
         COALESCE(state.effective_created_at, items.docm2tabl1_ordertime) AS created_at
       FROM slicer_order_state state
+      -- Каст здесь оставлен на чужой колонке намеренно: order_item_id — VARCHAR,
+      -- и в нём могут лежать не-uuid строки (синтетические id разморозки от старых
+      -- версий). Приведение state.order_item_id::uuid уронило бы весь запрос с 22P02.
+      -- Индексируемость даёт предикат по owner ниже, этого достаточно.
       INNER JOIN docm2tabl1_items items ON items.suuid::text = state.order_item_id
       INNER JOIN docm2_orders orders ON orders.suuid = items.owner
       LEFT JOIN slicer_dish_aliases alias
@@ -365,7 +419,7 @@ router.get('/', async (_req: Request, res: Response) => {
         -- Только чеки, у которых прямо сейчас есть живые позиции на доске
         -- (см. коммент выше: отсекает зависшие чеки прошлых компаний и
         -- ограничивает скан накопленных COMPLETED-строк).
-        AND items.owner::text = ANY($1::text[])
+        AND items.owner = ANY($1::uuid[])
     `, [activeOwnerIds]);
 
     // Группировка контекста по гостю. Ключи — visitKeyFor (единый контракт
@@ -485,15 +539,36 @@ router.post('/:id/complete', async (req: Request, res: Response) => {
       //    (раздача / пасс), чтобы нажатие нарезчиком не путало другие панели.
       //    finished_at = NOW() нужен для замера времени готовки повара
       //    (docm2tabl1_cooktime - finished_at).
-      await client.query(
+      //
+      //    ⚠️ Сторож перехода состояния (`WHERE ... IS DISTINCT FROM 'COMPLETED'`).
+      //    Без него повторный запрос проходил насквозь: UPSERT статуса идемпотентен,
+      //    а вот INSERT в историю и строки расхода ниже выполнялись безусловно —
+      //    столько раз, сколько пришло запросов. Это штатная ситуация, а не
+      //    экзотика: два планшета видят одну карточку до 4 секунд после того, как
+      //    её отдали на первом, и оба жмут «Готово» — в расход уходило 6 порций
+      //    вместо 3. Второй запрос под READ COMMITTED дожидается коммита первого,
+      //    перечитывает строку, видит COMPLETED и не проходит условие.
+      const stateTransition = await client.query(
         `INSERT INTO slicer_order_state (order_item_id, status, finished_at)
          VALUES ($1, 'COMPLETED', NOW())
          ON CONFLICT (order_item_id) DO UPDATE SET
            status = 'COMPLETED',
            finished_at = NOW(),
-           updated_at = NOW()`,
+           updated_at = NOW()
+         WHERE slicer_order_state.status IS DISTINCT FROM 'COMPLETED'
+         RETURNING order_item_id`,
         [id]
       );
+
+      // 2. Позиция уже была завершена — повтор. Отвечаем успехом (клиент не должен
+      //    откатывать оптимистичное удаление карточки), но НЕ дублируем историю
+      //    и расход.
+      if (stateTransition.rowCount === 0) {
+        await client.query('COMMIT');
+        console.warn(`[Orders] Повторное завершение позиции ${id} — история и расход не дублируются`);
+        res.json({ completed: true, historyId: null, alreadyCompleted: true });
+        return;
+      }
 
       // 3. Создать запись в истории
       const historyResult = await client.query(
@@ -530,24 +605,113 @@ router.post('/:id/complete', async (req: Request, res: Response) => {
 
 /**
  * POST /api/orders/:id/partial-complete — Частичное завершение заказа.
- * Body: то же что complete + quantityToComplete
+ *
+ * Body: то же что complete + quantityToComplete.
+ *
+ * ⚠️ Остаток считается ЗДЕСЬ, от актуального состояния в БД, а не берётся из
+ * тела запроса. Раньше сервер записывал присланные клиентом
+ * remainingQuantityStack/remainingTableStack как есть, ничего не сверяя. Из-за
+ * этого два планшета с устаревшим представлением могли отдать больше, чем есть
+ * в заказе: карточка на 3 порции, первый отдал 2, второй (ещё не обновившийся)
+ * тоже отдал 2 — в расход уходило 4 порции из трёхпорционного заказа.
+ * Эти поля в теле теперь игнорируются и оставлены только для совместимости
+ * со старыми клиентами.
  */
 router.post('/:id/partial-complete', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { dishId, dishName, quantityToComplete, prepTimeMs, wasParked, snapshot, consumedIngredients, remainingQuantityStack, remainingTableStack } = req.body;
+    const { dishId, dishName, quantityToComplete, prepTimeMs, wasParked, snapshot, consumedIngredients } = req.body;
+
+    // Валидация запрошенного количества до всякой работы с БД
+    const requested = Number(quantityToComplete);
+    if (!Number.isFinite(requested) || requested <= 0) {
+      res.status(400).json({ error: 'quantityToComplete должно быть положительным числом' });
+      return;
+    }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // Обновить slicer_order_state с уменьшенным quantity_stack
+      // 1. Читаем актуальные стеки под блокировкой строки. COALESCE — на случай
+      //    если теневой строки ещё нет: тогда истина в самой позиции чека.
+      //    FOR UPDATE держит строку до конца транзакции, поэтому параллельный
+      //    второй запрос дождётся коммита и увидит уже уменьшенный остаток.
+      const currentRes = await client.query(
+        `SELECT
+           COALESCE(
+             NULLIF(state.quantity_stack, '[]'::jsonb),
+             jsonb_build_array(items.docm2tabl1_quantity)
+           ) AS quantity_stack,
+           COALESCE(
+             NULLIF(state.table_stack, '[]'::jsonb),
+             CASE
+               WHEN tables.ctlg13_tablenumber IS NOT NULL
+                 THEN jsonb_build_array(jsonb_build_array(tables.ctlg13_tablenumber))
+               ELSE '[[]]'::jsonb
+             END
+           ) AS table_stack
+         FROM docm2tabl1_items items
+         LEFT JOIN docm2_orders orders ON orders.suuid = items.owner
+         LEFT JOIN ctlg13_halltables tables ON tables.suuid = orders.docm2_ctlg13_uuid__halltable
+         LEFT JOIN slicer_order_state state ON state.order_item_id = items.suuid::text
+         WHERE items.suuid::text = $1
+         FOR UPDATE OF state`,
+        [id]
+      );
+
+      if (currentRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        res.status(404).json({ error: 'Позиция заказа не найдена' });
+        return;
+      }
+
+      const currentStack: number[] = (currentRes.rows[0].quantity_stack || []).map(Number);
+      const currentTables: number[][] = currentRes.rows[0].table_stack || [];
+      const available = currentStack.reduce((sum, q) => sum + (Number(q) || 0), 0);
+
+      if (requested > available) {
+        await client.query('ROLLBACK');
+        console.warn(`[Orders] Частичная отдача ${id}: запрошено ${requested}, доступно ${available}`);
+        res.status(409).json({
+          error: `Осталось только ${available} порц. — обновите доску`,
+          available
+        });
+        return;
+      }
+
+      // 2. Списываем запрошенное количество с начала стека (FIFO по блокам).
+      const remainingStack: number[] = [];
+      let toRemove = requested;
+      for (const block of currentStack) {
+        const qty = Number(block) || 0;
+        if (toRemove <= 0) {
+          remainingStack.push(qty);
+        } else if (qty > toRemove) {
+          remainingStack.push(qty - toRemove);
+          toRemove = 0;
+        } else {
+          toRemove -= qty;
+        }
+      }
+      const cleanedStack = remainingStack.filter(q => q > 0);
+
+      // 3. Столы остатка. Столы усекаем ТОЛЬКО если их реально больше, чем
+      //    осталось блоков стека — то есть когда карточка была склеена из
+      //    нескольких одно-порционных позиций. Для обычной позиции чека
+      //    (3 порции одного стола) стол один на все порции, и обрезать его
+      //    по числу отданных порций нельзя: у остатка пропадал номер стола.
+      const flatTables = currentTables.flat();
+      const remainingTables = flatTables.length > cleanedStack.length && cleanedStack.length > 0
+        ? flatTables.slice(flatTables.length - cleanedStack.length)
+        : flatTables;
+
       await client.query(
         `INSERT INTO slicer_order_state (order_item_id, quantity_stack, table_stack)
          VALUES ($1, $2, $3)
          ON CONFLICT (order_item_id) DO UPDATE SET
            quantity_stack = $2, table_stack = $3, updated_at = NOW()`,
-        [id, JSON.stringify(remainingQuantityStack), JSON.stringify(remainingTableStack)]
+        [id, JSON.stringify(cleanedStack), JSON.stringify([remainingTables])]
       );
 
       // Создать запись в истории (частичную)

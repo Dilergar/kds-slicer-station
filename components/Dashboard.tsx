@@ -18,6 +18,7 @@ import { IngredientUsageSection } from './dashboard/IngredientUsageSection';
 import { StopListHistorySection } from './dashboard/StopListHistorySection';
 import { fetchChefCookingEntries } from '../services/chefCookingApi';
 import { fetchStopHistory } from '../services/stoplistApi';
+import { fetchOrderHistory } from '../services/ordersApi';
 import { StopHistoryEntry } from '../types';
 import {
   exportDashboardToExcel,
@@ -31,7 +32,6 @@ interface DashboardProps {
   categories: Category[];
   ingredients: IngredientBase[];
   dishes: Dish[];
-  orderHistory: OrderHistoryEntry[];
   settings: SystemSettings;
   /** Колбэк для сохранения изменений ингредиента (используется для bufferPercent в расходе) */
   onUpdateIngredient: (id: string, updates: Partial<IngredientBase>) => void;
@@ -40,8 +40,13 @@ interface DashboardProps {
 // stopHistory: больше не приходит через prop. Dashboard сам грузит история
 // по выбранному периоду через GET /api/stoplist/history?from=&to= (Фикс #2).
 // Секция StopListHistorySection дальше получает уже отфильтрованный набор.
+//
+// orderHistory — с 2026-08-14 тоже. Раньше отчёты брали общий массив из useOrders,
+// а тот теперь грузит только окно «Хранение истории» (иначе доска каждые 4 секунды
+// качала всю накопленную историю). Отчётам нужен произвольный период, поэтому они
+// запрашивают его сами — тем же запросом, но с from/to.
 
-export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, dishes, orderHistory, settings, onUpdateIngredient }) => {
+export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, dishes, settings, onUpdateIngredient }) => {
   const [tempStart, setTempStart] = useState(() => {
     const now = new Date();
     const year = now.getFullYear();
@@ -60,6 +65,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
 
   const [appliedFilter, setAppliedFilter] = useState<{ start: string; end: string; timestamp: number } | null>(null);
 
+  /** Текст ошибки выбора периода (пустые поля, перевёрнутый диапазон); '' = всё в порядке */
+  const [filterError, setFilterError] = useState('');
+
   // Метрика «Скорость готовки повара» живёт в отдельном endpoint,
   // а не в orderHistory — её сырые записи грузим при применении фильтра.
   // При clear — сбрасываем в пустой массив, чтобы не показывать устаревшие данные.
@@ -72,10 +80,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
   // Годовой отчёт — один запрос, все записи в диапазоне без лимита.
   const [periodStopHistory, setPeriodStopHistory] = useState<StopHistoryEntry[]>([]);
 
+  // История завершённых заказов за выбранный период — источник для секций
+  // «Скорость нарезчика» и «Расход ингредиентов».
+  const [periodOrderHistory, setPeriodOrderHistory] = useState<OrderHistoryEntry[]>([]);
+
   useEffect(() => {
     if (!appliedFilter) {
       setChefCookingEntries([]);
       setPeriodStopHistory([]);
+      setPeriodOrderHistory([]);
       return;
     }
 
@@ -104,12 +117,41 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
         if (!cancelled) setPeriodStopHistory([]);
       });
 
+    fetchOrderHistory({ from: fromIso, to: toIso })
+      .then(data => {
+        if (!cancelled) setPeriodOrderHistory(data);
+      })
+      .catch(err => {
+        console.error('[Dashboard] Ошибка загрузки истории заказов:', err);
+        if (!cancelled) setPeriodOrderHistory([]);
+      });
+
     return () => {
       cancelled = true;
     };
   }, [appliedFilter]);
 
+  /**
+   * Применяет выбранный период после проверки. Проверка обязательна: раньше
+   * «Сбросить фильтры» обнуляло поля, но OK всё равно создавал объект фильтра,
+   * охранное условие `if (!appliedFilter)` его пропускало, и пустая строка
+   * доходила до new Date('').toISOString() — RangeError прямо в эффекте
+   * укладывал всё приложение в белый экран.
+   */
   const handleApply = () => {
+    const startMs = Date.parse(tempStart);
+    const endMs = Date.parse(tempEnd);
+
+    if (!tempStart || !tempEnd || Number.isNaN(startMs) || Number.isNaN(endMs)) {
+      setFilterError('Укажите обе даты периода');
+      return;
+    }
+    if (startMs > endMs) {
+      setFilterError('Начало периода позже конца — поменяйте даты местами');
+      return;
+    }
+
+    setFilterError('');
     setAppliedFilter({
       start: tempStart,
       end: tempEnd,
@@ -118,6 +160,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
   };
 
   const handleClear = () => {
+    setFilterError('');
     setTempStart('');
     setTempEnd('');
     setAppliedFilter(null);
@@ -134,15 +177,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
     speedParked?: AggregatedSpeedReport;
     chefSpeed?: AggregatedChefReport;
     history?: HistoryReport;
+    // Строки поиска секций — экспорт печатает их в шапке листов, чтобы
+    // отфильтрованную книгу нельзя было принять за полный отчёт
+    speedSearchQuery?: string;
+    chefSearchQuery?: string;
   }>({});
   const [isExporting, setIsExporting] = useState(false);
 
-  const handleSpeedDataReady = useCallback((data: { standard: AggregatedSpeedReport; parked: AggregatedSpeedReport }) => {
+  const handleSpeedDataReady = useCallback((data: { standard: AggregatedSpeedReport; parked: AggregatedSpeedReport; searchQuery: string }) => {
     latestReportRef.current.speedStandard = data.standard;
     latestReportRef.current.speedParked = data.parked;
+    latestReportRef.current.speedSearchQuery = data.searchQuery;
   }, []);
-  const handleChefDataReady = useCallback((data: AggregatedChefReport) => {
-    latestReportRef.current.chefSpeed = data;
+  const handleChefDataReady = useCallback((data: { report: AggregatedChefReport; searchQuery: string }) => {
+    latestReportRef.current.chefSpeed = data.report;
+    latestReportRef.current.chefSearchQuery = data.searchQuery;
   }, []);
   const handleHistoryDataReady = useCallback((data: HistoryReport) => {
     latestReportRef.current.history = data;
@@ -159,6 +208,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
         speedParked: latestReportRef.current.speedParked,
         chefSpeed: latestReportRef.current.chefSpeed,
         history: latestReportRef.current.history,
+        speedSearchQuery: latestReportRef.current.speedSearchQuery,
+        chefSearchQuery: latestReportRef.current.chefSearchQuery,
       };
       await exportDashboardToExcel(payload);
     } catch (err) {
@@ -234,6 +285,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
         </div>
       </div>
 
+      {/* Ошибка выбора периода — рядом с фильтром, чтобы было видно куда смотреть */}
+      {filterError && (
+        <div className="mb-4 px-4 py-2 bg-red-900/30 border border-red-700/50 rounded text-red-300 text-sm font-medium">
+          {filterError}
+        </div>
+      )}
+
       {!appliedFilter ? (
         <div className="flex flex-col items-center justify-center h-96 border-2 border-dashed border-gray-800 rounded-lg text-gray-500">
           <Calendar size={64} className="mb-4 opacity-50" />
@@ -242,7 +300,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
       ) : (
         <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
           <SpeedKpiSection
-            orderHistory={orderHistory}
+            orderHistory={periodOrderHistory}
             appliedFilter={appliedFilter}
             categories={categories}
             dishes={dishes}
@@ -256,7 +314,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
             onDataReady={handleChefDataReady}
           />
           <IngredientUsageSection
-            orderHistory={orderHistory}
+            orderHistory={periodOrderHistory}
             appliedFilter={appliedFilter}
             ingredients={ingredients}
             onUpdateIngredient={onUpdateIngredient}

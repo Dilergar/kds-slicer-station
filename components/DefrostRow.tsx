@@ -17,7 +17,7 @@
  * списка тем же тиком — компонент физически не может увидеть переход
  * «идёт → истёк», из-за чего старый эффект не срабатывал никогда.
  */
-import React from 'react';
+import React, { useState } from 'react';
 import { Order, Dish } from '../types';
 import { Snowflake, X, Check } from 'lucide-react';
 import { isDefrostActive } from '../smartQueue';
@@ -54,6 +54,30 @@ export const DefrostRow: React.FC<DefrostRowProps> = ({
   onCancelDefrost,
   onCompleteDefrost,
 }) => {
+  // Мини-карточки, по которым только что нажали. Первый тап убирает карточку
+  // из ряда, оставшиеся сдвигаются влево — и второй тап «дребезга» попадал в
+  // соседнее блюдо: досрочно закрывал чужую разморозку или отменял её.
+  // Ключ — id заказа, поэтому блокировка переживает пересборку ряда.
+  const [pendingIds, setPendingIds] = useState<Set<string>>(new Set());
+
+  /**
+   * Выполняет действие мини-карточки один раз, гася её на время перестроения ряда.
+   * @param orderId — id заказа (виртуальный id группы разморозки)
+   * @param fn — что выполнить
+   */
+  const guardTap = (orderId: string, fn: () => void) => {
+    if (pendingIds.has(orderId)) return;
+    setPendingIds(prev => new Set(prev).add(orderId));
+    setTimeout(() => {
+      setPendingIds(prev => {
+        const next = new Set(prev);
+        next.delete(orderId);
+        return next;
+      });
+    }, 600);
+    fn();
+  };
+
   // Собираем все активно размораживающиеся заказы. В SlicerStation мы
   // работаем с уже готовыми Order[] (виртуальные группы Smart Wave),
   // поэтому здесь просто фильтруем по isDefrostActive.
@@ -111,13 +135,13 @@ export const DefrostRow: React.FC<DefrostRowProps> = ({
                   tabIndex={0}
                   onClick={(e) => {
                     e.stopPropagation();
-                    onCancelDefrost(order.id);
+                    guardTap(order.id, () => onCancelDefrost(order.id));
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
                       e.stopPropagation();
-                      onCancelDefrost(order.id);
+                      guardTap(order.id, () => onCancelDefrost(order.id));
                     }
                   }}
                   className="absolute top-1.5 right-1.5 w-6 h-6 flex items-center justify-center rounded-full bg-red-600 hover:bg-red-500 text-white border border-red-400 shadow-[0_0_8px_rgba(239,68,68,0.5)] transition-colors cursor-pointer"
@@ -135,13 +159,13 @@ export const DefrostRow: React.FC<DefrostRowProps> = ({
                   tabIndex={0}
                   onClick={(e) => {
                     e.stopPropagation();
-                    onCompleteDefrost(order.id);
+                    guardTap(order.id, () => onCompleteDefrost(order.id));
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
                       e.stopPropagation();
-                      onCompleteDefrost(order.id);
+                      guardTap(order.id, () => onCompleteDefrost(order.id));
                     }
                   }}
                   className="absolute bottom-1.5 right-1.5 w-8 h-8 flex items-center justify-center rounded-full bg-green-600 hover:bg-green-500 text-white border border-green-400 shadow-[0_0_10px_rgba(34,197,94,0.6)] transition-colors cursor-pointer"

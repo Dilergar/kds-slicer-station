@@ -501,6 +501,11 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
         reason: i.stop_reason || 'Unknown',
         durationMs: reportTime - i.stop_timestamp!,
         isActive: true,
+        // Кто поставил — приходит из GET /api/ingredients (миграция 014).
+        // Раньше у активных стопов актора не было вовсе: строка «Поставил»
+        // появлялась только после снятия, когда спрашивать уже поздно.
+        stoppedByUuid: i.stopped_by_uuid ?? null,
+        stoppedByName: i.stopped_by_name ?? null,
       }));
 
     const activeDishes: DashboardHistoryEntry[] = dishes
@@ -515,6 +520,8 @@ export const StopListHistorySection: React.FC<StopListHistorySectionProps> = ({ 
         reason: d.stop_reason || 'Manual',
         durationMs: reportTime - d.stop_timestamp!,
         isActive: true,
+        stoppedByUuid: d.stopped_by_uuid ?? null,
+        stoppedByName: d.stopped_by_name ?? null,
       }));
 
     return [...completed, ...activeIngredients, ...activeDishes].sort((a, b) => b.stoppedAt - a.stoppedAt);

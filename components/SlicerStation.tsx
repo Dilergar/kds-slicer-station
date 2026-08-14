@@ -27,7 +27,7 @@
 
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Dish, Order, Category, IngredientBase, PriorityLevel, OrderHistoryEntry, SystemSettings, SmartQueueGroup } from '../types';
-import { Clock, Flame, Check, Layers, AlertTriangle, PauseCircle, Car, X, CalendarClock, History, Undo, ArrowLeft, MoveLeft, ArrowUp, PieChart } from 'lucide-react';
+import { Clock, Flame, Check, Layers, AlertTriangle, PauseCircle, Car, X, CalendarClock, History, Undo, ArrowLeft, MoveLeft, ArrowUp, PieChart, WifiOff } from 'lucide-react';
 import { PartialCompletionModal } from './PartialCompletionModal';
 import { OrderCard } from './OrderCard';
 import { DefrostRow } from './DefrostRow';
@@ -63,6 +63,10 @@ interface SlicerStationProps {
    * молча, иначе каждый F5 «звенел» бы всеми текущими заказами.
    */
   ordersLoading?: boolean;
+  /** Время последнего успешного ответа сервера — для плашки «нет связи» */
+  lastSyncAt?: number | null;
+  /** Сколько опросов подряд не прошло — плашка появляется начиная с 3 */
+  failedPolls?: number;
   // Разморозка (миграция 016). Все три принимают sourceOrderItemIds для
   // Smart Wave: резолв виртуального id → реальные order_item_id делается
   // здесь внутри через smartQueueMappingRef.
@@ -89,6 +93,8 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   onRestoreOrder,
   settings,
   ordersLoading,
+  lastSyncAt = null,
+  failedPolls = 0,
   onStartDefrost,
   onCancelDefrost,
   onCompleteDefrost
@@ -773,6 +779,25 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
         </div>
       </div>
 
+      {/* Плашка потери связи. Показывается после 3 неудачных опросов подряд
+          (~12 секунд), чтобы одиночный сетевой сбой не мигал зря. Без неё доска
+          при обрыве Wi-Fi выглядит живой: таймеры на карточках тикают локально,
+          и «пустая доска» неотличима от «пустой кухни» — узнавали от официантов
+          через двадцать минут. */}
+      {failedPolls >= 3 && (
+        <div className="mb-4 px-4 py-3 bg-red-900/50 border-2 border-red-500 rounded-lg flex items-center gap-3 shadow-[0_0_20px_rgba(239,68,68,0.35)] animate-pulse">
+          <WifiOff size={26} className="text-red-300 shrink-0" />
+          <div className="leading-tight">
+            <div className="text-white font-bold text-lg">Нет связи с сервером</div>
+            <div className="text-red-200 text-sm">
+              {lastSyncAt
+                ? `Данные на экране от ${new Date(lastSyncAt).toLocaleTimeString('ru-RU')} — новые заказы сейчас не приходят`
+                : 'Заказы ещё ни разу не загрузились — позовите техподдержку'}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Ряд мини-карточек размораживающихся блюд (миграция 016).
           Между заголовком «KDS Board» и основной сеткой. Голубоватый фон
           визуально отделяет зону разморозки. Мини-карточки агрегированы:
@@ -809,12 +834,24 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           }}
           onCompleteOrder={() => { /* заменяется на onConfirmDefrosted внутри DefrostModal */ }}
           onStackMerge={() => { /* в разморозке merge не применяется — стек уже [total] */ }}
-          onCancelOrder={(id) => {
-            // «Отмена заказа» изнутри модалки — отменяет разморозку + сам заказ.
-            // Достаточно отменить разморозку (юзер сам закроет модалку или
-            // сделает следующее действие). Здесь пассивно пропускаем.
-            onCancelOrder?.(id);
+          onCancelOrder={() => {
+            // «НА СТОПЕ» изнутри модалки разморозки.
+            //
+            // Раньше сюда уходил СЫРОЙ синтетический id мини-карточки
+            // (`defrost_<блюдо>_<корзина>`): локально по нему ничего не
+            // находилось, поэтому визуально не происходило ничего, а на сервер
+            // запрос всё равно уходил и оставлял в slicer_order_state строку с
+            // бессмысленным order_item_id, которая никогда ни с чем не
+            // сопоставится. Разворачиваем группу в реальные позиции — ровно так,
+            // как это делает основная сетка.
+            const sourceIds = defrostModalGroup.sourceOrderIds;
+            sourceIds.forEach(realId => onCancelOrder?.(realId));
+            setDefrostModalGroupId(null);
           }}
+          // Частичная отдача во время разморозки не поддерживается: порции ещё
+          // не готовы к нарезке. Прокидываем undefined — DefrostModal по этому
+          // признаку скрывает кнопку, а не показывает мёртвую.
+          onPartialComplete={undefined}
           onPreviewImage={onPreviewImage}
         />
       )}

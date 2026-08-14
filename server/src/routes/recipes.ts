@@ -51,6 +51,37 @@ router.put('/:dishId', async (req: Request, res: Response) => {
       return;
     }
 
+    // Граммовка обязана быть положительным числом. Колонка quantity_per_portion
+    // объявлена NOT NULL, и раньше пустое поле формы приезжало сюда как null:
+    // запрос падал с 23502, а клиент получал безликое «Ошибка обновления рецепта»
+    // без указания, какой ингредиент виноват.
+    const badIngredient = ingredients.find(
+      (ing: { ingredientId?: unknown; quantity?: unknown }) =>
+        !ing || typeof ing.ingredientId !== 'string' ||
+        typeof ing.quantity !== 'number' || !Number.isFinite(ing.quantity) || ing.quantity <= 0
+    );
+    if (badIngredient) {
+      res.status(400).json({
+        error: `Некорректное количество для ингредиента ${badIngredient.ingredientId ?? '(без id)'} — нужно число больше нуля`
+      });
+      return;
+    }
+
+    // Блюдо должно существовать в справочнике заказчика: dish_id — VARCHAR без
+    // внешнего ключа, поэтому иначе рецепт молча записался бы на выдуманный id.
+    if (
+      typeof dishId !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(dishId)
+    ) {
+      res.status(404).json({ error: 'Блюдо не найдено в справочнике заказчика' });
+      return;
+    }
+    const dishRes = await pool.query('SELECT 1 FROM ctlg15_dishes WHERE suuid = $1 LIMIT 1', [dishId]);
+    if (dishRes.rowCount === 0) {
+      res.status(404).json({ error: 'Блюдо не найдено в справочнике заказчика' });
+      return;
+    }
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');

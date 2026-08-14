@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { SystemSettings } from '../../types';
 import { Check, Ban, Snowflake, Bell } from 'lucide-react';
+import { ClampedNumberInput } from '../ui/ClampedNumberInput';
 
 interface SystemSettingsTabProps {
   settings: SystemSettings;
@@ -149,17 +150,13 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
         <div>
           <label className="block text-gray-400 font-bold mb-2">Хранение истории (минуты)</label>
           <p className="text-xs text-gray-500 mb-2">Как долго отданные заказы висят на доске истории (Макс 120 мин).</p>
-          <input
-            type="number"
+          <ClampedNumberInput
+            value={settings.historyRetentionMinutes || 60}
             min={1}
             max={120}
-            value={settings.historyRetentionMinutes || 60}
-            onChange={(e) => {
-              let val = parseInt(e.target.value) || 60;
-              if (val > 120) val = 120;
-              if (val < 1) val = 1;
-              setSettings({ ...settings, historyRetentionMinutes: val });
-            }}
+            fallback={60}
+            aria-label="Хранение истории в минутах"
+            onCommit={(val) => setSettings({ ...settings, historyRetentionMinutes: val })}
             className="bg-gray-900 border border-gray-700 text-white p-3 rounded w-full focus:border-blue-500 outline-none"
           />
         </div>
@@ -329,16 +326,14 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
           <div className={`transition-all duration-300 ${settings.enableSmartAggregation === true ? 'opacity-100' : 'opacity-30 grayscale pointer-events-none select-none'} mt-2 p-4 bg-gray-900/50 rounded-lg border border-blue-600/30`}>
             <label className="block text-blue-300 font-bold mb-2 text-sm">⏱️ Шаг курса — окно уступки (секунды)</label>
             <div className="flex items-center gap-3">
-              <input
-                type="number"
-                min="10"
-                max="3600"
-                step="10"
+              <ClampedNumberInput
                 value={coursePace}
-                onChange={(e) => {
-                  const val = Math.max(10, Math.min(3600, parseInt(e.target.value) || 600));
-                  setSettings({ ...settings, coursePaceSeconds: val });
-                }}
+                min={10}
+                max={3600}
+                step={10}
+                fallback={600}
+                aria-label="Шаг курса в секундах"
+                onCommit={(val) => setSettings({ ...settings, coursePaceSeconds: val })}
                 className="w-24 bg-gray-800 text-white border border-gray-600 rounded px-3 py-2 text-center font-mono"
               />
               <span className="text-gray-400 text-sm">

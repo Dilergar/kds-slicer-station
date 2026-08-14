@@ -14,7 +14,7 @@
  * Работает как с реальными Order, так и с виртуальными (Smart Wave Aggregation).
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { Dish, Order, Category, IngredientBase, PriorityLevel } from '../types';
 import { Clock, Check, PauseCircle, Car, MoveLeft, ChevronDown, PieChart, AlertTriangle, X, Snowflake } from 'lucide-react';
 import { hasDefrostBeenStarted } from '../smartQueue';
@@ -149,27 +149,34 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
     }
 
     // --- Scroll Logic (> 5 Ingredients) ---
-    const itemCount = dish.ingredients.length;
-    const isScrollable = itemCount > 5;
-
+    //
+    // ⚠️ Признак «нужно листать» берётся из ФАКТИЧЕСКОЙ высоты списка, а не из
+    // длины рецепта. Раньше было `dish.ingredients.length > 5`, и состояние
+    // могло стать недостижимым: если часть ингредиентов не отрисовалась (их ещё
+    // нет в локальном справочнике — добавили с другого планшета), в рецепте
+    // считалось 7 позиций, а на экране помещались 5 строк. Скроллить нечего →
+    // handleScroll не вызовется никогда → «Готово» и «Частично» заблокированы
+    // надписью «Пролистайте» навсегда, карточку не закрыть до перезагрузки.
     const listRef = useRef<HTMLDivElement>(null);
-    const [isScrolledToBottom, setIsScrolledToBottom] = useState(!isScrollable); // If not scrollable, considered "at bottom"
-    const [showScrollIndicator, setShowScrollIndicator] = useState(isScrollable);
+    const [needsScroll, setNeedsScroll] = useState(false);
+    const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
+    const [showScrollIndicator, setShowScrollIndicator] = useState(false);
 
-    useEffect(() => {
-        // Reset state if inputs change significantly
-        if (!isScrollable) {
-            setIsScrolledToBottom(true);
-            setShowScrollIndicator(false);
-        } else {
-            setIsScrolledToBottom(false);
-            setShowScrollIndicator(true);
-            // Force check initial state? usually assumes start at top.
-        }
-    }, [dish.id, isScrollable]);
+    // Измеряем переполнение после отрисовки. useLayoutEffect — чтобы кнопка не
+    // мигала «доступна → заблокирована» в первом кадре.
+    useLayoutEffect(() => {
+        const el = listRef.current;
+        if (!el) return;
+        // +4px — допуск на субпиксельные округления, чтобы список, влезающий
+        // впритык, не считался переполненным
+        const overflows = el.scrollHeight > el.clientHeight + 4;
+        setNeedsScroll(overflows);
+        setIsScrolledToBottom(!overflows);
+        setShowScrollIndicator(overflows);
+    }, [dish.id, dish.ingredients, ingredients]);
 
     const handleScroll = () => {
-        if (!isScrollable || !listRef.current) return;
+        if (!needsScroll || !listRef.current) return;
 
         const { scrollTop, scrollHeight, clientHeight } = listRef.current;
         // Check if near bottom (< 10px)
@@ -178,18 +185,42 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
         if (atBottom) {
             setIsScrolledToBottom(true);
             setShowScrollIndicator(false);
-        } else {
-            // Optional: re-enable button lock if user scrolls up? 
-            // Requirement said "Разблокировка происходит только когда... запоминается"
-            // So we generally don't re-lock if they scroll up, unless desired.
-            // But let's verify: "Scroll to Accept" usually means ONCE they touch bottom, it's valid.
         }
+        // Если пролистали обратно вверх — блокировку не возвращаем:
+        // «scroll to accept» означает «увидел список целиком хотя бы раз».
     };
 
     // Determine button state
     // Blocked if: Is merged AND (Scrollable AND Not Scrolled to Bottom)
     // Also blocked if not merged (but that is separate logic)
-    const canAction = !isScrollable || isScrolledToBottom;
+    const canAction = !needsScroll || isScrolledToBottom;
+
+    // --- Защита от двойного тапа ---
+    //
+    // Первый тап синхронно убирает заказ из состояния, грид перестраивается за
+    // один кадр, и карточка из следующего слота переезжает под палец. Второй тап
+    // «дребезга» (типично в перчатке) попадал в «Готово» уже ДРУГОГО блюда,
+    // которое никто не резал. То же со снежинкой — запускалась разморозка чужого
+    // блюда, и оно уходило с доски на 15 минут.
+    //
+    // Локальное состояние компонента, очередь не затрагивается.
+    const [actionPending, setActionPending] = useState(false);
+    const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    useEffect(() => () => {
+        if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
+    }, []);
+
+    /**
+     * Оборачивает действие карточки блокировкой на время перестроения сетки.
+     * @param fn — что выполнить на первом (и единственном) тапе
+     */
+    const guardTap = (fn: () => void) => {
+        if (actionPending) return;
+        setActionPending(true);
+        pendingTimerRef.current = setTimeout(() => setActionPending(false), 600);
+        fn();
+    };
 
     return (
         <div
@@ -305,11 +336,12 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                 </div>
                             ) : (
                                 <button
+                                    disabled={actionPending}
                                     onClick={(e) => {
                                         e.stopPropagation();
-                                        onStartDefrost?.(order.id);
+                                        guardTap(() => onStartDefrost?.(order.id));
                                     }}
-                                    className="p-2 rounded bg-blue-900/30 hover:bg-blue-800/60 text-blue-300 border border-blue-700/50 transition-colors"
+                                    className="p-2 rounded bg-blue-900/30 hover:bg-blue-800/60 disabled:opacity-50 disabled:cursor-not-allowed text-blue-300 border border-blue-700/50 transition-colors"
                                     title="Запустить разморозку"
                                     aria-label="Запустить разморозку"
                                 >
@@ -365,14 +397,15 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                         </div>
                     )}
 
+                    {/* maxHeight стоит ВСЕГДА: именно по нему useLayoutEffect выше
+                        определяет, переполнен ли список на самом деле. Раньше
+                        ограничение включалось по длине рецепта, и фактическая
+                        высота с признаком «нужно листать» могли разойтись. */}
                     <div
                         ref={listRef}
                         onScroll={handleScroll}
-                        className={`
-               pr-1 custom-scrollbar pb-2
-               ${isScrollable ? 'overflow-y-auto' : 'overflow-visible'}
-            `}
-                        style={isScrollable ? { maxHeight: '290px' } : {}}
+                        className="pr-1 custom-scrollbar pb-2 overflow-y-auto"
+                        style={{ maxHeight: '290px' }}
                     >
                         <div className="space-y-2">
                             {dish.ingredients.map((dishIng, idx) => {
@@ -441,10 +474,14 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                 )}
 
                 <div className="flex gap-2 h-12">
-                    {/* Part Done Button - ALWAYS VISIBLE if quantity > 1 */}
+                    {/* Part Done Button — ALWAYS VISIBLE if quantity > 1.
+                        Если обработчик не прокинут (модалка разморозки — там
+                        частичная отдача не применима), кнопку не рисуем вовсе:
+                        мёртвая кнопка хуже отсутствующей. */}
+                    {onPartialComplete && (
                     <button
-                        disabled={!canAction || totalQty <= 1}
-                        onClick={() => onPartialComplete?.(order.id, 1)}
+                        disabled={!canAction || totalQty <= 1 || actionPending}
+                        onClick={() => guardTap(() => onPartialComplete(order.id, 1))}
                         className={`
                             px-4 rounded font-bold transition-all flex items-center justify-center border
                             ${!canAction
@@ -457,6 +494,7 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                     >
                         <PieChart size={20} />
                     </button>
+                    )}
 
                     {/* Middle Area: Merge Warning OR Done Button */}
                     {!isMerged ? (
@@ -468,11 +506,11 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                     ) : (
                         /* Done Button - Only if merged */
                         <button
-                            disabled={!canAction}
-                            onClick={() => onCompleteOrder(order.id)}
+                            disabled={!canAction || actionPending}
+                            onClick={() => guardTap(() => onCompleteOrder(order.id))}
                             className={`
                                 flex-1 rounded font-bold transition-all flex items-center justify-center uppercase tracking-wider
-                                ${!canAction
+                                ${!canAction || actionPending
                                     ? 'bg-slate-800 text-slate-500 cursor-not-allowed border-slate-700'
                                     : 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-900/20'}
                             `}
@@ -492,8 +530,9 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                     {/* On Stop Button - Moved to Right */}
                     {isStopped && (
                         <button
-                            onClick={() => onCancelOrder?.(order.id)}
-                            className="px-3 bg-red-600 hover:bg-red-700 text-white font-bold uppercase tracking-wider text-xs flex items-center justify-center gap-1 transition-all rounded shadow-lg shadow-red-900/20"
+                            disabled={actionPending}
+                            onClick={() => guardTap(() => onCancelOrder?.(order.id))}
+                            className="px-3 bg-red-600 hover:bg-red-700 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold uppercase tracking-wider text-xs flex items-center justify-center gap-1 transition-all rounded shadow-lg shadow-red-900/20"
                             title="Отменить заказ (На стопе)"
                         >
                             <X size={16} /> На стопе
