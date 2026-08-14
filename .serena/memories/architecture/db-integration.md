@@ -1,7 +1,7 @@
 # Интеграция с PostgreSQL (arclient)
 
 ## Обзор
-Модуль Slicer Station подключен к существующей KDS-базе `arclient` (PostgreSQL 18, localhost:5432, postgres/1234). Backend — Express на порту 3001, фронтенд проксирует `/api` через Vite.
+Модуль Slicer Station подключен к существующей KDS-базе `arclient` (PostgreSQL 18, localhost:5432; реквизиты — в `server/.env`, в документации не хранятся). Backend — Express на порту 3001, фронтенд проксирует `/api` через Vite.
 
 ## Архитектура слоёв
 
