@@ -20,7 +20,11 @@
 | `was_parked` | BOOLEAN | ❌ | `FALSE` | Был ли заказ паркован (для разделения KPI) |
 | `snapshot` | JSONB | ❌ | `NULL` | Полный объект Order (для восстановления) |
 | `consumed_ingredients` | JSONB | ❌ | `NULL` | Массив потреблённых ингредиентов |
+| `completed_by_uuid` | VARCHAR(255) | ❌ | `NULL` | `users.uuid` того, кто нажал «Готово»/«Частично» (миграция 029). NULL у записей до неё |
+| `completed_by_name` | VARCHAR(255) | ❌ | `NULL` | `users.login` автора порции. Показывается в отчёте «Скорость нарезчика» и в фильтре по нарезчикам |
 | `created_at` | TIMESTAMPTZ | ✅ | `NOW()` | Дата создания записи |
+
+Автор порции — именно **нажавший**, а не державший клейм: закрыть чужую карточку можно (UI спрашивает подтверждение), и в KPI должен попасть фактический исполнитель.
 
 ## Индексы
 
@@ -28,6 +32,7 @@
 |---|---|---|
 | `idx_slicer_order_history_time` | `completed_at` | Фильтрация по дате для Dashboard |
 | `idx_slicer_order_history_parked` | `was_parked` | Разделение KPI: обычные vs паркованные |
+| `idx_slicer_order_history_completed_by` | `(completed_by_uuid, completed_at)` Partial (WHERE completed_by_uuid IS NOT NULL) | Фильтр отчёта по нарезчику внутри периода (029) |
 
 ## Формат JSONB полей
 

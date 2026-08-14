@@ -239,8 +239,12 @@ function App() {
     // Признаки «свежести» доски для плашки «нет связи с сервером»
     lastSyncAt,
     failedPolls,
+    // Клейм «В работе» (миграция 029) — общий для всех планшетов
+    claimError,
     handleStackMerge,
     handleMergeAck,
+    handleClaimOrders,
+    handleReleaseOrders,
     handleCompleteOrder,
     handlePartialComplete,
     handleCancelOrder,
@@ -255,7 +259,9 @@ function App() {
     settings,
     dishes,
     dishMap,
-    ingredients
+    ingredients,
+    // Кем подписывать клейм «В работе» и автора порции в истории (миграция 029)
+    currentUser: user
   });
 
   // === Периодическое обновление справочников ===
@@ -399,6 +405,12 @@ function App() {
             onStartDefrost={handleStartDefrost}
             onCancelDefrost={handleCancelDefrost}
             onCompleteDefrost={handleCompleteDefrost}
+            // Режим нескольких нарезчиков (миграция 029): кто я и как взять/
+            // отпустить карточку. Метка «В работе» общая для всех планшетов.
+            currentUser={user}
+            onClaimOrders={handleClaimOrders}
+            onReleaseOrders={handleReleaseOrders}
+            claimError={claimError}
           />
         )}
         {currentView === 'STOPLIST' && (

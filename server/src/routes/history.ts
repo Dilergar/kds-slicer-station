@@ -66,6 +66,11 @@ router.get('/orders', async (req: Request, res: Response) => {
       totalQuantity: Number(row.total_quantity),
       prepTimeMs: Number(row.prep_time_ms),
       was_parked: row.was_parked,
+      // Автор порции (миграция 029): кто нажал «Готово»/«Частично».
+      // null у записей, сделанных до появления многопользовательского режима —
+      // отчёт показывает такие как «—».
+      completedByUuid: row.completed_by_uuid || null,
+      completedByName: row.completed_by_name || null,
       snapshot: row.snapshot,
       consumedIngredients: row.consumed_ingredients
     }));

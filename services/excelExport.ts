@@ -193,6 +193,12 @@ export interface ExportPayload {
   speedSearchQuery?: string;
   /** То же для секции «Скорость готовки повара». */
   chefSearchQuery?: string;
+  /**
+   * Выбранный нарезчик в секции «Скорость нарезчика» (миграция 029), пусто =
+   * «Все». Печатается в шапке листов по той же причине, что и строка поиска:
+   * книга по одному человеку не должна выглядеть как отчёт по всей кухне.
+   */
+  speedSlicerFilter?: string;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -360,6 +366,8 @@ function buildSummarySheet(wb: ExcelJS.Workbook, payload: ExportPayload): void {
   // отфильтрованным агрегатам, что показаны на экране.
   const activeSearches = [
     payload.speedSearchQuery?.trim() ? `скорость нарезчика: «${payload.speedSearchQuery.trim()}»` : null,
+    // Фильтр по нарезчику (миграция 029) — такой же «невидимый» фильтр, как поиск
+    payload.speedSlicerFilter?.trim() ? `только нарезчик: «${payload.speedSlicerFilter.trim()}»` : null,
     payload.chefSearchQuery?.trim() ? `готовка повара: «${payload.chefSearchQuery.trim()}»` : null,
     payload.history?.searchQuery?.trim() ? `стопы: «${payload.history.searchQuery.trim()}»` : null,
   ].filter(Boolean);
@@ -766,7 +774,8 @@ function buildSpeedSheet(
   wb: ExcelJS.Workbook,
   sheetName: string,
   data: AggregatedSpeedReport,
-  searchQuery?: string
+  searchQuery?: string,
+  slicerFilter?: string
 ): void {
   // summaryBelow=false — итоговая строка (Категория/Блюдо) над группой,
   // кнопки «+/−» на ней (см. лист «История стопов»).
@@ -781,6 +790,12 @@ function buildSpeedSheet(
     const warn = ws.addRow(['⚠ Показаны только блюда по запросу:', searchQuery.trim()]);
     warn.font = { bold: true, color: { argb: 'FFB45309' } };
   }
+  // Фильтр по нарезчику (миграция 029) — печатаем по той же причине, что и
+  // поиск: иначе лист по одному человеку не отличить от отчёта по всей кухне.
+  if (slicerFilter && slicerFilter.trim()) {
+    const warn = ws.addRow(['⚠ Показаны только порции нарезчика:', slicerFilter.trim()]);
+    warn.font = { bold: true, color: { argb: 'FFB45309' } };
+  }
   ws.addRow([]);
 
   const headers = [
@@ -793,6 +808,7 @@ function buildSpeedSheet(
     'Длительность',                  // G — текст
     'На порцию (сек)',               // H
     'На порцию',                     // I — текст
+    'Нарезчик',                      // J — автор порции (миграция 029)
   ];
   ws.addRow(headers);
   const HEADER_ROW = ws.lastRow!.number;
@@ -800,6 +816,7 @@ function buildSpeedSheet(
   ws.columns = [
     { width: 14 }, { width: 22 }, { width: 38 }, { width: 18 },
     { width: 10 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 },
+    { width: 20 },
   ];
   ws.getColumn(4).numFmt = 'dd.mm.yyyy hh:mm';
 
@@ -844,6 +861,9 @@ function buildSpeedSheet(
           formatDuration(o.prepTimeMs),
           Math.round(perPortionMs / 1000),
           formatDuration(perPortionMs),
+          // Автор порции. «—» у записей до миграции 029: тогда никто не
+          // подписывался, и пустая ячейка читалась бы как потерянные данные.
+          o.completedByName || '—',
         ]);
         portionRow.outlineLevel = 2;
         portionRow.hidden = true; // свёрнуто по умолчанию
@@ -958,8 +978,8 @@ export async function exportDashboardToExcel(payload: ExportPayload): Promise<vo
 
   buildSummarySheet(wb, payload);
   if (payload.history) buildHistorySheet(wb, payload.history, payload.settings);
-  if (payload.speedStandard) buildSpeedSheet(wb, 'Скорость отдачи (Обычные)', payload.speedStandard, payload.speedSearchQuery);
-  if (payload.speedParked) buildSpeedSheet(wb, 'Скорость отдачи (Парковка)', payload.speedParked, payload.speedSearchQuery);
+  if (payload.speedStandard) buildSpeedSheet(wb, 'Скорость отдачи (Обычные)', payload.speedStandard, payload.speedSearchQuery, payload.speedSlicerFilter);
+  if (payload.speedParked) buildSpeedSheet(wb, 'Скорость отдачи (Парковка)', payload.speedParked, payload.speedSearchQuery, payload.speedSlicerFilter);
   if (payload.chefSpeed) buildChefSpeedSheet(wb, payload.chefSpeed, payload.chefSearchQuery);
 
   const buffer = await wb.xlsx.writeBuffer();

@@ -9,7 +9,13 @@ import { Order, OrderHistoryEntry } from '../types';
 export const fetchOrders = (): Promise<Order[]> =>
   apiFetch('/orders');
 
-/** Завершить заказ */
+/**
+ * Завершить заказ.
+ *
+ * actorUuid/actorName (миграция 029) — кто нажал «Готово», из PIN-сессии.
+ * Уходит в slicer_order_history.completed_by_* и попадает в отчёт «Скорость
+ * нарезчика» (имя порции + фильтр по нарезчикам).
+ */
 export const completeOrder = (id: string, data: {
   dishId: string;
   dishName: string;
@@ -18,6 +24,8 @@ export const completeOrder = (id: string, data: {
   wasParked?: boolean;
   snapshot: Order;
   consumedIngredients: any[];
+  actorUuid?: string;
+  actorName?: string;
 }): Promise<{ completed: boolean; historyId: string }> =>
   apiFetch(`/orders/${id}/complete`, { method: 'POST', body: JSON.stringify(data) });
 
@@ -37,6 +45,8 @@ export const partialCompleteOrder = (id: string, data: {
   wasParked?: boolean;
   snapshot: Order;
   consumedIngredients: any[];
+  actorUuid?: string;
+  actorName?: string;
 }): Promise<{ completed: boolean; historyId: string }> =>
   apiFetch(`/orders/${id}/partial-complete`, { method: 'POST', body: JSON.stringify(data) });
 
@@ -78,6 +88,43 @@ export const mergeAckOrders = (
   apiFetch('/orders/merge-ack', {
     method: 'POST',
     body: JSON.stringify({ orderItemIds })
+  });
+
+// ======================================================================
+// Клейм «В работе» — режим 2–3 нарезчиков (миграция 029)
+// ======================================================================
+
+/**
+ * Взять карточку в работу.
+ *
+ * orderItemIds — ВСЕ реальные позиции карточки (в агрегированных режимах их
+ * несколько). Карточка атомарна: если хоть одна позиция занята другим
+ * нарезчиком, сервер отвечает 409 и никого не перетирает — клейм не
+ * «расщепляется» между двумя людьми.
+ *
+ * @returns `{claimed: true}` при успехе. При 409 apiFetch бросает ошибку с
+ *          текстом сервера — вызывающий код откатывает оптимистичную метку.
+ */
+export const claimOrders = (
+  orderItemIds: string[],
+  actor: { uuid: string; name: string }
+): Promise<{ claimed: boolean; items: number }> =>
+  apiFetch('/orders/claim', {
+    method: 'POST',
+    body: JSON.stringify({ orderItemIds, actorUuid: actor.uuid, actorName: actor.name })
+  });
+
+/**
+ * Отпустить карточку (повторный тап по своей).
+ * Снимается только СВОЙ клейм — чужой сервер не тронет.
+ */
+export const unclaimOrders = (
+  orderItemIds: string[],
+  actorUuid: string
+): Promise<{ released: number }> =>
+  apiFetch('/orders/unclaim', {
+    method: 'POST',
+    body: JSON.stringify({ orderItemIds, actorUuid })
   });
 
 /**

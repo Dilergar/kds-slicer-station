@@ -20,6 +20,9 @@
 | `Order.defrost_started_at` | `slicer_order_state` | `defrost_started_at` | TIMESTAMPTZ | Момент клика ❄️ (миграция 016) |
 | `Order.defrost_duration_seconds` | `slicer_order_state` | `defrost_duration_seconds` | INT | Snapshot duration в секундах (миграция 016) |
 | `Order.merge_ack` | `slicer_order_state` | `merge_ack` | BOOLEAN | Подтверждение объединения виртуальной карточки Smart Wave (миграция 022). NOT NULL DEFAULT FALSE, сбрасывается при `/restore` |
+| `Order.claimed_by_uuid` | `slicer_order_state` | `claimed_by_uuid` | VARCHAR(255) | Кто взял карточку «В работе» (миграция 029). NULL = свободна |
+| `Order.claimed_by_name` | `slicer_order_state` | `claimed_by_name` | VARCHAR(255) | Логин нарезчика на момент клейма — подпись на карточке |
+| `Order.claimed_at` | `slicer_order_state` | `claimed_at` | TIMESTAMPTZ | Когда взяли; владелец склеенной карточки = самый ранний клейм |
 | Номер стола | `ctlg13_halltables` | `ctlg13_tablenumber` | NUMERIC | JOIN через docm2_orders.docm2_ctlg13_uuid__halltable |
 
 ## Dish (types.ts) ↔ ctlg15_dishes + slicer_recipes + slicer_categories + slicer_dish_aliases
@@ -88,6 +91,8 @@
 | `enableSmartAggregation` | `enable_smart_aggregation` | BOOLEAN | Default: true |
 | `enableKdsStoplistSync` | `enable_kds_stoplist_sync` | BOOLEAN | Default: false (миграция 006) |
 | `enableDefrostSound` | `enable_defrost_sound` | BOOLEAN | Default: true (миграция 016). Время разморозки per-dish в `slicer_dish_defrost.defrost_duration_minutes` (миграция 020 удалила глобальную колонку из `slicer_settings`) |
+| `enableNewOrderSound` | `enable_new_order_sound` | BOOLEAN | Default: true (миграция 026). Двойной beep при появлении нового заказа на доске |
+| `houseTables` | `house_tables` | INTEGER[] | Default: `{30,31,32}` (миграция 030). Столы-домики: номер рисуется кирпичным в рамке-домике. CHECK ≤100 элементов и без NULL; диапазон 1..9999 проверяет API |
 | `dessertCategoryId` | `dessert_category_id` | UUID | FK → slicer_categories(id) (миграция 017) |
 | `dessertAutoParkEnabled` | `dessert_auto_park_enabled` | BOOLEAN | Default: false (миграция 017) |
 | `dessertAutoParkMinutes` | `dessert_auto_park_minutes` | INT | Default: 40, CHECK 1..240 (миграция 017) |
@@ -106,6 +111,8 @@
 | `was_parked` | `was_parked` | BOOLEAN | Для разделения KPI |
 | `snapshot` | `snapshot` | JSONB | Полный объект Order |
 | `consumedIngredients` | `consumed_ingredients` | JSONB | `[{id,name,unitType,quantity,weightGrams}]` |
+| `completedByUuid` | `completed_by_uuid` | VARCHAR(255) | Кто нажал «Готово»/«Частично» (миграция 029). NULL у записей до неё |
+| `completedByName` | `completed_by_name` | VARCHAR(255) | Логин автора порции — колонка в отчёте и фильтр по нарезчикам |
 
 ## StopHistoryEntry (types.ts) ↔ slicer_stop_history
 

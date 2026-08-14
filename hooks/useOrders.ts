@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Order, OrderHistoryEntry, Dish, IngredientBase, SystemSettings } from '../types';
+import { AuthUser, Order, OrderHistoryEntry, Dish, IngredientBase, SystemSettings } from '../types';
 import { calculateConsumedIngredients } from '../utils';
 import {
   fetchOrders,
@@ -10,6 +10,8 @@ import {
   unparkOrder,
   mergeOrder,
   mergeAckOrders,
+  claimOrders,
+  unclaimOrders,
   fetchOrderHistory,
   deleteOrderHistory,
   restoreOrder,
@@ -23,6 +25,12 @@ interface UseOrdersProps {
   dishes: Dish[];
   dishMap: Map<string, Dish>;
   ingredients: IngredientBase[];
+  /**
+   * Текущий пользователь PIN-сессии. Нужен режиму нескольких нарезчиков
+   * (миграция 029): им подписываются клейм «В работе» и автор порции в
+   * истории. null возможен только в теории — доска рендерится после логина.
+   */
+  currentUser: AuthUser | null;
 }
 
 /**
@@ -36,7 +44,8 @@ export const useOrders = ({
   settings,
   dishes,
   dishMap,
-  ingredients
+  ingredients,
+  currentUser
 }: UseOrdersProps) => {
   const [orders, setOrders] = useState<Order[]>([]);
   const [orderHistory, setOrderHistory] = useState<OrderHistoryEntry[]>([]);
@@ -63,6 +72,17 @@ export const useOrders = ({
   const pendingMergeAckRef = useRef<Set<string>>(new Set());
 
   /**
+   * Клеймы «В работе» (миграция 029), отправленные на сервер, но ещё не
+   * подтверждённые поллингом. Значение: кто взял, либо null = «отпустили».
+   *
+   * Зачем: тап по карточке обязан отзываться мгновенно, а следующий GET может
+   * стартовать ДО коммита нашего POST и принести старое состояние — рамка
+   * мигала бы «взял → отпустил → взял» до четырёх секунд. Пока id лежит здесь,
+   * поллинг не может перебить наше значение (та же схема, что у merge_ack).
+   */
+  const pendingClaimRef = useRef<Map<string, { uuid: string; name: string } | null>>(new Map());
+
+  /**
    * Загрузка активных заказов из БД.
    * Вызывается при монтировании и каждые 4 секунды (polling).
    */
@@ -84,9 +104,40 @@ export const useOrders = ({
           if ((row && row.merge_ack) || !boardIds.has(id)) pending.delete(id);
         }
       }
-      setOrders(pending.size === 0
+
+      // То же самое для клеймов: сервер согласился с нашим значением (или
+      // позиция ушла с доски) → снимаем защиту, дальше истина в БД. Это же
+      // условие закрывает случай «клейм отклонён 409, победил сосед»: там
+      // ветка ошибки чистит pending сама, и следующий снапшот покажет чужое
+      // имя без всякого мигания.
+      const pendingClaims = pendingClaimRef.current;
+      if (pendingClaims.size > 0) {
+        const boardIds = new Set(data.map(o => o.id));
+        for (const [id, desired] of [...pendingClaims]) {
+          if (!boardIds.has(id)) { pendingClaims.delete(id); continue; }
+          const row = data.find(o => o.id === id);
+          if ((row?.claimed_by_uuid ?? null) === (desired?.uuid ?? null)) {
+            pendingClaims.delete(id);
+          }
+        }
+      }
+
+      setOrders(pending.size === 0 && pendingClaims.size === 0
         ? data
-        : data.map(o => pending.has(o.id) ? { ...o, merge_ack: true } : o));
+        : data.map(o => {
+            let next = o;
+            if (pending.has(o.id)) next = { ...next, merge_ack: true };
+            if (pendingClaims.has(o.id)) {
+              const desired = pendingClaims.get(o.id) ?? null;
+              next = {
+                ...next,
+                claimed_by_uuid: desired?.uuid ?? null,
+                claimed_by_name: desired?.name ?? null,
+                claimed_at: desired ? (next.claimed_at ?? Date.now()) : null
+              };
+            }
+            return next;
+          }));
       setLastSyncAt(Date.now());
       setFailedPolls(0);
     } catch (err) {
@@ -187,6 +238,85 @@ export const useOrders = ({
     }
   }, [loadOrders]);
 
+  // ======================================================================
+  // Клейм «В работе» — режим 2–3 нарезчиков (миграция 029)
+  //
+  // Метка живёт в БД и раздаётся всем планшетам обычным поллингом, поэтому
+  // нарезчики в разных концах кухни видят, кто что режет. Обе операции идут
+  // на ВСЕ реальные позиции карточки: в агрегированных режимах одна карточка
+  // склеена из нескольких позиций, и полклейма — бессмыслица.
+  // ======================================================================
+
+  /**
+   * Текст последней неудачной попытки клейма («Карточку уже взял Азамат»).
+   * Гасится сам через несколько секунд — это уведомление, а не состояние
+   * ошибки: нарезчику достаточно понять, почему рамка не загорелась.
+   */
+  const [claimError, setClaimError] = useState<string | null>(null);
+  const claimErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showClaimError = useCallback((message: string) => {
+    setClaimError(message);
+    if (claimErrorTimerRef.current) clearTimeout(claimErrorTimerRef.current);
+    claimErrorTimerRef.current = setTimeout(() => setClaimError(null), 4000);
+  }, []);
+
+  useEffect(() => () => {
+    if (claimErrorTimerRef.current) clearTimeout(claimErrorTimerRef.current);
+  }, []);
+
+  /**
+   * Взять карточку в работу. Оптимистично зажигаем метку своим именем, затем
+   * подтверждаем на сервере.
+   *
+   * 409 (позицию успел взять сосед) — не сбой, а штатный исход гонки двух
+   * планшетов в четырёхсекундном окне поллинга: снимаем свою оптимистичную
+   * метку, перечитываем доску (на карточке появится его имя) и показываем
+   * короткое уведомление.
+   */
+  const handleClaimOrders = useCallback(async (sourceOrderIds: string[]) => {
+    if (!currentUser || !sourceOrderIds || sourceOrderIds.length === 0) return;
+    const actor = { uuid: currentUser.uuid, name: currentUser.login };
+    const now = Date.now();
+
+    for (const id of sourceOrderIds) pendingClaimRef.current.set(id, actor);
+    setOrders(prev => prev.map(o => sourceOrderIds.includes(o.id)
+      ? { ...o, claimed_by_uuid: actor.uuid, claimed_by_name: actor.name, claimed_at: now }
+      : o
+    ));
+
+    try {
+      await claimOrders(sourceOrderIds, actor);
+    } catch (err) {
+      console.warn('[useOrders] Клейм не прошёл:', err);
+      for (const id of sourceOrderIds) pendingClaimRef.current.delete(id);
+      showClaimError(err instanceof Error ? err.message : 'Не удалось взять карточку');
+      await loadOrders();
+    }
+  }, [currentUser, loadOrders, showClaimError]);
+
+  /**
+   * Отпустить карточку (повторный тап по своей). Сервер снимает только свой
+   * клейм, поэтому «отпустить» чужую карточку этим путём невозможно.
+   */
+  const handleReleaseOrders = useCallback(async (sourceOrderIds: string[]) => {
+    if (!currentUser || !sourceOrderIds || sourceOrderIds.length === 0) return;
+
+    for (const id of sourceOrderIds) pendingClaimRef.current.set(id, null);
+    setOrders(prev => prev.map(o => sourceOrderIds.includes(o.id)
+      ? { ...o, claimed_by_uuid: null, claimed_by_name: null, claimed_at: null }
+      : o
+    ));
+
+    try {
+      await unclaimOrders(sourceOrderIds, currentUser.uuid);
+    } catch (err) {
+      console.error('[useOrders] Ошибка unclaim:', err);
+      for (const id of sourceOrderIds) pendingClaimRef.current.delete(id);
+      await loadOrders();
+    }
+  }, [currentUser, loadOrders]);
+
   /**
    * Полное завершение заказа.
    * Отправляет на backend: обновляет docm2tabl1_cooked, создаёт историю и расход.
@@ -209,6 +339,10 @@ export const useOrders = ({
     // pendingMergeAckRef, и оверлей навязывал merge_ack=true вопреки
     // серверному сбросу в /restore (позиция обязана заново пройти Merge).
     pendingMergeAckRef.current.delete(orderId);
+    // Клейм закрытой позиции больше не наш: её нет на доске, а после «Вернуть»
+    // сервер отдаёт чистую строку — оптимистичный оверлей навязал бы метку
+    // заново (та же ловушка, что и с merge_ack выше).
+    pendingClaimRef.current.delete(orderId);
 
     // Оптимистичное удаление из UI
     setOrders(prev => prev.filter(o => o.id !== orderId));
@@ -221,14 +355,17 @@ export const useOrders = ({
         prepTimeMs,
         wasParked: order.was_parked,
         snapshot: order,
-        consumedIngredients
+        consumedIngredients,
+        // Автор порции для отчёта — тот, кто нажал «Готово» (миграция 029)
+        actorUuid: currentUser?.uuid,
+        actorName: currentUser?.login
       });
       await loadHistory(); // Обновить историю
     } catch (err) {
       console.error('[useOrders] Ошибка complete:', err);
       await loadOrders(); // Откатываем
     }
-  }, [orders, dishMap, ingredients, loadOrders, loadHistory]);
+  }, [orders, dishMap, ingredients, loadOrders, loadHistory, currentUser]);
 
   /**
    * Частичная отдача заказа.
@@ -288,14 +425,17 @@ export const useOrders = ({
         prepTimeMs,
         wasParked: order.was_parked,
         snapshot: { ...order, quantity_stack: [quantityToComplete], table_stack: [completedTables] },
-        consumedIngredients
+        consumedIngredients,
+        // Автор порции для отчёта — тот, кто нажал «Частично» (миграция 029)
+        actorUuid: currentUser?.uuid,
+        actorName: currentUser?.login
       });
       await loadHistory();
     } catch (err) {
       console.error('[useOrders] Ошибка partial-complete:', err);
       await loadOrders();
     }
-  }, [orders, dishMap, ingredients, loadOrders, loadHistory]);
+  }, [orders, dishMap, ingredients, loadOrders, loadHistory, currentUser]);
 
   /**
    * Отмена заказа через API.
@@ -337,6 +477,9 @@ export const useOrders = ({
     // id из pending-оверлея, чтобы тот не перекрыл серверный сброс на
     // ближайшем поллинге (см. комментарий у pendingMergeAckRef).
     pendingMergeAckRef.current.delete(restoredOrder.id);
+    // /restore на бэке чистит и клейм «В работе» (миграция 029) — оптимистичный
+    // оверлей не должен воскрешать метку человека, который эту порцию уже сдал.
+    pendingClaimRef.current.delete(restoredOrder.id);
 
     // Вычисляем финальный стек ДО оптимистичного обновления, чтобы отправить то же самое на backend.
     const existing = orders.find(o => o.id === restoredOrder.id);
@@ -375,6 +518,10 @@ export const useOrders = ({
         parked_by_auto: undefined,
         defrost_started_at: undefined,
         defrost_duration_seconds: undefined,
+        // Клейм из снапшота не воскрешаем — сервер его тоже сбросил
+        claimed_by_uuid: null,
+        claimed_by_name: null,
+        claimed_at: null,
       };
       return [...prev, sanitized];
     });
@@ -429,6 +576,12 @@ export const useOrders = ({
         unpark_at: returnTimestamp,
         was_parked: true,
         parked_tables: updatedParkedTables,
+        // Парковка снимает клейм «В работе» (миграция 029) — так же, как на
+        // сервере. Без этого припаркованная карточка на панели парковки ещё
+        // 4 секунды показывала бы имя нарезчика, который её уже отпустил.
+        claimed_by_uuid: null,
+        claimed_by_name: null,
+        claimed_at: null,
       }];
     }));
 
@@ -642,8 +795,12 @@ export const useOrders = ({
     lastSyncAt,
     /** Сколько опросов подряд не прошло — доска показывает плашку начиная с 3 */
     failedPolls,
+    /** Текст последней отклонённой попытки клейма (гаснет сам через 4 сек) */
+    claimError,
     handleStackMerge,
     handleMergeAck,
+    handleClaimOrders,
+    handleReleaseOrders,
     handleCompleteOrder,
     handlePartialComplete,
     handleCancelOrder,

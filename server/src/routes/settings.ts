@@ -34,6 +34,26 @@ const validateIntRange = (
 };
 
 /**
+ * Проверяет список номеров столов-домиков (миграция 030).
+ * Схема гарантирует только отсутствие NULL и длину массива — «номер стола
+ * это целое 1..9999» в CHECK не выразить без подзапроса, поэтому диапазон
+ * закрываем здесь: с мусором вроде 0 или -5 метка молча не совпала бы ни
+ * с одним столом, и владелец решил бы что фича сломана.
+ *
+ * @param value Присланное значение (undefined/null = поле не меняется)
+ */
+const validateHouseTables = (value: unknown): string | null => {
+  if (value == null) return null;
+  if (!Array.isArray(value)) return 'houseTables должен быть массивом номеров столов';
+  if (value.length > 100) return 'houseTables: не более 100 столов';
+  const ok = value.every(
+    (n: unknown) => typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 9999
+  );
+  if (!ok) return 'houseTables: номер стола должен быть целым числом 1..9999';
+  return null;
+};
+
+/**
  * Проверяет строку времени формата HH:MM.
  * @param value Присланное значение (undefined/null = поле не меняется)
  * @param name Имя поля для текста ошибки
@@ -74,6 +94,9 @@ router.get('/', async (_req: Request, res: Response) => {
       enableDefrostSound: row.enable_defrost_sound,
       // Звук поступления нового заказа (миграция 026)
       enableNewOrderSound: row.enable_new_order_sound,
+      // Столы-домики: номера, которые на карточке рисуются кирпичной
+      // «крышей» вместо обычного жёлтого (миграция 030)
+      houseTables: row.house_tables ?? [],
       // Авто-парковка десертов (миграции 017 + 019)
       dessertCategoryId: row.dessert_category_id,
       dessertAutoParkEnabled: row.dessert_auto_park_enabled,
@@ -103,6 +126,7 @@ router.put('/', async (req: Request, res: Response) => {
       enableKdsStoplistSync,
       enableDefrostSound,
       enableNewOrderSound,
+      houseTables,
       dessertCategoryId,
       dessertAutoParkEnabled,
       dessertAutoParkMinutes,
@@ -137,6 +161,19 @@ router.put('/', async (req: Request, res: Response) => {
       res.status(400).json({ error: timeError });
       return;
     }
+
+    // Столы-домики (миграция 030)
+    const houseTablesError = validateHouseTables(houseTables);
+    if (houseTablesError) {
+      res.status(400).json({ error: houseTablesError });
+      return;
+    }
+    // Нормализуем на входе: дубли и произвольный порядок ничего не ломают,
+    // но список возвращается в UI как есть — «30, 7, 30» выглядел бы сбоем.
+    const normalizedHouseTables: number[] | null =
+      houseTables == null
+        ? null
+        : Array.from(new Set(houseTables as number[])).sort((a, b) => a - b);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Килсвитч записи в чужую таблицу через этот эндпоинт НЕ переключается.
@@ -182,17 +219,30 @@ router.put('/', async (req: Request, res: Response) => {
         enable_aggregation = COALESCE($8, enable_aggregation),
         enable_smart_aggregation = COALESCE($9, enable_smart_aggregation),
         -- enable_kds_stoplist_sync НАМЕРЕННО не меняется через этот эндпоинт
-        -- (см. блок про килсвитч выше). $10 больше не участвует.
+        -- (см. блок про килсвитч выше) — поэтому присваиваем колонку самой себе.
+        --
+        -- ⚠️ Нумерация параметров ДОЛЖНА быть сплошной. Когда килсвитч убрали
+        -- из запроса (ревью 2026-08-14), его $10 остался в массиве значений
+        -- «чтобы не перенумеровывать остальные», но в тексте запроса исчез.
+        -- Postgres выводит типы параметров ИЗ ТЕКСТА запроса: на неупомянутый
+        -- $10 он отвечал «не удалось определить тип данных параметра $10», и
+        -- PUT падал 500-кой на ЛЮБОЙ настройке — админка молча откатывала
+        -- изменение и перечитывала старые значения из БД. Дыру в нумерации
+        -- здесь не оставлять.
         enable_kds_stoplist_sync = enable_kds_stoplist_sync,
-        enable_defrost_sound = COALESCE($11, enable_defrost_sound),
-        enable_new_order_sound = COALESCE($18, enable_new_order_sound),
+        enable_defrost_sound = COALESCE($10, enable_defrost_sound),
+        enable_new_order_sound = COALESCE($17, enable_new_order_sound),
         -- Десерты: dessert_category_id может прийти явным null (отвязать),
-        -- поэтому НЕ через COALESCE — используем флаг $15 "трогаем ли это поле".
-        dessert_category_id = CASE WHEN $15::bool THEN $12::uuid ELSE dessert_category_id END,
-        dessert_auto_park_enabled = COALESCE($13, dessert_auto_park_enabled),
-        dessert_auto_park_minutes = COALESCE($14, dessert_auto_park_minutes),
-        dessert_trigger_modifier_patterns = COALESCE($16::text[], dessert_trigger_modifier_patterns),
-        course_pace_seconds = COALESCE($17, course_pace_seconds),
+        -- поэтому НЕ через COALESCE — используем флаг $14 "трогаем ли это поле".
+        dessert_category_id = CASE WHEN $14::bool THEN $11::uuid ELSE dessert_category_id END,
+        dessert_auto_park_enabled = COALESCE($12, dessert_auto_park_enabled),
+        dessert_auto_park_minutes = COALESCE($13, dessert_auto_park_minutes),
+        dessert_trigger_modifier_patterns = COALESCE($15::text[], dessert_trigger_modifier_patterns),
+        course_pace_seconds = COALESCE($16, course_pace_seconds),
+        -- Столы-домики (миграция 030). Пустой массив — валидное значение
+        -- «меток нет», поэтому COALESCE отличает его от «поле не прислали»
+        -- только потому, что не присланное поле уходит сюда как NULL.
+        house_tables = COALESCE($18::integer[], house_tables),
         updated_at = NOW()
        WHERE id = 1
        RETURNING *`,
@@ -206,9 +256,9 @@ router.put('/', async (req: Request, res: Response) => {
         excludedDates ? JSON.stringify(excludedDates) : null,
         enableAggregation,
         enableSmartAggregation,
-        // $10 сохранён как placeholder, чтобы не перенумеровывать остальные
-        // параметры: сам флаг синхронизации этим запросом не меняется (см. выше)
-        null,
+        // Плейсхолдера под килсвитч синхронизации здесь БОЛЬШЕ НЕТ: значение,
+        // которому не соответствует параметр в тексте запроса, ломает весь
+        // PUT (см. комментарий про нумерацию выше). Флаг меняется только SQL-ом.
         enableDefrostSound,
         dessertCategoryId ?? null,
         dessertAutoParkEnabled,
@@ -218,8 +268,10 @@ router.put('/', async (req: Request, res: Response) => {
         Object.prototype.hasOwnProperty.call(req.body, 'dessertCategoryId'),
         dessertTriggerModifierPatterns ?? null,
         coursePaceSeconds ?? null,
-        // $18: звук нового заказа (миграция 026)
-        enableNewOrderSound
+        // $17: звук нового заказа (миграция 026)
+        enableNewOrderSound,
+        // $18: столы-домики (миграция 030) — отсортированы и без дублей
+        normalizedHouseTables
       ]
     );
 
@@ -242,6 +294,7 @@ router.put('/', async (req: Request, res: Response) => {
       enableKdsStoplistSync: row.enable_kds_stoplist_sync,
       enableDefrostSound: row.enable_defrost_sound,
       enableNewOrderSound: row.enable_new_order_sound,
+      houseTables: row.house_tables ?? [],
       dessertCategoryId: row.dessert_category_id,
       dessertAutoParkEnabled: row.dessert_auto_park_enabled,
       dessertAutoParkMinutes: row.dessert_auto_park_minutes,

@@ -14,10 +14,13 @@
  * Работает как с реальными Order, так и с виртуальными (Smart Wave Aggregation).
  */
 
-import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect, useMemo } from 'react';
 import { Dish, Order, Category, IngredientBase, PriorityLevel } from '../types';
 import { Clock, Check, PauseCircle, Car, MoveLeft, ChevronDown, PieChart, AlertTriangle, X, Snowflake } from 'lucide-react';
 import { hasDefrostBeenStarted } from '../smartQueue';
+// Метка стола-домика (миграция 030) — общий компонент с админкой, чтобы
+// владелец в настройках видел ровно то, что нарезчик видит на карточке
+import { HouseTableBadge } from './ui/HouseTableBadge';
 
 interface OrderCardProps {
     order: Order;
@@ -31,11 +34,19 @@ interface OrderCardProps {
     onCancelOrder?: (orderId: string) => void;
     onPreviewImage: (url: string) => void;
     /**
-     * Чисто визуальный флаг «эту карточку уже кто-то начал делать».
-     * Тап по незанятой области карточки → toggle. Живёт только в локальном
-     * стейте SlicerStation, не пишется в БД, не переживает reload.
+     * Карточку кто-то взял в работу (клейм «В работе», миграция 029).
+     * Флаг приходит из slicer_order_state через GET /api/orders, поэтому метку
+     * видят ВСЕ планшеты — на этом держится режим 2–3 нарезчиков.
      */
     isInWork?: boolean;
+    /** Взял её Я (лаймовая рамка) или сосед (синяя рамка + его имя) */
+    isClaimedByMe?: boolean;
+    /** Логин нарезчика, который держит карточку */
+    claimedByName?: string | null;
+    /**
+     * Тап по карточке: свободную беру себе, свою отпускаю, чужую не трогаю
+     * (решение принимает SlicerStation — здесь только жест).
+     */
     onToggleInWork?: (orderId: string) => void;
     /**
      * Кнопка запуска разморозки (синяя ❄️) — показывается только если
@@ -51,6 +62,13 @@ interface OrderCardProps {
      * же карточку что и на доске, но подтверждает другое действие.
      */
     completeButtonLabel?: string;
+    /**
+     * Номера столов-домиков (миграция 030, slicer_settings.house_tables).
+     * Такой номер рисуется кирпичным в рамке-домике вместо обычного жёлтого.
+     * Метка касается ТОЛЬКО номера стола — рамка карточки, ULTRA/VIP и клейм
+     * «В работе» не затрагиваются (решение владельца).
+     */
+    houseTables?: number[];
 }
 
 const OrderCardBase: React.FC<OrderCardProps> = ({
@@ -65,16 +83,25 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
     onCancelOrder,
     onPreviewImage,
     isInWork,
+    isClaimedByMe,
+    claimedByName,
     onToggleInWork,
     onStartDefrost,
     completeButtonLabel,
+    houseTables,
 }) => {
+    // Set вместо includes(): столов на склеенной карточке может быть с десяток,
+    // а список домиков живёт в настройках и меняется раз в сезон.
+    const houseTableSet = useMemo(() => new Set(houseTables ?? []), [houseTables]);
     /**
-     * Тап по карточке → toggle «В работе». Игнорируем если тап попал в button
-     * (Готово / Частично / Отмена / Merge-бейдж / action-кнопки в футере) —
-     * тогда работают их собственные обработчики. Если картинку ингредиента
-     * тапнут — тоже toggle'нём, это приемлемо: двойной клик для превью
-     * всё равно был ненадёжен на планшете.
+     * Тап по карточке → взять/отпустить её («В работе»). Игнорируем если тап
+     * попал в button (Готово / Частично / Отмена / Merge-бейдж / action-кнопки
+     * в футере) — тогда работают их собственные обработчики. Если картинку
+     * ингредиента тапнут — тоже сработает, это приемлемо: двойной клик для
+     * превью всё равно был ненадёжен на планшете.
+     *
+     * Что именно произойдёт, решает SlicerStation: свободную карточку берём,
+     * свою отпускаем, чужую не трогаем (клейм соседа снять нельзя).
      */
     const handleCardTap = (e: React.MouseEvent<HTMLDivElement>) => {
         if (!onToggleInWork) return;
@@ -142,10 +169,16 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
         }
     }
 
-    // «В работе» — светло-неоновый зелёный бордер, overrides ULTRA/VIP.
-    // Делаем ярче чем VIP но светлее чем ULTRA-красный — отличимо с 3 метров.
+    // «В работе» (миграция 029) — рамка перекрывает ULTRA/VIP: пока карточку
+    // кто-то режет, это главное, что о ней нужно знать.
+    //   * своя — светло-неоновый лайм (как было до режима нескольких
+    //     нарезчиков, привычка не ломается);
+    //   * чужая — голубая. Оба цвета ярче VIP-жёлтого и не спорят с
+    //     ULTRA-красным, различимы с трёх метров.
     if (isInWork) {
-        borderClass = "border-lime-400 shadow-[0_0_20px_rgba(163,230,53,0.7)]";
+        borderClass = isClaimedByMe
+            ? "border-lime-400 shadow-[0_0_20px_rgba(163,230,53,0.7)]"
+            : "border-sky-400 shadow-[0_0_20px_rgba(56,189,248,0.7)]";
     }
 
     // --- Scroll Logic (> 5 Ingredients) ---
@@ -291,11 +324,17 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                                             const isParked = order.parked_tables
                                                 ? order.parked_tables.includes(num)
                                                 : !!order.was_parked; // Fallback
+                                            // Стол-домик (миграция 030) — метка «это не зал, это домик
+                                            // на улице». Приоритет выше парковки только по ФОРМЕ:
+                                            // фиолетовый смысл парковки остаётся внутри домика.
+                                            const isHouse = houseTableSet.has(num);
 
                                             return (
                                                 <React.Fragment key={tIdx}>
                                                     {tIdx > 0 && <span className="text-slate-500 mr-1">,</span>}
-                                                    {isParked ? (
+                                                    {isHouse ? (
+                                                        <HouseTableBadge num={num} isParked={isParked} />
+                                                    ) : isParked ? (
                                                         <span className="text-purple-300 bg-purple-900/40 px-1.5 py-0.5 rounded border border-purple-500/50">
                                                             {num}
                                                         </span>
@@ -368,14 +407,26 @@ const OrderCardBase: React.FC<OrderCardProps> = ({
                         {isMerged ? totalQty : stackString}
                     </button>
 
-                    {/* «В работе» — смайлик ножа рядом с количеством порций. */}
+                    {/* «В работе» — нож и ИМЯ нарезчика рядом с количеством
+                        порций. Имя показываем и на своей карточке тоже: когда
+                        за доской трое, «моя/не моя» должно читаться с любого
+                        планшета, а не только с того, где стоишь. */}
                     {isInWork && (
                         <span
-                            className="text-2xl select-none drop-shadow-[0_0_6px_rgba(163,230,53,0.8)]"
-                            title="В работе"
-                            aria-label="В работе"
+                            className={`
+                                inline-flex items-center gap-1 max-w-[55%] px-2 py-0.5 rounded border
+                                font-bold text-sm uppercase tracking-wide select-none
+                                ${isClaimedByMe
+                                    ? 'text-lime-300 border-lime-500/60 bg-lime-500/10 drop-shadow-[0_0_6px_rgba(163,230,53,0.6)]'
+                                    : 'text-sky-300 border-sky-500/60 bg-sky-500/10 drop-shadow-[0_0_6px_rgba(56,189,248,0.6)]'}
+                            `}
+                            title={claimedByName ? `В работе: ${claimedByName}` : 'В работе'}
+                            aria-label={claimedByName ? `В работе: ${claimedByName}` : 'В работе'}
                         >
-                            🔪
+                            <span className="text-xl leading-none">🔪</span>
+                            {claimedByName && (
+                                <span className="truncate">{claimedByName}</span>
+                            )}
                         </span>
                     )}
 

@@ -24,6 +24,7 @@
 | `enable_kds_stoplist_sync` | BOOLEAN | ✅ | `FALSE` | 006 | Двусторонняя синхронизация стоп-листа с `rgst3_dishstoplist` (см. раздел 10 Инструкции) |
 | `enable_defrost_sound` | BOOLEAN | ✅ | `TRUE` | 016 | Web Audio beep при истечении таймера мини-карточки разморозки. Время разморозки per-dish в `slicer_dish_defrost.defrost_duration_minutes` (миграция 020 удалила глобальную колонку `defrost_duration_minutes`) |
 | `enable_new_order_sound` | BOOLEAN | ✅ | `TRUE` | 026 | Web Audio beep (двойной тон, отличается от сигнала разморозки) при появлении нового заказа на доске. Логика на фронте: эффект в `SlicerStation` отслеживает новые `order_item_id` в поллинге; первый снапшот после загрузки молчит |
+| `house_tables` | INTEGER[] | ✅ | `{30,31,32}` | 030 | Номера столов-домиков: на карточке такой номер рисуется кирпичным (`#E2725B`) в рамке в форме домика вместо жёлтого. Пустой массив = меток нет. DEFAULT — боевая рассадка ресторана; правится в UI (Админка → Общие Настройки → «Столы-домики»). CHECK: не более 100 элементов, без NULL внутри; диапазон номера (1..9999) валидирует API |
 | `dessert_category_id` | UUID | ❌ | `NULL` | 017 | FK → `slicer_categories(id)` ON DELETE SET NULL. К какой категории применяется правило авто-парковки десертов. NULL = правило отключено |
 | `dessert_auto_park_enabled` | BOOLEAN | ✅ | `FALSE` | 017 | Глобальный тумблер авто-парковки десертов |
 | `dessert_auto_park_minutes` | INT | ✅ | `40` | 017 | На сколько минут уходит в парковку десертная позиция (CHECK 1..240) |
@@ -34,6 +35,7 @@
 - `CHECK (id = 1)` — singleton
 - `CHECK (dessert_auto_park_minutes BETWEEN 1 AND 240)` — `slicer_settings_dessert_auto_park_minutes_valid` (017)
 - (Миграция 020 удалила `CHECK (defrost_duration_minutes BETWEEN 1 AND 60)` вместе с самой колонкой — правило переехало в `slicer_dish_defrost`.)
+- `CHECK (array_length(house_tables,1) <= 100 AND array_position(house_tables, NULL) IS NULL)` — `slicer_settings_house_tables_sane` (030). Диапазон номера (1..9999) в CHECK не выразить без подзапроса — его проверяет `PUT /api/settings`
 - `FOREIGN KEY (dessert_category_id) REFERENCES slicer_categories(id) ON DELETE SET NULL` — `slicer_settings_dessert_category_fk` (017)
 - `enable_aggregation` и `enable_smart_aggregation` **взаимоисключающие** (логика на уровне приложения)
 
@@ -74,6 +76,7 @@ interface SystemSettings {
   // defrostDurationMinutes удалён в миграции 020 — время per-dish в Dish.defrost_duration_minutes
   enableDefrostSound?: boolean;         // → enable_defrost_sound (016)
   enableNewOrderSound?: boolean;        // → enable_new_order_sound (026)
+  houseTables?: number[];               // → house_tables (030), столы-домики
   dessertCategoryId?: string | null;    // → dessert_category_id (017)
   dessertAutoParkEnabled?: boolean;     // → dessert_auto_park_enabled (017)
   dessertAutoParkMinutes?: number;      // → dessert_auto_park_minutes (017)

@@ -32,6 +32,12 @@ interface DefrostRowProps {
   onCancelDefrost: (orderId: string) => void;
   /** Клик по зелёной галочке → подтвердить «Разморозилось» (то же что кнопка в модалке) */
   onCompleteDefrost: (orderId: string) => void;
+  /**
+   * uuid текущего нарезчика (миграция 029) — чтобы отличить свой клейм от
+   * чужого. Разморозка клейм не снимает, поэтому мини-карточка тоже
+   * подписана: видно, кто вернётся к этой рыбе, когда таймер истечёт.
+   */
+  currentUserUuid?: string | null;
 }
 
 /**
@@ -53,6 +59,7 @@ export const DefrostRow: React.FC<DefrostRowProps> = ({
   onOpenModal,
   onCancelDefrost,
   onCompleteDefrost,
+  currentUserUuid = null,
 }) => {
   // Мини-карточки, по которым только что нажали. Первый тап убирает карточку
   // из ряда, оставшиеся сдвигаются влево — и второй тап «дребезга» попадал в
@@ -128,6 +135,20 @@ export const DefrostRow: React.FC<DefrostRowProps> = ({
                   <div className="text-lg font-mono font-black text-blue-200 mt-1 leading-none">
                     {formatCountdown(remainingSec)}
                   </div>
+                  {/* Клейм «В работе» (миграция 029) — своя метка лаймовая,
+                      чужая голубая, как на больших карточках. */}
+                  {order.claimed_by_uuid && (
+                    <div
+                      className={`text-[11px] font-bold mt-1 leading-none truncate ${
+                        order.claimed_by_uuid === currentUserUuid
+                          ? 'text-lime-300'
+                          : 'text-sky-300'
+                      }`}
+                      title={`В работе: ${order.claimed_by_name || 'нарезчик'}`}
+                    >
+                      🔪 {order.claimed_by_name || 'в работе'}
+                    </div>
+                  )}
                 </div>
                 {/* Крестик отмены разморозки — компактный красный кружок справа сверху. */}
                 <span

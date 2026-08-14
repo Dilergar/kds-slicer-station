@@ -26,7 +26,7 @@
  */
 
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Dish, Order, Category, IngredientBase, PriorityLevel, OrderHistoryEntry, SystemSettings, SmartQueueGroup } from '../types';
+import { AuthUser, Dish, Order, Category, IngredientBase, PriorityLevel, OrderHistoryEntry, SystemSettings, SmartQueueGroup } from '../types';
 import { Clock, Flame, Check, Layers, AlertTriangle, PauseCircle, Car, X, CalendarClock, History, Undo, ArrowLeft, MoveLeft, ArrowUp, PieChart, WifiOff } from 'lucide-react';
 import { PartialCompletionModal } from './PartialCompletionModal';
 import { OrderCard } from './OrderCard';
@@ -73,6 +73,16 @@ interface SlicerStationProps {
   onStartDefrost?: (orderId: string, sourceOrderItemIds?: string[]) => void;
   onCancelDefrost?: (orderId: string, sourceOrderItemIds?: string[]) => void;
   onCompleteDefrost?: (orderId: string, sourceOrderItemIds?: string[]) => void;
+
+  // === Режим 2–3 нарезчиков: клейм «В работе» (миграция 029) ===
+  /** Кто сейчас за планшетом — им подписывается клейм, по нему «моя/чужая» */
+  currentUser?: AuthUser | null;
+  /** Взять карточку в работу: все её реальные позиции */
+  onClaimOrders?: (sourceOrderIds: string[]) => void;
+  /** Отпустить свою карточку (повторный тап) */
+  onReleaseOrders?: (sourceOrderIds: string[]) => void;
+  /** Текст отклонённой попытки клейма («Карточку уже взял Азамат») */
+  claimError?: string | null;
 }
 
 export const SlicerStation: React.FC<SlicerStationProps> = ({
@@ -97,7 +107,11 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   failedPolls = 0,
   onStartDefrost,
   onCancelDefrost,
-  onCompleteDefrost
+  onCompleteDefrost,
+  currentUser = null,
+  onClaimOrders,
+  onReleaseOrders,
+  claimError = null
 }) => {
   const retentionMinutes = settings?.historyRetentionMinutes || 60;
   const [now, setNow] = useState(Date.now());
@@ -131,36 +145,21 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   // Ключ: virtualOrderId, Значение: { sourceOrderIds, itemCountByOrder }
   const smartQueueMappingRef = useRef<Map<string, { sourceOrderIds: string[], itemCountByOrder: Map<string, number> }>>(new Map());
 
-  // === «В работе» — локальный визуальный claim карточки ===
-  // Чисто UI-состояние для координации двух нарезчиков за одним планшетом:
-  // тап по карточке → неоновая рамка + 🔪 у количества порции. Повторный
-  // тап снимает. Не пишется в БД, не переживает F5, не участвует в отчётах —
-  // только сигнал «эту уже кто-то взял, не трогай».
-  const [inWorkIds, setInWorkIds] = useState<Set<string>>(new Set());
-
-  /**
-   * Якорный id карточки для клейма «В работе». Виртуальный id нестабилен:
-   * его порядковый суффикс (`_1`, `_2`) пересчитывается позиционно на каждой
-   * ежесекундной пересборке, и при перестановке двух карточек одного блюда
-   * метка 🔪 перепрыгивала на чужую карточку (ревью 2026-07-11). Поэтому
-   * клейм ключуем по ПЕРВОМУ source-заказу карточки — он фиксируется в момент
-   * её создания и не меняется, пока карточка живёт. В стандартном режиме
-   * (без маппинга) id уже реальный — он и есть якорь.
-   */
-  const claimAnchorOf = useCallback((cardId: string): string => {
-    const mapping = smartQueueMappingRef.current.get(cardId);
-    return mapping?.sourceOrderIds[0] ?? cardId;
-  }, []);
-
-  const toggleInWork = useCallback((cardId: string) => {
-    const anchor = claimAnchorOf(cardId);
-    setInWorkIds(prev => {
-      const next = new Set(prev);
-      if (next.has(anchor)) next.delete(anchor);
-      else next.add(anchor);
-      return next;
-    });
-  }, [claimAnchorOf]);
+  // === «В работе» — общий клейм карточки (миграция 029) ===
+  //
+  // Раньше метка жила в локальном стейте этого компонента и была видна только
+  // одному браузеру: за одним планшетом это работало, при двух-трёх нарезчиках
+  // с разных устройств — нет. Теперь клейм хранится в slicer_order_state,
+  // приходит с каждым поллингом в полях `claimed_by_*` заказа и раздаётся всем
+  // планшетам. Ключевать метку якорем больше не нужно: она едет вместе с
+  // реальными позициями, а не с нестабильным виртуальным id карточки.
+  //
+  // Правила тапа (решения владельца, грил 2026-08-15):
+  //   * свободная карточка → беру себе;
+  //   * своя → отпускаю;
+  //   * чужая → тап не делает ничего (снять чужой клейм нельзя, он висит
+  //     до «Готово» или парковки).
+  // Обработчик объявлен ниже, после сборки очереди — ему нужен sortedOrders.
 
   // === Звук готовности разморозки ===
   // Трекинг переходов «таймер идёт → таймер истёк» по СЫРЫМ заказам.
@@ -269,6 +268,12 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
       totalQuantity: number;
       tableBlocks: number[][];
       accumulatedTimeMs: number;
+      // Клейм «В работе» (миграция 029): разморозка его СОХРАНЯЕТ, поэтому
+      // мини-карточка тоже подписана именем того, кто взял блюдо. Держим
+      // самый ранний клейм группы — тот же тайбрейкер, что у карточек очереди.
+      claimedByUuid: string | null;
+      claimedByName: string | null;
+      claimedAt: number | null;
     }>();
 
     for (const o of orders) {
@@ -287,10 +292,19 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           totalQuantity: 0,
           tableBlocks: [],
           accumulatedTimeMs: 0,
+          claimedByUuid: null,
+          claimedByName: null,
+          claimedAt: null,
         };
         groups.set(key, g);
       }
       g.sourceOrderIds.push(o.id);
+      // Самый ранний клейм среди позиций группы
+      if (o.claimed_by_uuid && (g.claimedAt === null || (o.claimed_at ?? 0) < g.claimedAt)) {
+        g.claimedByUuid = o.claimed_by_uuid;
+        g.claimedByName = o.claimed_by_name ?? null;
+        g.claimedAt = o.claimed_at ?? 0;
+      }
       // Для FIFO внутри карточки берём самый ранний created_at — соответствует
       // логике Smart Wave (earliestOrderTime группы).
       if (o.created_at < g.earliestCreatedAt) g.earliestCreatedAt = o.created_at;
@@ -322,6 +336,9 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
         accumulated_time_ms: g.accumulatedTimeMs,
         defrost_started_at: g.startedAt,
         defrost_duration_seconds: g.durationSec,
+        claimed_by_uuid: g.claimedByUuid,
+        claimed_by_name: g.claimedByName,
+        claimed_at: g.claimedAt,
       };
       return { ...g, virtualOrder };
     });
@@ -367,6 +384,12 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
   // (окно до следующего polling ~4 сек) и правки категорий посреди смены —
   // карточки не прыгают. Чистится внутри buildSmartQueue по живым заказам.
   const vtStickyCacheRef = useRef<Map<string, PersistentVtEntry>>(new Map());
+
+  // Столы-домики (миграция 030) — номера, которые OrderCard рисует кирпичным
+  // в рамке-домике. Ссылку стабилизируем: карточки обёрнуты в React.memo, а
+  // литерал `settings?.houseTables ?? []` был бы новым массивом на каждый тик
+  // таймера (`now` тикает раз в секунду).
+  const houseTables = useMemo(() => settings?.houseTables ?? [], [settings?.houseTables]);
 
   const sortedOrders = useMemo(() => {
     const isSmartAggregation = settings?.enableSmartAggregation === true;
@@ -520,6 +543,19 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           sourceOrdersInGroup.flatMap(s => s.parked_tables || [])
         ));
 
+        // Клейм «В работе» склеенной карточки (миграция 029).
+        // Карточка считается занятой, если занята ХОТЬ ОДНА её позиция —
+        // выбор владельца: «занята целиком, без счётчика». Владельцем
+        // показываем того, кто взял РАНЬШЕ: на соседнем планшете та же рыба
+        // может быть разбита на другие карточки, и тайбрейкер по claimed_at
+        // даёт одинаковый ответ на всех устройствах.
+        const claimedSources = sourceOrdersInGroup.filter(s => !!s.claimed_by_uuid);
+        const claimOwner = claimedSources.length > 0
+          ? claimedSources.reduce((earliest, s) =>
+              (s.claimed_at ?? 0) < (earliest.claimed_at ?? 0) ? s : earliest
+            )
+          : null;
+
         const virtualOrder: Order = {
           id: virtualId,
           dish_id: group.dishId,
@@ -533,6 +569,9 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           parked_tables: parkedTablesUnion,
           defrost_started_at: defrostStartedAt,
           defrost_duration_seconds: defrostDurationSeconds,
+          claimed_by_uuid: claimOwner?.claimed_by_uuid ?? null,
+          claimed_by_name: claimOwner?.claimed_by_name ?? null,
+          claimed_at: claimOwner?.claimed_at ?? null,
         };
 
         return virtualOrder;
@@ -609,24 +648,72 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
     // возвращается в сетку мгновенно в обоих режимах очереди.
   }, [activeOrders, dishes, categories, settings, now]);
 
-  // Чистка «В работе»: якоря, исчезнувшие с доски (карточка завершена,
-  // отменена или ушла в разморозку), убираем из набора. Без этого якорь
-  // следующего заказа того же блюда появлялся бы уже помеченным 🔪, хотя
-  // его никто не брал. Сравниваем по якорям (см. claimAnchorOf) — метка
-  // следует за карточкой, а не за нестабильным виртуальным id.
-  useEffect(() => {
-    setInWorkIds(prev => {
-      if (prev.size === 0) return prev;
-      const boardAnchors = new Set(sortedOrders.map(o => claimAnchorOf(o.id)));
-      let changed = false;
-      const next = new Set<string>();
-      for (const id of prev) {
-        if (boardAnchors.has(id)) next.add(id);
-        else changed = true;
-      }
-      return changed ? next : prev;
-    });
-  }, [sortedOrders, claimAnchorOf]);
+  /**
+   * Тап по карточке → взять/отпустить её (клейм «В работе», миграция 029).
+   *
+   * Чистки набора больше нет и не нужно: метка живёт в БД вместе с позицией,
+   * поэтому исчезает вместе с ней (отдали, отменили, припарковали) без всякой
+   * помощи со стороны UI. Разморозка клейм СОХРАНЯЕТ — карточка вернётся
+   * из мини-ряда всё ещё занятой тем же человеком.
+   *
+   * @param cardId id карточки (реальный в стандартном режиме, виртуальный в
+   *               агрегированных — резолвится в реальные позиции)
+   */
+  const toggleInWork = useCallback((cardId: string) => {
+    if (!currentUser) return;
+    const card = sortedOrders.find(o => o.id === cardId);
+    if (!card) return;
+
+    const ownerUuid = card.claimed_by_uuid ?? null;
+    // Чужая карточка: тап игнорируем. Снять чужой клейм нельзя — по решению
+    // владельца он висит до «Готово» (парковка тоже снимает).
+    if (ownerUuid && ownerUuid !== currentUser.uuid) return;
+
+    const sourceIds = resolveSourceOrderIds(cardId);
+    if (sourceIds.length === 0) return;
+
+    if (ownerUuid) onReleaseOrders?.(sourceIds);
+    else onClaimOrders?.(sourceIds);
+  }, [currentUser, sortedOrders, resolveSourceOrderIds, onClaimOrders, onReleaseOrders]);
+
+  /**
+   * Действие с ЧУЖОЙ карточкой, ждущее подтверждения («её взял Азамат, всё
+   * равно закрыть?»). Мягкая защита: закрыть чужую карточку можно — человек
+   * мог уйти на перерыв, — но не одним случайным тапом. Распространяется на
+   * «Готово» и «Частично»; парковка, отмена и разморозка спрашивают не больше,
+   * чем раньше (решение владельца, грил 2026-08-15).
+   */
+  const [foreignAction, setForeignAction] = useState<{
+    ownerName: string;
+    dishName: string;
+    actionLabel: string;
+    run: () => void;
+  } | null>(null);
+
+  /**
+   * Обёртка действия карточки: если карточку держит ДРУГОЙ нарезчик —
+   * показываем подтверждение, иначе выполняем сразу.
+   * @param card карточка, с которой работаем
+   * @param actionLabel подпись кнопки подтверждения («Всё равно отдать»)
+   * @param run само действие
+   */
+  const guardForeignCard = useCallback((
+    card: Order,
+    actionLabel: string,
+    run: () => void
+  ) => {
+    const ownerUuid = card.claimed_by_uuid ?? null;
+    if (ownerUuid && ownerUuid !== currentUser?.uuid) {
+      setForeignAction({
+        ownerName: card.claimed_by_name || 'другой нарезчик',
+        dishName: dishes.find(d => d.id === card.dish_id)?.name || 'Блюдо',
+        actionLabel,
+        run
+      });
+      return;
+    }
+    run();
+  }, [currentUser, dishes]);
 
   const checkStopped = (dish: Dish): string | null => {
     // Board ONLY checks Dish status - ingredient logic is synced at App level
@@ -815,6 +902,7 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           const sourceIds = defrostGroupMapping.get(vid);
           onCompleteDefrost?.(sourceIds?.[0] ?? vid, sourceIds);
         }}
+        currentUserUuid={currentUser?.uuid ?? null}
       />
 
       {/* Модалка разморозки — стандартный OrderCard с кнопкой «РАЗМОРОЗИЛАСЬ».
@@ -828,6 +916,10 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           ingredients={ingredients}
           now={now}
           onClose={() => setDefrostModalGroupId(null)}
+          currentUserUuid={currentUser?.uuid ?? null}
+          // Модалка — тот же OrderCard, что и на доске: номер стола-домика
+          // должен выглядеть одинаково в обоих местах (миграция 030)
+          houseTables={houseTables}
           onConfirmDefrosted={() => {
             const sourceIds = defrostModalGroup.sourceOrderIds;
             onCompleteDefrost?.(sourceIds[0], sourceIds);
@@ -878,45 +970,52 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
               ingredients={ingredients}
               now={now}
               onCompleteOrder={(orderId) => {
-                // Smart Aggregation: маппинг виртуального ID → реальные заказы
-                const mapping = smartQueueMappingRef.current.get(orderId);
-                if (mapping) {
-                  for (const [sourceId, count] of mapping.itemCountByOrder) {
-                    const sourceOrder = orders.find(o => o.id === sourceId);
-                    if (!sourceOrder) continue;
-                    const sourceTotalQty = sourceOrder.quantity_stack.reduce((a, b) => a + b, 0);
-                    if (count >= sourceTotalQty) {
-                      // Полное завершение этого source order
-                      onCompleteOrder(sourceId);
-                    } else {
-                      // Частичное завершение
-                      onPartialComplete?.(sourceId, count);
+                // Чужую карточку закрываем только после подтверждения
+                // (мягкая защита режима нескольких нарезчиков, миграция 029).
+                guardForeignCard(order, 'Всё равно отдать', () => {
+                  // Smart Aggregation: маппинг виртуального ID → реальные заказы
+                  const mapping = smartQueueMappingRef.current.get(orderId);
+                  if (mapping) {
+                    for (const [sourceId, count] of mapping.itemCountByOrder) {
+                      const sourceOrder = orders.find(o => o.id === sourceId);
+                      if (!sourceOrder) continue;
+                      const sourceTotalQty = sourceOrder.quantity_stack.reduce((a, b) => a + b, 0);
+                      if (count >= sourceTotalQty) {
+                        // Полное завершение этого source order
+                        onCompleteOrder(sourceId);
+                      } else {
+                        // Частичное завершение
+                        onPartialComplete?.(sourceId, count);
+                      }
                     }
+                  } else {
+                    // Стандартный режим (не Smart Aggregation)
+                    onCompleteOrder(orderId);
                   }
-                } else {
-                  // Стандартный режим (не Smart Aggregation)
-                  onCompleteOrder(orderId);
-                }
+                });
               }}
               onPartialComplete={(id) => {
-                // Smart Aggregation: PartDone на виртуальном заказе
-                const mapping = smartQueueMappingRef.current.get(id);
-                if (mapping) {
-                  // Создаём виртуальный Order для модалки PartialCompletion.
-                  // Source-ы фиксируем СЕЙЧАС (снапшот) — к моменту «ОК»
-                  // маппинг мог быть пересобран под другую карточку.
-                  const virtualOrder = sortedOrders.find(o => o.id === id);
-                  if (virtualOrder) {
-                    setPartialOrder(virtualOrder);
-                    setPartialSources(new Map(mapping.itemCountByOrder));
+                // Чужая карточка — сначала подтверждение (миграция 029)
+                guardForeignCard(order, 'Всё равно открыть', () => {
+                  // Smart Aggregation: PartDone на виртуальном заказе
+                  const mapping = smartQueueMappingRef.current.get(id);
+                  if (mapping) {
+                    // Создаём виртуальный Order для модалки PartialCompletion.
+                    // Source-ы фиксируем СЕЙЧАС (снапшот) — к моменту «ОК»
+                    // маппинг мог быть пересобран под другую карточку.
+                    const virtualOrder = sortedOrders.find(o => o.id === id);
+                    if (virtualOrder) {
+                      setPartialOrder(virtualOrder);
+                      setPartialSources(new Map(mapping.itemCountByOrder));
+                    }
+                  } else {
+                    const o = orders.find(x => x.id === id);
+                    if (o) {
+                      setPartialOrder(o);
+                      setPartialSources(null);
+                    }
                   }
-                } else {
-                  const o = orders.find(x => x.id === id);
-                  if (o) {
-                    setPartialOrder(o);
-                    setPartialSources(null);
-                  }
-                }
+                });
               }}
               onStackMerge={(id) => {
                 // Smart Aggregation: подтверждаем ТЕКУЩИЕ source-ы карточки —
@@ -940,7 +1039,13 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                 }
               }}
               onPreviewImage={onPreviewImage}
-              isInWork={inWorkIds.has(claimAnchorOf(order.id))}
+              // Клейм «В работе» (миграция 029). Своя карточка — лаймовая
+              // рамка и 🔪 как раньше, чужая — синяя с именем нарезчика.
+              isInWork={!!order.claimed_by_uuid}
+              claimedByName={order.claimed_by_name ?? null}
+              isClaimedByMe={
+                !!order.claimed_by_uuid && order.claimed_by_uuid === currentUser?.uuid
+              }
               onToggleInWork={toggleInWork}
               // ❄️ Запуск разморозки — резолвим Smart Wave virtual id в реальные
               // source_order_ids (через smartQueueMappingRef). Для стандартного
@@ -949,6 +1054,8 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
                 const sourceIds = resolveSourceOrderIds(id);
                 onStartDefrost?.(sourceIds[0], sourceIds);
               }}
+              // Столы-домики (миграция 030) — кирпичная метка номера стола
+              houseTables={houseTables}
             />
           );
         })}
@@ -964,6 +1071,58 @@ export const SlicerStation: React.FC<SlicerStationProps> = ({
           </div>
         )}
       </div>
+
+      {/* Подтверждение действия с ЧУЖОЙ карточкой (миграция 029).
+          Мягкая защита: закрыть карточку соседа можно (он мог уйти на
+          перерыв), но не случайным тапом. Оформление намеренно НЕ красное —
+          это не разрушительное действие, а предупреждение. */}
+      {foreignAction && (
+        <div className="fixed inset-0 z-[500] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-amber-600/60 rounded-xl shadow-2xl overflow-hidden max-w-md w-full">
+            <div className="bg-amber-950/30 p-6 flex flex-col items-center border-b border-amber-800/40">
+              <div className="w-16 h-16 bg-amber-900/20 rounded-full flex items-center justify-center mb-4 text-amber-400 text-3xl select-none">
+                🔪
+              </div>
+              <h2 className="text-xl font-bold text-white text-center">
+                Карточку взял {foreignAction.ownerName}
+              </h2>
+            </div>
+            <div className="p-6">
+              <p className="text-gray-300 text-center mb-8">
+                «{foreignAction.dishName}» уже кто-то режет. Если он отошёл —
+                продолжайте, запись в отчёте останется за вами.
+              </p>
+              <div className="flex gap-4">
+                <button
+                  onClick={() => setForeignAction(null)}
+                  className="flex-1 px-4 py-3 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-medium transition-colors border border-slate-700"
+                >
+                  Отмена
+                </button>
+                <button
+                  onClick={() => {
+                    const action = foreignAction;
+                    setForeignAction(null);
+                    action.run();
+                  }}
+                  className="flex-1 px-4 py-3 bg-amber-600 hover:bg-amber-500 text-white rounded-lg font-bold transition-all shadow-lg shadow-amber-900/30 transform active:scale-95"
+                >
+                  {foreignAction.actionLabel}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Отклонённый клейм: сосед успел раньше в окно поллинга. Не ошибка,
+          а уведомление — гаснет само через несколько секунд (см. useOrders). */}
+      {claimError && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[400] px-5 py-3 rounded-lg bg-slate-800 border border-amber-600/60 text-amber-200 font-bold shadow-2xl flex items-center gap-2 pointer-events-none">
+          <span className="select-none">🔪</span>
+          {claimError}
+        </div>
+      )}
 
       {/* Park Modal */}
       {showParkModal && (

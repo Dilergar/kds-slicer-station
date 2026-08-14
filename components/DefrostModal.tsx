@@ -30,6 +30,17 @@ interface DefrostModalProps {
   onPartialComplete?: (orderId: string, quantity: number) => void;
   onCancelOrder?: (orderId: string) => void;
   onPreviewImage: (url: string) => void;
+  /**
+   * uuid текущего нарезчика (миграция 029). Разморозка клейм сохраняет,
+   * поэтому карточка в модалке показывает его так же, как на доске —
+   * только read-only: onToggleInWork сюда не прокидывается.
+   */
+  currentUserUuid?: string | null;
+  /**
+   * Номера столов-домиков (миграция 030) — прокидываем в OrderCard, чтобы
+   * номер стола выглядел одинаково и на доске, и в этой модалке.
+   */
+  houseTables?: number[];
 }
 
 export const DefrostModal: React.FC<DefrostModalProps> = ({
@@ -45,6 +56,8 @@ export const DefrostModal: React.FC<DefrostModalProps> = ({
   onPartialComplete,
   onCancelOrder,
   onPreviewImage,
+  currentUserUuid = null,
+  houseTables,
 }) => {
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-[110] p-4">
@@ -82,6 +95,10 @@ export const DefrostModal: React.FC<DefrostModalProps> = ({
             onPartialComplete={onPartialComplete}
             onCancelOrder={onCancelOrder}
             onPreviewImage={onPreviewImage}
+            isInWork={!!order.claimed_by_uuid}
+            isClaimedByMe={!!order.claimed_by_uuid && order.claimed_by_uuid === currentUserUuid}
+            claimedByName={order.claimed_by_name ?? null}
+            houseTables={houseTables}
           />
         </div>
       </div>

@@ -132,6 +132,10 @@
 - [024_course_pace_default_600](migrations/024_course_pace_default_600.md) — Дефолт шага курса 600 сек + семантика «окно уступки»
 - [025_course_pace_check](migrations/025_course_pace_check.md) — CHECK 10..3600 на course_pace_seconds (+ кламп существующих значений)
 - [026_new_order_sound](migrations/026_new_order_sound.md) — enable_new_order_sound: тумблер звука при поступлении нового заказа (default TRUE)
+- [027_history_fractional_quantity](migrations/027_history_fractional_quantity.md) — total_quantity в истории: INT → NUMERIC(21,3) под весовые позиции чека
+- [028_archive_trigger_never_blocks](migrations/028_archive_trigger_never_blocks.md) — триггер-архиватор rgst3 в EXCEPTION-блоке + SECURITY DEFINER: сбой архивации не блокирует чужой DELETE
+- [029_order_claims](migrations/029_order_claims.md) — режим 2–3 нарезчиков: клейм «В работе» в slicer_order_state (виден всем планшетам) + автор порции в slicer_order_history
+- [030_house_tables](migrations/030_house_tables.md) — столы-домики: house_tables в настройках, номер стола рисуется кирпичным в рамке-домике (default {30,31,32}, правится в UI)
 
 ## Связанные документы
 - [mappings.md](mappings.md) — TypeScript interface ↔ DB column маппинг

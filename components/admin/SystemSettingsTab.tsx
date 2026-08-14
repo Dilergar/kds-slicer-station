@@ -1,15 +1,65 @@
 import React, { useState } from 'react';
 import { SystemSettings } from '../../types';
-import { Check, Ban, Snowflake, Bell } from 'lucide-react';
+import { Check, Ban, Snowflake, Bell, Home, X } from 'lucide-react';
 import { ClampedNumberInput } from '../ui/ClampedNumberInput';
+import { HouseTableBadge } from '../ui/HouseTableBadge';
 
 interface SystemSettingsTabProps {
   settings: SystemSettings;
   setSettings: (settings: SystemSettings) => void;
 }
 
+/** Верхняя граница номера стола — совпадает с проверкой в PUT /api/settings */
+const MAX_TABLE_NUMBER = 9999;
+/** Предел длины списка — совпадает с CHECK'ом миграции 030 */
+const MAX_HOUSE_TABLES = 100;
+
 export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, setSettings }) => {
   const [currentDate, setCurrentDate] = useState(new Date());
+
+  // ── Столы-домики (миграция 030) ────────────────────────────────────────────
+  // Черновик поля ввода держим отдельно от настроек: настройки уходят на сервер
+  // с дебаунсом 500 мс (App.tsx), и промежуточная «3» на пути к «33» успела бы
+  // сохраниться как отдельный стол.
+  const [houseTableDraft, setHouseTableDraft] = useState('');
+  const [houseTableError, setHouseTableError] = useState<string | null>(null);
+  const houseTables = settings.houseTables ?? [];
+
+  /**
+   * Добавляет номер из поля ввода в список столов-домиков.
+   * Границы дублируют проверку API (1..9999, не более 100) — чтобы владелец
+   * увидел причину сразу, а не молчаливый откат настроек после 400-ки.
+   */
+  const addHouseTable = () => {
+    const raw = houseTableDraft.trim();
+    if (!raw) return;
+    const num = Number(raw);
+    if (!Number.isInteger(num) || num < 1 || num > MAX_TABLE_NUMBER) {
+      setHouseTableError(`Номер стола — целое число от 1 до ${MAX_TABLE_NUMBER}`);
+      return;
+    }
+    if (houseTables.includes(num)) {
+      setHouseTableError(`Стол ${num} уже в списке`);
+      return;
+    }
+    if (houseTables.length >= MAX_HOUSE_TABLES) {
+      setHouseTableError(`Больше ${MAX_HOUSE_TABLES} столов добавить нельзя`);
+      return;
+    }
+    // Сортировка — чтобы список читался как рассадка, а не как история правок
+    setSettings({ ...settings, houseTables: [...houseTables, num].sort((a, b) => a - b) });
+    setHouseTableDraft('');
+    setHouseTableError(null);
+  };
+
+  /**
+   * Убирает стол из списка домиков — его номер снова рисуется обычным жёлтым.
+   * @param num Номер стола
+   */
+  const removeHouseTable = (num: number) => {
+    setSettings({ ...settings, houseTables: houseTables.filter(t => t !== num) });
+    setHouseTableError(null);
+  };
 
   // Шаг курса умной очереди с фолбэком на дефолт БД (600, миграция 024) —
   // одно место вместо четырёх повторов `?? 600` в блоке ниже (инпут, подпись
@@ -239,6 +289,79 @@ export const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({ settings, 
               </button>
             </div>
           </div>
+        </div>
+
+        {/* Столы-домики (миграция 030). Номер такого стола рисуется на карточке
+            кирпичным в рамке-домике — нарезчик видит «это в домик на улице»
+            прямо по номеру. Метка касается ТОЛЬКО номера стола: рамка карточки,
+            мини-ряд разморозки, панель парковки и история не меняются. */}
+        <div className="border-t border-gray-700 pt-6">
+          <label className="block text-gray-400 text-sm font-bold mb-1 flex items-center gap-2">
+            <Home size={16} style={{ color: '#E2725B' }} />
+            Столы-домики
+          </label>
+          <p className="text-gray-500 text-xs max-w-md mb-4">
+            Номера столов, которые стоят отдельными домиками. На карточке заказа такой номер
+            рисуется кирпичным цветом в рамке в форме домика вместо обычного жёлтого. Остальное
+            оформление карточки не меняется. Пустой список — меток нет.
+          </p>
+
+          {/* Текущий список. Значок — тот же компонент, что и на доске:
+              владелец видит ровно то, что увидит нарезчик. */}
+          <div className="flex flex-wrap items-center gap-2 mb-3">
+            {houseTables.length === 0 ? (
+              <span className="text-gray-600 text-sm italic">Столов-домиков пока нет</span>
+            ) : (
+              houseTables.map(num => (
+                <span
+                  key={num}
+                  className="inline-flex items-center gap-1 bg-gray-900 border border-gray-700 rounded-lg pl-1 pr-1 py-1"
+                >
+                  <HouseTableBadge num={num} />
+                  <button
+                    onClick={() => removeHouseTable(num)}
+                    className="text-gray-500 hover:text-red-400 transition-colors p-0.5 rounded"
+                    title={`Убрать стол ${num} из домиков`}
+                    aria-label={`Убрать стол ${num} из домиков`}
+                  >
+                    <X size={14} />
+                  </button>
+                </span>
+              ))
+            )}
+          </div>
+
+          {/* Добавление. Enter работает наравне с кнопкой — на планшете с
+              экранной клавиатурой это привычнее, чем целиться в кнопку. */}
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              inputMode="numeric"
+              value={houseTableDraft}
+              onChange={(e) => {
+                setHouseTableDraft(e.target.value);
+                setHouseTableError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  addHouseTable();
+                }
+              }}
+              placeholder="Напр. 33"
+              aria-label="Номер стола-домика"
+              className="w-32 bg-gray-900 border border-gray-700 text-white p-2 rounded focus:border-blue-500 outline-none font-mono"
+            />
+            <button
+              onClick={addHouseTable}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold rounded transition-colors"
+            >
+              Добавить
+            </button>
+          </div>
+          {houseTableError && (
+            <p className="text-red-400 text-xs mt-2">{houseTableError}</p>
+          )}
         </div>
 
         <div className="border-t border-gray-700 pt-6">

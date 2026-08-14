@@ -210,6 +210,23 @@ export const installAudioUnlock = (): (() => void) => {
 };
 
 /**
+ * Пиковая громкость сигналов (амплитуда синуса, 0..1).
+ *
+ * Подняты втрое 2026-08-15 по просьбе владельца: прежние 0.25 / 0.22 на
+ * работающей кухне (вытяжка, вок, разговоры) просто не слышали. Ровно ×3 —
+ * это примерно +9.5 дБ, на слух «вдвое громче».
+ *
+ * Выше поднимать нельзя без смены подхода: 1.0 — потолок, за которым
+ * начинается клиппинг (сигнал превращается в хрип, а не становится громче).
+ * Текущие значения оставляют запас, поэтому искажений нет. Если и этого мало
+ * — громкость самого планшета даёт больше, чем любые правки здесь; следующий
+ * шаг по коду — не gain, а более «резкий» тембр (square вместо sine) или
+ * повтор паттерна.
+ */
+const DEFROST_PEAK_GAIN = 0.75;   // было 0.25
+const NEW_ORDER_PEAK_GAIN = 0.66; // было 0.22
+
+/**
  * Проигрывает короткий 3-тональный beep через Web Audio API — сигнал
  * «разморозка готова». Отдельной зависимости не добавляем — API нативный.
  *
@@ -231,7 +248,7 @@ export const playDefrostBeep = (): void => {
             osc.type = 'sine';
             osc.frequency.value = freq;
             gain.gain.setValueAtTime(0.0001, t0 + i * 0.18);
-            gain.gain.exponentialRampToValueAtTime(0.25, t0 + i * 0.18 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(DEFROST_PEAK_GAIN, t0 + i * 0.18 + 0.02);
             gain.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.18 + 0.15);
             osc.connect(gain).connect(ctx.destination);
             osc.start(t0 + i * 0.18);
@@ -267,7 +284,7 @@ export const playNewOrderBeep = (): void => {
             osc.type = 'sine';
             osc.frequency.value = freq;
             gain.gain.setValueAtTime(0.0001, t0 + i * 0.16);
-            gain.gain.exponentialRampToValueAtTime(0.22, t0 + i * 0.16 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(NEW_ORDER_PEAK_GAIN, t0 + i * 0.16 + 0.02);
             gain.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.16 + 0.12);
             osc.connect(gain).connect(ctx.destination);
             osc.start(t0 + i * 0.16);

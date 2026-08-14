@@ -181,13 +181,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
     // отфильтрованную книгу нельзя было принять за полный отчёт
     speedSearchQuery?: string;
     chefSearchQuery?: string;
+    // Выбранный нарезчик в секции скорости (миграция 029) — печатается там же
+    speedSlicerFilter?: string;
   }>({});
   const [isExporting, setIsExporting] = useState(false);
 
-  const handleSpeedDataReady = useCallback((data: { standard: AggregatedSpeedReport; parked: AggregatedSpeedReport; searchQuery: string }) => {
+  const handleSpeedDataReady = useCallback((data: {
+    standard: AggregatedSpeedReport;
+    parked: AggregatedSpeedReport;
+    searchQuery: string;
+    slicerFilterLabel: string;
+  }) => {
     latestReportRef.current.speedStandard = data.standard;
     latestReportRef.current.speedParked = data.parked;
     latestReportRef.current.speedSearchQuery = data.searchQuery;
+    latestReportRef.current.speedSlicerFilter = data.slicerFilterLabel;
   }, []);
   const handleChefDataReady = useCallback((data: { report: AggregatedChefReport; searchQuery: string }) => {
     latestReportRef.current.chefSpeed = data.report;
@@ -210,6 +218,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ categories, ingredients, d
         history: latestReportRef.current.history,
         speedSearchQuery: latestReportRef.current.speedSearchQuery,
         chefSearchQuery: latestReportRef.current.chefSearchQuery,
+        speedSlicerFilter: latestReportRef.current.speedSlicerFilter,
       };
       await exportDashboardToExcel(payload);
     } catch (err) {

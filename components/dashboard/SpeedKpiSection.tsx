@@ -16,11 +16,27 @@ interface SpeedKpiSectionProps {
    * Parent должен мемоизировать callback (useCallback), чтобы не было
    * лишних ре-рендеров.
    */
-  onDataReady?: (data: { standard: AggregatedSpeedReport; parked: AggregatedSpeedReport; searchQuery: string }) => void;
+  onDataReady?: (data: {
+    standard: AggregatedSpeedReport;
+    parked: AggregatedSpeedReport;
+    searchQuery: string;
+    /** Имя выбранного нарезчика или пусто, если фильтр «Все» (миграция 029) */
+    slicerFilterLabel: string;
+  }) => void;
 }
+
+/** Значение фильтра «нарезчик» для записей без автора (сделаны до миграции 029) */
+const NO_SLICER = '__none__';
 
 export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, appliedFilter, dishes, categories, onDataReady }) => {
   const [searchQuery, setSearchQuery] = useState('');
+  /**
+   * Фильтр по нарезчику (миграция 029): 'ALL' — все, uuid — конкретный
+   * человек, NO_SLICER — порции без автора (закрытые до появления режима
+   * нескольких нарезчиков). Нужен, чтобы заведующая могла посмотреть выработку
+   * каждого отдельно, а не только общую цифру по кухне.
+   */
+  const [slicerFilter, setSlicerFilter] = useState<string>('ALL');
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
   // Развёрнутые блюда → показываем drilldown по каждой завершённой партии
   // (один OrderHistoryEntry = одна порция/партия с timestamp + длительность).
@@ -69,15 +85,61 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
     return `${datePart} ${timePart}`;
   };
 
+  /**
+   * Кто из нарезчиков встречается в выбранном периоде (миграция 029).
+   * Список строим из самих данных, а не из справочника сотрудников: в отчёте
+   * нужны только те, кто реально что-то сдал за период — иначе в выпадающем
+   * списке будет вся таблица users заказчика.
+   */
+  const slicerOptions = useMemo(() => {
+    if (!appliedFilter || !orderHistory) return { people: [] as { uuid: string; name: string }[], hasUnknown: false };
+
+    const startTime = new Date(appliedFilter.start).getTime();
+    const endTime = new Date(appliedFilter.end).getTime();
+
+    const byUuid = new Map<string, string>();
+    let hasUnknown = false;
+    for (const o of orderHistory) {
+      if (o.completedAt < startTime || o.completedAt > endTime) continue;
+      if (o.completedByUuid) {
+        // Имя берём последнее встреченное: если сотруднику меняли логин,
+        // в списке логичнее видеть актуальный вариант.
+        byUuid.set(o.completedByUuid, o.completedByName || o.completedByUuid);
+      } else {
+        hasUnknown = true;
+      }
+    }
+
+    return {
+      people: [...byUuid.entries()]
+        .map(([uuid, name]) => ({ uuid, name }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+      hasUnknown
+    };
+  }, [orderHistory, appliedFilter]);
+
+  /** Подпись выбранного фильтра — для шапки листа Excel и пустых состояний */
+  const slicerFilterLabel = slicerFilter === 'ALL'
+    ? ''
+    : slicerFilter === NO_SLICER
+      ? 'без автора'
+      : (slicerOptions.people.find(p => p.uuid === slicerFilter)?.name || slicerFilter);
+
   const speedStats = useMemo(() => {
     if (!appliedFilter || !orderHistory) return { standard: [], parked: [] };
 
     const startTime = new Date(appliedFilter.start).getTime();
     const endTime = new Date(appliedFilter.end).getTime();
 
-    const filteredOrders = orderHistory.filter(o =>
-      o.completedAt >= startTime && o.completedAt <= endTime
-    );
+    const filteredOrders = orderHistory
+      .filter(o => o.completedAt >= startTime && o.completedAt <= endTime)
+      // Фильтр по нарезчику применяем ДО агрегации, поэтому средние времена и
+      // счётчики категорий тоже считаются только по выбранному человеку.
+      .filter(o => {
+        if (slicerFilter === 'ALL') return true;
+        if (slicerFilter === NO_SLICER) return !o.completedByUuid;
+        return o.completedByUuid === slicerFilter;
+      });
 
     const aggregateByCategory = (orders: typeof orderHistory) => {
       const dishMap = new Map<string, {
@@ -217,7 +279,7 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
       parkedTimeline: toEntries(parkedOrders),
     };
 
-  }, [orderHistory, appliedFilter, dishes, categories, searchQuery, sortConfig]);
+  }, [orderHistory, appliedFilter, dishes, categories, searchQuery, sortConfig, slicerFilter]);
 
   // Подписываем родителя на актуальные агрегаты — для экспорта в Excel.
   // standard / parked имеют тот же shape, что AggregatedSpeedReport
@@ -229,8 +291,10 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
       // Строку поиска отдаём вместе с агрегатами: экспорт печатает её в шапке,
       // иначе отфильтрованная книга неотличима от полного отчёта за смену.
       searchQuery,
+      // По той же причине — и выбранного нарезчика (миграция 029)
+      slicerFilterLabel,
     });
-  }, [speedStats.standard, speedStats.parked, searchQuery, onDataReady]);
+  }, [speedStats.standard, speedStats.parked, searchQuery, slicerFilterLabel, onDataReady]);
 
   // Границы timeline-чартов — тот же period, что и фильтр Dashboard.
   const rangeStart = new Date(appliedFilter.start).getTime();
@@ -238,23 +302,46 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
 
   return (
     <>
-      {/* Search Bar */}
-      <div className="mb-6 relative">
-        <input
-          type="text"
-          placeholder="Поиск блюд..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          className="w-full bg-slate-900 border border-slate-700 rounded-lg py-3 px-10 text-white focus:outline-none focus:border-blue-500 transition-colors"
-        />
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={20} />
-        {searchQuery && (
-          <button
-            onClick={() => setSearchQuery('')}
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white"
+      {/* Search Bar + фильтр по нарезчику (миграция 029) */}
+      <div className="mb-6 flex gap-3 flex-wrap">
+        <div className="relative flex-1 min-w-[240px]">
+          <input
+            type="text"
+            placeholder="Поиск блюд..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full bg-slate-900 border border-slate-700 rounded-lg py-3 px-10 text-white focus:outline-none focus:border-blue-500 transition-colors"
+          />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={20} />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white"
+            >
+              <X size={16} />
+            </button>
+          )}
+        </div>
+
+        {/* Выпадающий список появляется, только если за период есть хотя бы
+            один именованный автор: до перехода на режим нескольких нарезчиков
+            выбирать нечего, и лишний контрол в отчёте не нужен. */}
+        {slicerOptions.people.length > 0 && (
+          <select
+            value={slicerFilter}
+            onChange={(e) => setSlicerFilter(e.target.value)}
+            className={`bg-slate-900 border rounded-lg py-3 px-4 text-white focus:outline-none focus:border-blue-500 transition-colors min-w-[200px]
+              ${slicerFilter === 'ALL' ? 'border-slate-700' : 'border-lime-600 text-lime-300'}`}
+            title="Показать порции конкретного нарезчика"
           >
-            <X size={16} />
-          </button>
+            <option value="ALL">🔪 Все нарезчики</option>
+            {slicerOptions.people.map(p => (
+              <option key={p.uuid} value={p.uuid}>{p.name}</option>
+            ))}
+            {slicerOptions.hasUnknown && (
+              <option value={NO_SLICER}>Без автора (старые записи)</option>
+            )}
+          </select>
         )}
       </div>
 
@@ -362,6 +449,15 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                                     <td className="p-2 pl-16 text-slate-400 font-mono flex items-center gap-2">
                                       <span className="text-slate-600">└</span>
                                       {formatPortionTime(o.completedAt)}
+                                      {/* Автор порции (миграция 029) — кто нажал «Готово».
+                                          «—» у записей, сделанных до режима нескольких
+                                          нарезчиков: тогда автор нигде не сохранялся. */}
+                                      <span
+                                        className="text-lime-400/80 truncate max-w-[45%]"
+                                        title="Кто отдал порцию"
+                                      >
+                                        🔪 {o.completedByName || '—'}
+                                      </span>
                                     </td>
                                     <td className="p-2 text-center font-mono text-slate-400">{o.totalQuantity} шт</td>
                                     <td className="p-2 text-right font-mono text-green-300/70">
@@ -486,6 +582,15 @@ export const SpeedKpiSection: React.FC<SpeedKpiSectionProps> = ({ orderHistory, 
                                     <td className="p-2 pl-16 text-slate-400 font-mono flex items-center gap-2">
                                       <span className="text-slate-600">└</span>
                                       {formatPortionTime(o.completedAt)}
+                                      {/* Автор порции (миграция 029) — кто нажал «Готово».
+                                          «—» у записей, сделанных до режима нескольких
+                                          нарезчиков: тогда автор нигде не сохранялся. */}
+                                      <span
+                                        className="text-lime-400/80 truncate max-w-[45%]"
+                                        title="Кто отдал порцию"
+                                      >
+                                        🔪 {o.completedByName || '—'}
+                                      </span>
                                     </td>
                                     <td className="p-2 text-center font-mono text-slate-400">{o.totalQuantity} шт</td>
                                     <td className="p-2 text-right font-mono text-yellow-300/70">

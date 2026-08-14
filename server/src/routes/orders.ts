@@ -311,7 +311,13 @@ router.get('/', async (_req: Request, res: Response) => {
         state.defrost_duration_seconds,
         -- Merge-подтверждение виртуальной карточки Smart Wave (миграция 022).
         -- TRUE = позиция входит в объединённый блок стека, FALSE = отдельный блок.
-        state.merge_ack
+        state.merge_ack,
+        -- Клейм «В работе» (миграция 029): кто из нарезчиков взял позицию.
+        -- NULL = свободна. Раздаётся всем планшетам этим же поллингом, поэтому
+        -- при работе вдвоём-втроём видно, кто что режет прямо сейчас.
+        state.claimed_by_uuid,
+        state.claimed_by_name,
+        state.claimed_at
       FROM docm2tabl1_items items
       INNER JOIN docm2_orders orders ON orders.suuid = items.owner
       INNER JOIN ctlg15_dishes dishes ON dishes.suuid = items.docm2tabl1_ctlg15_uuid__dish
@@ -506,6 +512,10 @@ router.get('/', async (_req: Request, res: Response) => {
           : null,
         // Merge-подтверждение Smart Wave (миграция 022). Нет строки state → false.
         merge_ack: row.merge_ack === true,
+        // Клейм «В работе» (миграция 029). null = позиция свободна.
+        claimed_by_uuid: row.claimed_by_uuid || null,
+        claimed_by_name: row.claimed_by_name || null,
+        claimed_at: row.claimed_at ? new Date(row.claimed_at).getTime() : null,
         // «Замороженные» курсы (2026-07-11): уже отданные позиции визита
         // гостя + самое раннее время пробития среди них. Пустой массив /
         // undefined = в визите ещё ничего не отдавали.
@@ -523,12 +533,21 @@ router.get('/', async (_req: Request, res: Response) => {
 
 /**
  * POST /api/orders/:id/complete — Завершить заказ (отметить как приготовленный).
- * Body: { dishId, dishName, totalQuantity, prepTimeMs, wasParked, snapshot, consumedIngredients }
+ * Body: { dishId, dishName, totalQuantity, prepTimeMs, wasParked, snapshot,
+ *         consumedIngredients, actorUuid?, actorName? }
+ *
+ * actorUuid/actorName (миграция 029) — кто нажал «Готово», из PIN-сессии.
+ * Именно нажавший, а не державший клейм: закрыть чужую карточку можно (UI
+ * спрашивает подтверждение), и в отчёте должен стоять тот, кто реально сдал
+ * порцию. Поля необязательные — без сессии запись просто останется без автора.
  */
 router.post('/:id/complete', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { dishId, dishName, totalQuantity, prepTimeMs, wasParked, snapshot, consumedIngredients } = req.body;
+    const {
+      dishId, dishName, totalQuantity, prepTimeMs, wasParked, snapshot,
+      consumedIngredients, actorUuid, actorName
+    } = req.body;
 
     const client = await pool.connect();
     try {
@@ -570,11 +589,15 @@ router.post('/:id/complete', async (req: Request, res: Response) => {
         return;
       }
 
-      // 3. Создать запись в истории
+      // 3. Создать запись в истории (с автором порции — миграция 029)
       const historyResult = await client.query(
-        `INSERT INTO slicer_order_history (dish_id, dish_name, total_quantity, prep_time_ms, was_parked, snapshot, consumed_ingredients)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-        [dishId, dishName, totalQuantity, prepTimeMs, wasParked || false, JSON.stringify(snapshot), JSON.stringify(consumedIngredients)]
+        `INSERT INTO slicer_order_history (dish_id, dish_name, total_quantity, prep_time_ms, was_parked, snapshot, consumed_ingredients, completed_by_uuid, completed_by_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [
+          dishId, dishName, totalQuantity, prepTimeMs, wasParked || false,
+          JSON.stringify(snapshot), JSON.stringify(consumedIngredients),
+          actorUuid || null, actorName || null
+        ]
       );
       const historyId = historyResult.rows[0].id;
 
@@ -620,7 +643,10 @@ router.post('/:id/complete', async (req: Request, res: Response) => {
 router.post('/:id/partial-complete', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { dishId, dishName, quantityToComplete, prepTimeMs, wasParked, snapshot, consumedIngredients } = req.body;
+    const {
+      dishId, dishName, quantityToComplete, prepTimeMs, wasParked, snapshot,
+      consumedIngredients, actorUuid, actorName
+    } = req.body;
 
     // Валидация запрошенного количества до всякой работы с БД
     const requested = Number(quantityToComplete);
@@ -714,11 +740,15 @@ router.post('/:id/partial-complete', async (req: Request, res: Response) => {
         [id, JSON.stringify(cleanedStack), JSON.stringify([remainingTables])]
       );
 
-      // Создать запись в истории (частичную)
+      // Создать запись в истории (частичную, с автором порции — миграция 029)
       const historyResult = await client.query(
-        `INSERT INTO slicer_order_history (dish_id, dish_name, total_quantity, prep_time_ms, was_parked, snapshot, consumed_ingredients)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-        [dishId, dishName + ' (Partial)', quantityToComplete, prepTimeMs, wasParked || false, JSON.stringify(snapshot), JSON.stringify(consumedIngredients)]
+        `INSERT INTO slicer_order_history (dish_id, dish_name, total_quantity, prep_time_ms, was_parked, snapshot, consumed_ingredients, completed_by_uuid, completed_by_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [
+          dishId, dishName + ' (Partial)', quantityToComplete, prepTimeMs, wasParked || false,
+          JSON.stringify(snapshot), JSON.stringify(consumedIngredients),
+          actorUuid || null, actorName || null
+        ]
       );
       const historyId = historyResult.rows[0].id;
 
@@ -800,6 +830,13 @@ router.post('/:id/park', async (req: Request, res: Response) => {
          parked_by_auto = FALSE,
          defrost_started_at = NULL,
          defrost_duration_seconds = NULL,
+         -- Клейм «В работе» снимается парковкой (миграция 029): заказ отложен
+         -- на час-два, нарезчик давно переключился на другое. Разморозка,
+         -- в отличие от парковки, клейм СОХРАНЯЕТ — рыбу доделает тот же
+         -- человек, который её взял.
+         claimed_by_uuid = NULL,
+         claimed_by_name = NULL,
+         claimed_at = NULL,
          updated_at = NOW()`,
       [
         id,
@@ -920,6 +957,11 @@ router.post('/:id/restore', async (req: Request, res: Response) => {
          -- Merge-подтверждение (миграция 022) тоже сбрасываем: восстановленная
          -- позиция должна заново пройти визуальное объединение на доске.
          merge_ack                = FALSE,
+         -- И клейм «В работе» (миграция 029): позиция вернулась из истории,
+         -- её никто ещё не режет.
+         claimed_by_uuid          = NULL,
+         claimed_by_name          = NULL,
+         claimed_at               = NULL,
          updated_at               = NOW()`,
       [id, JSON.stringify(quantityStack), JSON.stringify(tableStack)]
     );
@@ -990,6 +1032,157 @@ router.post('/merge-ack', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[Orders] Ошибка merge-ack:', err);
     res.status(500).json({ error: 'Ошибка подтверждения объединения' });
+  }
+});
+
+/**
+ * POST /api/orders/claim — Взять карточку в работу (миграция 029).
+ *
+ * Body: `{ orderItemIds: string[], actorUuid: string, actorName: string }` —
+ * ВСЕ реальные позиции карточки (в умной очереди и режиме скорости одна
+ * карточка склеена из нескольких) + кто берёт, из PIN-сессии.
+ *
+ * Карточка — атомарная единица: если хоть одна её позиция уже занята ДРУГИМ
+ * нарезчиком, весь клейм отклоняется с 409 и именем владельца. Иначе на
+ * карточке было бы два хозяина одновременно — на соседнем планшете та же
+ * рыба может быть разбита на две карточки, и «половина Азамата, половина
+ * Ержана» не читается ни в каком оформлении.
+ *
+ * Гонка двух планшетов разрешается в БД, а не в UI: `ON CONFLICT DO UPDATE
+ * ... WHERE claimed_by_uuid IS NULL OR = наш` под READ COMMITTED перечитывает
+ * строку после коммита соперника, поэтому второй запрос ничего не перетирает.
+ * Финальная проверка ниже ловит и этот случай, и параллельный INSERT новой
+ * строки — и откатывает транзакцию целиком.
+ *
+ * UPSERT идёт через INSERT ... SELECT с реальными стеками (REAL_STACKS_SQL):
+ * у позиции может ещё не быть строки в slicer_order_state, и DEFAULT'ы
+ * колонок перетёрли бы настоящие количество и стол (та же ловушка, что
+ * ловили defrost-start и merge-ack).
+ */
+router.post('/claim', async (req: Request, res: Response) => {
+  try {
+    const { orderItemIds, actorUuid, actorName } = req.body as {
+      orderItemIds?: string[];
+      actorUuid?: string;
+      actorName?: string;
+    };
+    if (!Array.isArray(orderItemIds) || orderItemIds.length === 0) {
+      res.status(400).json({ error: 'orderItemIds должен быть непустым массивом' });
+      return;
+    }
+    if (!actorUuid || typeof actorUuid !== 'string') {
+      res.status(400).json({ error: 'actorUuid обязателен — клейм всегда именной' });
+      return;
+    }
+    const ids = [...new Set(orderItemIds.map(String))];
+    const name = typeof actorName === 'string' && actorName.trim() ? actorName.trim() : 'Нарезчик';
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const itemId of ids) {
+        await client.query(
+          `INSERT INTO slicer_order_state
+             (order_item_id, status, quantity_stack, table_stack,
+              claimed_by_uuid, claimed_by_name, claimed_at)
+           SELECT
+             items.suuid::text,
+             'ACTIVE',
+             ${REAL_STACKS_SQL},
+             $2, $3, NOW()
+           FROM docm2tabl1_items items
+           LEFT JOIN docm2_orders orders ON orders.suuid = items.owner
+           LEFT JOIN ctlg13_halltables tables ON tables.suuid = orders.docm2_ctlg13_uuid__halltable
+           WHERE items.suuid::text = $1
+           ON CONFLICT (order_item_id) DO UPDATE SET
+             claimed_by_uuid = $2,
+             claimed_by_name = $3,
+             claimed_at      = NOW(),
+             updated_at      = NOW()
+           WHERE slicer_order_state.claimed_by_uuid IS NULL
+              OR slicer_order_state.claimed_by_uuid = $2`,
+          [itemId, actorUuid, name]
+        );
+      }
+
+      // Хоть одна позиция карточки осталась за чужим нарезчиком — значит он
+      // успел раньше (или держал её всё это время). Откатываем весь клейм.
+      const foreign = await client.query(
+        `SELECT claimed_by_name
+           FROM slicer_order_state
+          WHERE order_item_id = ANY($1::text[])
+            AND claimed_by_uuid IS NOT NULL
+            AND claimed_by_uuid <> $2
+          LIMIT 1`,
+        [ids, actorUuid]
+      );
+      if ((foreign.rowCount ?? 0) > 0) {
+        await client.query('ROLLBACK');
+        const ownerName = foreign.rows[0].claimed_by_name || 'другой нарезчик';
+        // `error` заполняем осмысленным текстом намеренно: apiFetch на клиенте
+        // бросает Error(body.error), и без него нарезчик увидел бы «HTTP 409».
+        res.status(409).json({
+          claimed: false,
+          ownerName,
+          error: `Карточку уже взял ${ownerName}`
+        });
+        return;
+      }
+
+      await client.query('COMMIT');
+      res.json({ claimed: true, items: ids.length });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('[Orders] Ошибка claim:', err);
+    res.status(500).json({ error: 'Ошибка взятия карточки в работу' });
+  }
+});
+
+/**
+ * POST /api/orders/unclaim — Отпустить карточку (повторный тап).
+ *
+ * Body: `{ orderItemIds: string[], actorUuid: string }`.
+ *
+ * Снять можно ТОЛЬКО свой клейм — условие `claimed_by_uuid = $2` в WHERE.
+ * Чужой не снимается ничем: по решению владельца клейм висит до «Готово»
+ * (и снимается парковкой). Поэтому ответ не считается ошибкой, если ничего
+ * не обновилось — просто `released: 0`.
+ */
+router.post('/unclaim', async (req: Request, res: Response) => {
+  try {
+    const { orderItemIds, actorUuid } = req.body as {
+      orderItemIds?: string[];
+      actorUuid?: string;
+    };
+    if (!Array.isArray(orderItemIds) || orderItemIds.length === 0) {
+      res.status(400).json({ error: 'orderItemIds должен быть непустым массивом' });
+      return;
+    }
+    if (!actorUuid || typeof actorUuid !== 'string') {
+      res.status(400).json({ error: 'actorUuid обязателен' });
+      return;
+    }
+
+    const result = await pool.query(
+      `UPDATE slicer_order_state
+          SET claimed_by_uuid = NULL,
+              claimed_by_name = NULL,
+              claimed_at      = NULL,
+              updated_at      = NOW()
+        WHERE order_item_id = ANY($1::text[])
+          AND claimed_by_uuid = $2`,
+      [[...new Set(orderItemIds.map(String))], actorUuid]
+    );
+
+    res.json({ released: result.rowCount ?? 0 });
+  } catch (err) {
+    console.error('[Orders] Ошибка unclaim:', err);
+    res.status(500).json({ error: 'Ошибка снятия карточки с работы' });
   }
 });
 
