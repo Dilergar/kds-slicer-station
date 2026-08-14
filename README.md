@@ -203,7 +203,8 @@ npm start         # Production запуск
 
 | Метод | Путь | Описание |
 |---|---|---|
-| POST | `/api/auth/login` | Авторизация по PIN (`{pin}`) → `{uuid, login, roles}` |
+| POST | `/api/auth/login` | Авторизация по PIN (`{pin}`) → `{uuid, login, roles}`. 429 при 10 неудачах в минуту с одного адреса |
+| GET | `/api/auth/me?uuid=…` | Перепроверка сессии (при загрузке и раз в 10 мин): роли на лету, 401 если юзер заблокирован/удалён |
 | GET | `/api/orders` | Активные заказы (polling каждые 4 сек) |
 | POST | `/api/orders/:id/complete` | Завершить заказ |
 | POST | `/api/orders/:id/partial-complete` | Частичное завершение |
@@ -212,6 +213,8 @@ npm start         # Production запуск
 | POST | `/api/orders/:id/unpark` | Снять с парковки |
 | POST | `/api/orders/:id/merge` | Объединить стеки |
 | POST | `/api/orders/merge-ack` | Подтвердить объединение виртуальной карточки Smart Wave (merge_ack=TRUE, миграция 022) |
+| POST | `/api/orders/claim` | Взять карточку в работу (миграция 029). 409 + имя владельца, если хоть одна позиция занята другим |
+| POST | `/api/orders/unclaim` | Отпустить карточку (только свой клейм; чужой не трогается) |
 | POST | `/api/orders/:id/cancel` | Отменить заказ |
 | POST | `/api/orders/:id/defrost-start` | Запустить разморозку (время per-dish из slicer_dish_defrost) |
 | POST | `/api/orders/:id/defrost-cancel` | Отменить разморозку (сброс defrost-полей) |
@@ -229,6 +232,8 @@ npm start         # Production запуск
 | POST | `/api/dish-aliases` | Создать алиас (автокопия категорий primary → alias) |
 | DELETE | `/api/dish-aliases/:alias_dish_id` | Отвязать алиас |
 | GET | `/api/ingredients` | Список ингредиентов (+ POST/PUT/DELETE) |
+| PUT | `/api/ingredients/:id/rename-parent` | Транзакционное переименование сырья + перезапись приставок «Сырьё · нарезка» у всех разновидностей |
+| GET | `/api/ingredients/:id/usage` | `{children, recipes, activeStops}` — счётчики для диалога подтверждения удаления |
 | GET | `/api/categories` | Список категорий (+ POST/PUT/DELETE) |
 | PUT | `/api/categories/reorder` | Пакетная смена порядка |
 | GET | `/api/settings` | Настройки модуля |

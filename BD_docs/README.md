@@ -87,6 +87,9 @@
 - [ctlg18_menuitems](existing_tables.md#ctlg18_menuitems) — Пункты меню (связь блюдо→склад)
 - [ctlg17_storages](existing_tables.md#ctlg17_storages) — Склады-цеха (фильтр по цехам для нарезчика)
 - [rgst3_dishstoplist](existing_tables.md#rgst3_dishstoplist) — Стоп-лист блюд
+- [users / userroles / roles](existing_tables.md#users--userroles--roles) — Вход по PIN и матрица доступа к вкладкам (нужен явный SELECT — под шаблон `ctlg*` не подпадают)
+- [docm2tabl2_dishmodifiers / ctlg20_modifiers](existing_tables.md#docm2tabl2_dishmodifiers--ctlg20_modifiers) — Модификаторы «Готовить к HH.MM» — триггер авто-парковки десертов
+- [ctlg11_restaurants / ctlg16_restaurantmenu / ctlg5_employees / ctlg10_useremployees](existing_tables.md#ctlg11_restaurants--ctlg16_restaurantmenu--ctlg5_employees--ctlg10_useremployees) — Только при включённой синхронизации стоп-листа
 
 ### Таблицы модуля (slicer_*):
 - [slicer_categories](tables/slicer_categories.md) — Категории с порядком сортировки

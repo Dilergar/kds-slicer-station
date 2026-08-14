@@ -243,3 +243,64 @@ OR EXISTS (
 | `rgst3_ctlg5_uuid__responsible` | UUID | FK → ответственный сотрудник |
 
 **Связь с модулем:** Читаем для определения, какие блюда на стопе в основной системе. Дополняем своим стоп-листом ингредиентов (`slicer_ingredients.is_stopped`).
+
+---
+
+## users / userroles / roles
+
+**Назначение:** Учётные записи заказчика. Модуль **не заводит своих** — вход в
+станцию нарезчика идёт по 4-значному `users.pin`, а набор доступных вкладок
+выдаётся по названию роли.
+
+| Таблица | Колонка | Тип | Описание |
+|---|---|---|---|
+| `users` | `uuid` | UUID | PK пользователя; попадает в `claimed_by_uuid` / `completed_by_uuid` наших таблиц |
+| `users` | `login` | TEXT | Отображаемое имя нарезчика на карточке и в отчётах |
+| `users` | `pin` | INT | 4-значный код входа; пускаем только `pin > 0` |
+| `users` | `locked` | BOOLEAN | Заблокированных не пускаем |
+| `userroles` | `user_uuid` / `role_uuid` | UUID | Связь M2M пользователь ↔ роль |
+| `roles` | `uuid` / `name` | UUID / TEXT | Имя роли сравнивается **точно** с матрицей `constants.ts → ROLE_ACCESS` |
+
+**Связь с модулем:** `POST /api/auth/login` (проверка PIN) и
+`GET /api/auth/me` (перепроверка сессии раз в 10 минут — блокировка юзера
+разлогинивает, смена ролей применяется на лету).
+
+⚠️ **Права:** этим трём таблицам нужен явный `SELECT` — их имена не подпадают
+под шаблоны `docm2_*` / `ctlg*`, которыми обычно выдают доступ. Без них вход в
+модуль не работает вообще.
+
+---
+
+## docm2tabl2_dishmodifiers / ctlg20_modifiers
+
+**Назначение:** Модификаторы позиции чека («Готовить к 18.00», «Ждать
+разъяснений»). Модуль использует их как **триггер авто-парковки десертов**
+(миграция 019).
+
+| Таблица | Колонка | Тип | Описание |
+|---|---|---|---|
+| `docm2tabl2_dishmodifiers` | `docm2tabl2_itemrow` | UUID | FK → `docm2tabl1_items.suuid` |
+| `docm2tabl2_dishmodifiers` | `docm2tabl2_ctlg20_uuid__modifier` | UUID | FK → `ctlg20_modifiers.suuid` |
+| `ctlg20_modifiers` | `suuid` / `name` | UUID / TEXT | Имя матчится по маскам из `slicer_settings.dessert_trigger_modifier_patterns` (по умолчанию `Готовить%`, `Ждать%`) |
+
+**Связь с модулем:** в `GET /api/orders` дессертная позиция паркуется, только
+если у неё есть подходящий модификатор. Имя вида «Готовить к HH.MM» задаёт
+конкретное время возврата (при нескольких — берётся максимальное).
+
+---
+
+## ctlg11_restaurants / ctlg16_restaurantmenu / ctlg5_employees / ctlg10_useremployees
+
+**Назначение:** Нужны **только при включённой двусторонней синхронизации
+стоп-листа** (`Инструкция.md` раздел 10). При выключенной (состояние по
+умолчанию) модуль их не читает.
+
+| Таблица | Что берём |
+|---|---|
+| `ctlg11_restaurants` | `suuid` ресторана → `rgst3_dishstoplist.rgst3_ctlg11_uuid__restaurant` |
+| `ctlg16_restaurantmenu` | `suuid` меню → `rgst3_ctlg16_uuid__restaurantmenu` |
+| `ctlg5_employees` | `suuid` сотрудника → `rgst3_ctlg5_uuid__responsible` |
+| `ctlg10_useremployees` | Связь `users.uuid` → `ctlg5_employees.suuid`: подставляет в стоп реального сотрудника из PIN-сессии вместо системного из конфига |
+
+**Связь с модулем:** `server/src/services/kdsStoplistSync.ts`, конфиг —
+`slicer_kds_sync_config` (см. `tables/slicer_kds_sync_config.md`).
